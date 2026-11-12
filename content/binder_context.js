@@ -1019,43 +1019,57 @@
       else shadowed = binder;
     }
     if (shadowed) {
-      return {
+      return withReplay({
         name, kind: 'variable', source: 'local_var',
         typeSignature: `${name} : ${shadowed.type}`,
-        docstring: `Local variable ${later.how}; shown with the type of the earlier binder \`${name} : ${shadowed.type}\`, which it most likely re-introduces.` +
-          changeWarning(name, laterChanges(name, contextText, later.pos))
-      };
+        docstring: `Local variable ${later.how}; shown with the type of the earlier binder \`${name} : ${shadowed.type}\`, which it most likely re-introduces.`
+      }, shadowed.type, hypothesisChanges(name, contextText, later.pos));
     }
     if (binder) {
-      return {
+      return withReplay({
         name, kind: 'variable', source: 'local_var',
         typeSignature: `${name} : ${binder.type}`,
-        docstring: 'Local variable / hypothesis bound in this declaration.' +
-          changeWarning(name, laterChanges(name, contextText, binder.pos))
-      };
+        docstring: 'Local variable / hypothesis bound in this declaration.'
+      }, binder.type, hypothesisChanges(name, contextText, binder.pos));
     }
     const untyped = findUntypedBinder(name, contextText);
     if (untyped) {
       let inferred = null;
       try { inferred = inferLocalType(name, contextText); } catch (err) { inferred = null; }
+      const changes = hypothesisChanges(name, contextText, untyped.pos);
       if (inferred && inferred.types.length) {
         const f = formatInferred(name, inferred);
-        return {
+        return withReplay({
           name, kind: 'variable', source: 'local_var',
           typeSignature: f.typeSignature,
-          docstring: `Local variable ${untyped.how}; type inferred from ${inferred.source}${f.note ? ' (' + f.note + ')' : ''}.` +
-            changeWarning(name, laterChanges(name, contextText, untyped.pos))
-        };
+          docstring: `Local variable ${untyped.how}; type inferred from ${inferred.source}${f.note ? ' (' + f.note + ')' : ''}.`
+        }, f.typeSignature.slice(name.length + 3), changes);
       }
-      return {
+      const info = {
         name, kind: 'variable', source: 'local_var',
         typeSignature: untyped.value ? `${name} := ${untyped.value}` : `${name} : _`,
         docstring: `Local variable ${untyped.how}; its type isn't written in the source` +
           (inferred && inferred.pending ? ', so it is being worked out from the signature…' : ', so it would need Lean to elaborate.'),
         inferNeeded: inferred && inferred.pending ? Object.assign({ caseIdx: inferred.caseIdx || 0 }, inferred.pending) : null
       };
+      // A pending inference gets its base type from the worker; replay changes after that.
+      return info.inferNeeded ? withReplay(info, null, changes) : info;
     }
     return null;
+  }
+
+  /**
+   * Attach a replay request when tactics before the hover change the hypothesis
+   * (`rw … at h`, `simp at h`, …): the type shown first is the declared one, and
+   * `replayChanges` / `describeReplay` produce the current one (or say why they can't).
+   */
+  function withReplay(info, baseType, changes) {
+    if (!changes || !changes.length) return info;
+    const pendingText = changes.map(c => `\`${c.text.length > 60 ? c.text.slice(0, 57) + '…' : c.text}\``).join(', ');
+    return Object.assign(info, {
+      docstring: `${info.docstring}\n\n*Applying ${pendingText}…*`,
+      replay: { baseType, changes, lead: info.docstring, projection: null }
+    });
   }
 
   /** Type of a local, written or inferred (a single unambiguous type), or null. */
@@ -1193,17 +1207,33 @@
   function projectionInfo(chain, contextText) {
     const segs = chain.split('.');
     if (segs.length < 2 || !/^\d+$/.test(segs[segs.length - 1]) || !segs.slice(1).every(x => /^\d+$/.test(x))) return null;
-    const base = findBinder(segs[0], contextText);
+    let base = findBinder(segs[0], contextText);
+    const untypedBase = findUntypedBinder(segs[0], contextText);
+    if (base && untypedBase && untypedBase.pos > base.pos) base = null; // re-bound later (intro / obtain)
     if (!base) {
-      const untyped = findUntypedBinder(segs[0], contextText);
-      if (!untyped) return null;
-      return {
+      if (!untypedBase) return null;
+      const inferredType = localType(segs[0], contextText);
+      if (!inferredType) {
+        return {
+          name: chain, kind: 'variable', source: 'local_var',
+          typeSignature: `${chain} : _`,
+          docstring: `Projection \`.${segs.slice(1).join('.')}\` of the local \`${segs[0]}\`, which is ${untypedBase.how}; its type isn't written in the source.`
+        };
+      }
+      base = { type: inferredType, pos: untypedBase.pos };
+    }
+    const changes = hypothesisChanges(segs[0], contextText, base.pos);
+    if (changes.length) {
+      const info = {
         name: chain, kind: 'variable', source: 'local_var',
         typeSignature: `${chain} : _`,
-        docstring: `Projection \`.${segs.slice(1).join('.')}\` of the local \`${segs[0]}\`, which is ${untyped.how}; its type isn't written in the source.`
+        docstring: `Projection of \`${segs[0]}\`.`
       };
+      withReplay(info, base.type, changes);
+      info.replay.projection = segs.slice(1).map(Number);
+      return info;
     }
-    const warning = changeWarning(segs[0], laterChanges(segs[0], contextText, base.pos));
+    const warning = '';
     let type = base.type;
     const notes = [];
     for (let k = 1; k < segs.length; k++) {
@@ -1271,6 +1301,656 @@
     const rest = contextText.slice(end + 1);
     const stop = rest.search(/\swhere\b|:=/);
     return typeHead(stop === -1 ? rest : rest.slice(0, stop), null);
+  }
+
+  // --- Replaying `rw … at h`: a small term model ---
+  //
+  // Enough of Lean's notation to rewrite hypothesis types the way `rw` does: parse the type,
+  // find the first instance of the rule's left side (pre-order, like `kabstract`), fix its
+  // variables from that instance, replace every equal instance, and print the result.
+
+  const T_START = /[A-Za-z_Ͱ-ΟΡ΢Τ-κμ-Ͽἀ-῿℀-⅏\u{1D400}-\u{1D7FF}]/u;
+  const T_CONT = /[A-Za-z0-9_'!?Ͱ-ΟΡ΢Τ-κμ-Ͽἀ-῿₀-ₜᵢ-ᵪ℀-⅏\u{1D400}-\u{1D7FF}]/u;
+  const T_OPS = ['[[', ']]', '×ˢ', '×ℂ', '⁻¹', ':=', '=>', '∃!', '<-', '↔', '→', '←', '∧', '∨', '¬', '≠', '≤', '≥',
+    '∈', '∉', '⊆', '⊂', '⊇', '⊃', '∩', '∪', '⊓', '⊔', '•', '∘', '∣', '×', 'ᶜ', '↑', '⇑', '↦', '‖', '⟨', '⟩',
+    '(', ')', '[', ']', '{', '}', ',', '|', '+', '-', '*', '/', '%', '^', '=', '<', '>', '\\', '∑', '∏', '∫',
+    '∀', '∃', '⋃', '⋂', '⨆', '⨅', 'λ', 'Π', '·', ':', '∞', '⊤', '⊥', '∅'];
+  // [precedence, associativity] as in Lean / Mathlib.
+  const T_BIN = {
+    '↔': [20, 'n'], '→': [25, 'r'], '∨': [30, 'r'], '∧': [35, 'r'], '×': [35, 'r'],
+    '=': [50, 'n'], '≠': [50, 'n'], '<': [50, 'n'], '>': [50, 'n'], '≤': [50, 'n'], '≥': [50, 'n'],
+    '∈': [50, 'n'], '∉': [50, 'n'], '⊆': [50, 'n'], '⊂': [50, 'n'], '⊇': [50, 'n'], '⊃': [50, 'n'], '∣': [50, 'n'],
+    '∪': [65, 'l'], '+': [65, 'l'], '-': [65, 'l'], '⊔': [68, 'l'], '⊓': [69, 'l'],
+    '∩': [70, 'l'], '*': [70, 'l'], '/': [70, 'l'], '%': [70, 'l'], '\\': [70, 'l'], '×ℂ': [72, 'l'],
+    '•': [73, 'r'], '^': [75, 'r'], '×ˢ': [82, 'r'], '∘': [90, 'r']
+  };
+  const T_BINDER_HEADS = new Set(['∀', '∃', '∃!', '∑', '∏', '⋃', '⋂', '⨆', '⨅', '∫', 'λ', 'Π']);
+  const T_STOP_WORDS = new Set(['at', 'with', 'from', 'by', 'using', 'then', 'else', 'in', 'do']);
+  const T_OPENERS = ['(', '[', '{', '⟨', '[['];
+  const T_CLOSERS = [')', ']', '}', '⟩', ']]'];
+
+  function tokenizeTerm(text) {
+    const chars = Array.from(text);
+    const toks = [];
+    let off = 0;
+    const offs = chars.map(c => { const o = off; off += c.length; return o; });
+    offs.push(off);
+    let i = 0;
+    while (i < chars.length) {
+      const c = chars[i];
+      if (/\s/.test(c)) { i++; continue; }
+      let j = i;
+      if (/[0-9]/.test(c)) {
+        while (j < chars.length && (/[0-9]/.test(chars[j]) || (chars[j] === '.' && /[0-9]/.test(chars[j + 1] || '')))) j++;
+        toks.push({ k: 'num', v: chars.slice(i, j).join(''), s: offs[i], e: offs[j] });
+      } else if (T_START.test(c)) {
+        j = i + 1;
+        for (;;) {
+          while (j < chars.length && T_CONT.test(chars[j])) j++;
+          if (chars[j] === '.' && j + 1 < chars.length && (T_START.test(chars[j + 1]) || /[0-9]/.test(chars[j + 1]))) { j += 2; continue; }
+          break;
+        }
+        toks.push({ k: 'id', v: chars.slice(i, j).join(''), s: offs[i], e: offs[j] });
+      } else if (c === '.' && i + 1 < chars.length && (T_START.test(chars[i + 1]) || /[0-9]/.test(chars[i + 1]))) {
+        j = i + 1;
+        while (j < chars.length && T_CONT.test(chars[j])) j++;
+        toks.push({ k: 'field', v: chars.slice(i + 1, j).join(''), s: offs[i], e: offs[j] });
+      } else {
+        const ahead = chars.slice(i, i + 3).join('');
+        const op = T_OPS.find(o => ahead.startsWith(o)) || c;
+        j = i + Array.from(op).length;
+        toks.push({ k: 'op', v: op, s: offs[i], e: offs[j] });
+      }
+      i = j;
+    }
+    return toks;
+  }
+
+  const tPeek = (st) => st.toks[st.i];
+  const tNext = (st) => st.toks[st.i++];
+  const tIs = (t, v) => Boolean(t) && t.k === 'op' && t.v === v;
+  function tExpect(st, v) { if (!tIs(tNext(st), v)) throw new Error(`expected ${v}`); }
+
+  /** Parse a Lean term into a small AST, or null if it uses notation we don't model. */
+  function parseTerm(text) {
+    const st = { src: text, toks: tokenizeTerm(text), i: 0 };
+    try {
+      const node = tExpr(st, 0);
+      return st.i === st.toks.length ? node : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  /** Source text of the tokens up to a top-level stop token (left unconsumed). */
+  function tRawUntil(st, stops) {
+    const first = st.i;
+    let depth = 0;
+    while (st.i < st.toks.length) {
+      const t = tPeek(st);
+      if (t.k === 'op') {
+        if (depth === 0 && stops.includes(t.v)) break;
+        if (T_OPENERS.includes(t.v)) depth++;
+        else if (T_CLOSERS.includes(t.v)) { if (depth === 0) break; depth--; }
+      }
+      st.i++;
+    }
+    return st.i > first ? st.src.slice(st.toks[first].s, st.toks[st.i - 1].e).trim() : '';
+  }
+
+  function tStartsArg(t) {
+    if (!t) return false;
+    if (t.k === 'num') return true;
+    if (t.k === 'id') return !T_STOP_WORDS.has(t.v);
+    return t.k === 'op' && ['(', '⟨', '{', '[[', '↑', '⇑', '·', '∞', '⊤', '⊥', '∅'].includes(t.v);
+  }
+
+  function tBinder(st, head) {
+    const stops = head === 'fun' || head === 'λ' ? ['=>', '↦'] : [','];
+    const binders = tRawUntil(st, stops);
+    const sep = tNext(st);
+    if (!sep || sep.k !== 'op' || !stops.includes(sep.v)) throw new Error('binder');
+    return { k: 'bind', head, binders, sep: sep.v, body: tExpr(st, 0) };
+  }
+
+  function tPrefix(st) {
+    const t = tNext(st);
+    if (!t) throw new Error('eof');
+    if (t.k === 'num') return { k: 'num', v: t.v };
+    if (t.k === 'id') {
+      if (t.v === 'fun') return tBinder(st, 'fun');
+      if (T_STOP_WORDS.has(t.v)) throw new Error('stop word');
+      return { k: 'id', v: t.v };
+    }
+    if (t.k === 'field') throw new Error('field');
+    switch (t.v) {
+      case '¬': return { k: 'pre', op: '¬', e: tExpr(st, 40) };
+      case '-': return { k: 'pre', op: '-', e: tExpr(st, 75) };
+      case '↑': case '⇑': return { k: 'pre', op: t.v, e: tArg(st) };
+      case '(': {
+        const e = tExpr(st, 0);
+        if (tIs(tPeek(st), ':')) { tNext(st); const ty = tExpr(st, 0); tExpect(st, ')'); return { k: 'asc', e, ty }; }
+        tExpect(st, ')');
+        return Object.assign({}, e, { paren: true }); // `(f ∘ g) x`: parenthesised terms can be applied
+      }
+      case '|': { const e = tExpr(st, 0); tExpect(st, '|'); return { k: 'abs', e }; }
+      case '‖': { const e = tExpr(st, 0); tExpect(st, '‖'); return { k: 'norm', e }; }
+      case '⟨': {
+        const es = [];
+        if (!tIs(tPeek(st), '⟩')) {
+          for (;;) { es.push(tExpr(st, 0)); if (tIs(tPeek(st), ',')) { tNext(st); continue; } break; }
+        }
+        tExpect(st, '⟩');
+        return { k: 'tuple', es };
+      }
+      case '{': { const inner = tRawUntil(st, []); tExpect(st, '}'); return { k: 'raw', v: `{${inner}}` }; }
+      case '[': { const inner = tRawUntil(st, []); tExpect(st, ']'); return { k: 'raw', v: `[${inner}]` }; }
+      case '[[': {
+        const a = tExpr(st, 0); tExpect(st, ',');
+        const b = tExpr(st, 0); tExpect(st, ']]');
+        return { k: 'app', f: { k: 'id', v: 'Set.uIcc' }, args: [a, b] };
+      }
+      case '·': case '∞': case '⊤': case '⊥': case '∅': return { k: 'id', v: t.v };
+      default:
+        if (T_BINDER_HEADS.has(t.v)) return tBinder(st, t.v);
+        throw new Error(`unexpected ${t.v}`);
+    }
+  }
+
+  function tPostfix(st, e) {
+    for (;;) {
+      const t = tPeek(st);
+      if (tIs(t, '⁻¹') || tIs(t, 'ᶜ')) { tNext(st); e = { k: 'post', op: t.v, e }; continue; }
+      if (t && t.k === 'field') { tNext(st); e = { k: 'proj', e, f: t.v }; continue; }
+      return e;
+    }
+  }
+
+  function tArg(st) { return tPostfix(st, tPrefix(st)); }
+
+  function tExpr(st, minPrec) {
+    let left = tArg(st);
+    for (;;) {
+      const t = tPeek(st);
+      if (!t) break;
+      if (t.k === 'op' && T_BIN[t.v]) {
+        const [p, assoc] = T_BIN[t.v];
+        if (p < minPrec) break;
+        tNext(st);
+        left = { k: 'bin', op: t.v, l: left, r: tExpr(st, assoc === 'r' ? p : p + 1) };
+        continue;
+      }
+      const applicable = ['id', 'app', 'proj'].includes(left.k) || left.paren || (left.k === 'pre' && (left.op === '↑' || left.op === '⇑'));
+      if (minPrec <= 1024 && applicable && tStartsArg(t)) {
+        const arg = tArg(st);
+        left = left.k === 'app' ? { k: 'app', f: left.f, args: left.args.concat([arg]) } : { k: 'app', f: left, args: [arg] };
+        continue;
+      }
+      break;
+    }
+    return left;
+  }
+
+  function tPrec(n) {
+    switch (n.k) {
+      case 'bin': return T_BIN[n.op][0];
+      case 'pre': return n.op === '¬' ? 40 : n.op === '-' ? 75 : 2000;
+      case 'post': return 1100;
+      case 'app': return 1024;
+      case 'bind': return 0;
+      default: return 2000;
+    }
+  }
+
+  /** Print an AST back to Lean text, adding parentheses only where precedence needs them. */
+  function showTerm(n, minPrec = 0) {
+    let s;
+    switch (n.k) {
+      case 'id': case 'num': case 'raw': s = n.v; break;
+      case 'asc': s = `(${showTerm(n.e)} : ${showTerm(n.ty)})`; break;
+      case 'abs': s = `|${showTerm(n.e)}|`; break;
+      case 'norm': s = `‖${showTerm(n.e)}‖`; break;
+      case 'tuple': s = `⟨${n.es.map(e => showTerm(e)).join(', ')}⟩`; break;
+      case 'proj': s = `${showTerm(n.e, 1025)}.${n.f}`; break;
+      case 'post': s = `${showTerm(n.e, 1025)}${n.op}`; break;
+      case 'pre':
+        s = n.op === '¬' ? `¬${showTerm(n.e, 40)}` : n.op === '-' ? `-${showTerm(n.e, 75)}` : `${n.op}${showTerm(n.e, 1025)}`;
+        break;
+      case 'app': s = [showTerm(n.f, 1024), ...n.args.map(a => showTerm(a, 1025))].join(' '); break;
+      case 'bin': {
+        const [p, assoc] = T_BIN[n.op];
+        s = `${showTerm(n.l, assoc === 'l' ? p : p + 1)} ${n.op} ${showTerm(n.r, assoc === 'r' ? p : p + 1)}`;
+        break;
+      }
+      case 'bind':
+        s = n.head === 'fun' || n.head === 'λ' ? `fun ${n.binders} ${n.sep} ${showTerm(n.body)}` : `${n.head} ${n.binders}, ${showTerm(n.body)}`;
+        break;
+      default: s = '?';
+    }
+    return tPrec(n) < minPrec ? `(${s})` : s;
+  }
+
+  // Ascriptions `(0 : ℝ)` and coercion arrows don't change which term is meant.
+  function tCore(n) {
+    while (n && (n.k === 'asc' || (n.k === 'pre' && (n.op === '↑' || n.op === '⇑')))) n = n.e;
+    return n;
+  }
+  const tIdEq = (a, b) => a === b || a.endsWith('.' + b) || b.endsWith('.' + a);
+  const tRawEq = (a, b) => a.replace(/\s+/g, '') === b.replace(/\s+/g, '');
+
+  function tChildren(n) {
+    switch (n.k) {
+      case 'app': return [n.f, ...n.args];
+      case 'bin': return [n.l, n.r];
+      case 'pre': case 'post': case 'abs': case 'norm': case 'proj': case 'asc': return [n.e];
+      case 'tuple': return n.es;
+      case 'bind': return [n.body];
+      default: return [];
+    }
+  }
+  function tWithChildren(n, kids) {
+    switch (n.k) {
+      case 'app': return Object.assign({}, n, { f: kids[0], args: kids.slice(1) });
+      case 'bin': return Object.assign({}, n, { l: kids[0], r: kids[1] });
+      case 'pre': case 'post': case 'abs': case 'norm': case 'proj': case 'asc': return Object.assign({}, n, { e: kids[0] });
+      case 'tuple': return Object.assign({}, n, { es: kids });
+      case 'bind': return Object.assign({}, n, { body: kids[0] });
+      default: return n;
+    }
+  }
+
+  /**
+   * Match pattern `p` (variables in `vars`) against term `t`, extending `sub` (Map name → node).
+   * `x.field` with `x` a variable matches `t.field` (dot notation in lemma statements).
+   */
+  function matchTerm(p, t, vars, sub) {
+    const tp = tCore(p), tt = tCore(t);
+    if (!tp || !tt) return false;
+    if (tp.k === 'id') {
+      if (vars.has(tp.v)) {
+        if (sub.has(tp.v)) return sameTerm(sub.get(tp.v), t);
+        sub.set(tp.v, t);
+        return true;
+      }
+      const dot = tp.v.indexOf('.');
+      if (dot > 0 && vars.has(tp.v.slice(0, dot))) {
+        const rest = tp.v.slice(dot + 1);
+        let recv = null;
+        if (tt.k === 'id' && tt.v.endsWith('.' + rest) && tt.v.length > rest.length + 1) recv = { k: 'id', v: tt.v.slice(0, tt.v.length - rest.length - 1) };
+        else if (tt.k === 'proj' && tt.f === rest) recv = tt.e;
+        return Boolean(recv) && matchTerm({ k: 'id', v: tp.v.slice(0, dot) }, recv, vars, sub);
+      }
+    }
+    // `n.succ` written as one identifier vs. a projection node of `n`.
+    if (tp.k === 'proj' && tt.k === 'id' && tt.v.endsWith('.' + tp.f) && tt.v.length > tp.f.length + 1) {
+      return matchTerm(tp.e, { k: 'id', v: tt.v.slice(0, tt.v.length - tp.f.length - 1) }, vars, sub);
+    }
+    if (tp.k === 'id' && tt.k === 'proj' && tp.v.endsWith('.' + tt.f) && tp.v.length > tt.f.length + 1) {
+      return matchTerm({ k: 'id', v: tp.v.slice(0, tp.v.length - tt.f.length - 1) }, tt.e, vars, sub);
+    }
+    if (tp.k !== tt.k) return false;
+    switch (tp.k) {
+      case 'id': return tIdEq(tp.v, tt.v);
+      case 'num': return tp.v === tt.v;
+      case 'raw': return tRawEq(tp.v, tt.v);
+      case 'abs': case 'norm': return matchTerm(tp.e, tt.e, vars, sub);
+      case 'pre': case 'post': return tp.op === tt.op && matchTerm(tp.e, tt.e, vars, sub);
+      case 'proj': return tp.f === tt.f && matchTerm(tp.e, tt.e, vars, sub);
+      case 'tuple': return tp.es.length === tt.es.length && tp.es.every((e, i) => matchTerm(e, tt.es[i], vars, sub));
+      case 'app':
+        return tp.args.length === tt.args.length && matchTerm(tp.f, tt.f, vars, sub) &&
+          tp.args.every((e, i) => matchTerm(e, tt.args[i], vars, sub));
+      case 'bin': return tp.op === tt.op && matchTerm(tp.l, tt.l, vars, sub) && matchTerm(tp.r, tt.r, vars, sub);
+      case 'bind': return tp.head === tt.head && tRawEq(tp.binders, tt.binders) && matchTerm(tp.body, tt.body, vars, sub);
+      default: return false;
+    }
+  }
+  const sameTerm = (a, b) => matchTerm(a, b, new Set(), new Map());
+
+  /** Substitute variables (Map name → node) into `n`. */
+  function substTerm(n, sub) {
+    if (!n) return n;
+    if (n.k === 'id') {
+      if (sub.has(n.v)) return sub.get(n.v);
+      const dot = n.v.indexOf('.');
+      if (dot > 0 && sub.has(n.v.slice(0, dot))) return { k: 'proj', e: sub.get(n.v.slice(0, dot)), f: n.v.slice(dot + 1) };
+      return n;
+    }
+    if (n.k === 'raw' || n.k === 'bind') {
+      let text = n.k === 'raw' ? n.v : n.binders;
+      sub.forEach((v, name) => { text = replaceWord(text, name, showTerm(v, 1025)); });
+      const m = n.k === 'raw' ? Object.assign({}, n, { v: text }) : Object.assign({}, n, { binders: text });
+      return n.k === 'bind' ? Object.assign(m, { body: substTerm(n.body, sub) }) : m;
+    }
+    const m = tWithChildren(n, tChildren(n).map(c => substTerm(c, sub)));
+    return n.k === 'asc' ? Object.assign(m, { ty: substTerm(n.ty, sub) }) : m;
+  }
+
+  function freeNames(n, out = new Set()) {
+    if (!n) return out;
+    if (n.k === 'id') out.add(n.v.split('.')[0]);
+    if (n.k === 'raw') namesIn(n.v).forEach(x => out.add(x));
+    if (n.k === 'bind') namesIn(n.binders).forEach(x => out.add(x));
+    tChildren(n).forEach(c => freeNames(c, out));
+    return out;
+  }
+
+  function boundNamesOf(binders) {
+    const names = [];
+    const groups = binders.match(/[({⦃[]\s*[^(){}⦃⦄[\]:]+?\s*:/g);
+    if (groups) groups.forEach(g => names.push(...g.replace(/^[({⦃[]\s*/, '').replace(/\s*:$/, '').split(/\s+/)));
+    else names.push(...binders.split(/\s*(?::|∈|∉|<|≤|>|≥|≠|⊆|\bin\b)/)[0].trim().split(/\s+/));
+    return names.filter(Boolean);
+  }
+
+  /**
+   * Rewrite `tree` with `lhs = rhs` like `rw`: the first instance in pre-order fixes the
+   * variables, then every equal instance (or only the `nth`) is replaced. Subterms that
+   * mention variables bound by `∀`/`∃`/`fun` are skipped, as Lean's `rw` can't rewrite there.
+   * Returns the new tree, or null if there is no instance.
+   */
+  function rewriteTerm(tree, lhs, rhs, vars, nth = 0) {
+    const mentions = (n, bound) => bound.size > 0 && [...freeNames(n)].some(x => bound.has(x));
+    const inner = (n, bound) => (n.k === 'bind' ? new Set([...bound, ...boundNamesOf(n.binders)]) : bound);
+    let found = null;
+    const find = (n, bound) => {
+      if (found || !n) return;
+      if (!mentions(n, bound)) {
+        const sub = new Map();
+        if (matchTerm(lhs, n, vars, sub)) { found = sub; return; }
+      }
+      tChildren(n).forEach(c => find(c, inner(n, bound)));
+    };
+    find(tree, new Set());
+    if (!found) return null;
+    // Every variable of the right side must be fixed by the match.
+    if ([...freeNames(rhs)].some(x => vars.has(x) && !found.has(x))) return null;
+    const inst = substTerm(lhs, found);
+    const out = substTerm(rhs, found);
+    let count = 0;
+    let replaced = 0;
+    const rep = (n, bound) => {
+      if (!mentions(n, bound) && sameTerm(inst, n)) {
+        count++;
+        if (!nth || count === nth) { replaced++; return out; }
+        return n;
+      }
+      return tWithChildren(n, tChildren(n).map(c => rep(c, inner(n, bound))));
+    };
+    const result = rep(tree, new Set());
+    return replaced ? result : null;
+  }
+
+  /**
+   * Binders and conclusion of a type or Loogle signature:
+   * `{a b : α} (h : a ≤ b) : Set.uIcc a b = Set.Icc a b`, `∀ n, f n = n + 1`, `0 ≤ a → |a| = a`.
+   * Premises `A →` count as unnamed explicit binders.
+   */
+  function peelSignature(type) {
+    let t = (type || '').replace(/\s+/g, ' ').trim();
+    const binders = [];
+    let i = 0;
+    while (i < t.length && '({[⦃'.includes(t[i])) {
+      const close = matchClose(t, i);
+      if (close === -1) break;
+      const g = t.slice(i + 1, close);
+      const c = g.indexOf(' : ');
+      if (c !== -1) binders.push({ names: g.slice(0, c).trim().split(/\s+/), type: g.slice(c + 3).trim(), explicit: t[i] === '(' });
+      else binders.push({ names: [], type: g.trim(), explicit: false });
+      i = close + 1;
+      while (t[i] === ' ') i++;
+    }
+    if (i > 0) {
+      if (t[i] === ':' && t[i + 1] !== '=') t = t.slice(i + 1).trim();
+      else { binders.length = 0; } // not a signature: just a parenthesised type
+    }
+    for (let guard = 0; guard < 30; guard++) {
+      while (t.startsWith('(') && matchClose(t, 0) === t.length - 1) t = t.slice(1, -1).trim();
+      if (/^(∀|Π)/.test(t)) {
+        const comma = topLevelIndexOf(t, ',');
+        if (comma === -1) break;
+        const seg = t.slice(1, comma).trim();
+        if ('({[⦃'.includes(seg[0])) {
+          let j = 0;
+          while (j < seg.length) {
+            while (seg[j] === ' ') j++;
+            if (!'({[⦃'.includes(seg[j])) break;
+            const close = matchClose(seg, j);
+            if (close === -1) break;
+            const g = seg.slice(j + 1, close);
+            const c = g.indexOf(':');
+            binders.push({ names: (c === -1 ? g : g.slice(0, c)).trim().split(/\s+/), type: c === -1 ? '' : g.slice(c + 1).trim(), explicit: seg[j] === '(' });
+            j = close + 1;
+          }
+        } else {
+          const pm = seg.match(/^([\w'Ͱ-Ͽ₀-ₜ\s]+?)\s*(∈|∉|<|≤|>|≥|≠|⊆)\s*(.+)$/);
+          if (pm) {
+            const names = pm[1].trim().split(/\s+/);
+            binders.push({ names, type: '', explicit: true });
+            names.forEach(v => binders.push({ names: [], type: `${v} ${pm[2]} ${pm[3]}`, explicit: true }));
+          } else {
+            const c = seg.indexOf(':');
+            binders.push({ names: (c === -1 ? seg : seg.slice(0, c)).trim().split(/\s+/), type: c === -1 ? '' : seg.slice(c + 1).trim(), explicit: true });
+          }
+        }
+        t = t.slice(comma + 1).trim();
+        continue;
+      }
+      // A premise `A → B` (plain arrow at top level).
+      let depth = 0, cut = -1;
+      for (let k = 0; k < t.length; k++) {
+        const ch = t[k];
+        if (OPENERS[ch]) depth++;
+        else if (CLOSERS.has(ch)) depth = Math.max(0, depth - 1);
+        else if (depth === 0 && ch === '→' && t[k + 1] === ' ') { cut = k; break; }
+        else if (depth === 0 && (ch === '=' || ch === '↔')) break; // an equation's sides may contain arrows
+      }
+      if (cut > 0) {
+        binders.push({ names: [], type: t.slice(0, cut).trim(), explicit: true });
+        t = t.slice(cut + 1).trim();
+        continue;
+      }
+      break;
+    }
+    return { binders, concl: t };
+  }
+
+  /**
+   * `{ lhs, rhs, vars }` for a rewrite rule given its signature (constant or local), its
+   * positional / named arguments, and direction. Hypothesis arguments fix variables through
+   * their types (`h : 0 ≤ s` for `(h : a ≤ b)` gives `a := 0, b := s`).
+   */
+  function ruleEquationFrom(sig, positional, named, rev, text) {
+    const peeled = peelSignature(sig);
+    // Rename the rule's own variables apart, so arguments that mention a local with the same
+    // name (`div_eq_iff hc` with `hc : c ≠ 0`, where the lemma also has a `c`) can't be captured.
+    const own = [...new Set(peeled.binders.flatMap(b => b.names))];
+    const fresh = (n) => `__pv_${n}`;
+    const ren = (str) => own.reduce((acc, n) => replaceWord(acc, n, fresh(n)), str || '');
+    const binders = peeled.binders.map(b => ({ names: b.names.map(fresh), type: ren(b.type), explicit: b.explicit }));
+    const concl = ren(peeled.concl);
+    named = Object.fromEntries(Object.entries(named).map(([k, v]) => [own.includes(k) ? fresh(k) : k, v]));
+    const vars = new Set(binders.flatMap(b => b.names));
+    const slots = binders.filter(b => b.explicit).flatMap(b => (b.names.length ? b.names : [null]).map(n => ({ name: n, type: b.type })));
+    const sub = new Map();
+    positional.forEach((a, k) => {
+      const slot = slots[k];
+      if (!slot || a === '_' || a === '?_') return;
+      const node = parseTerm(a);
+      if (!node) return;
+      if (slot.name) sub.set(slot.name, node);
+      const argType = /^[^\s()]+$/.test(a) ? localType(a, text) : null;
+      const slotT = argType && slot.type && parseTerm(slot.type);
+      const argT = argType && parseTerm(argType);
+      if (slotT && argT) {
+        const extended = new Map(sub);
+        if (matchTerm(slotT, argT, vars, extended)) extended.forEach((v, key) => sub.set(key, v));
+      }
+    });
+    for (const [n, v] of Object.entries(named)) {
+      const node = parseTerm(v);
+      if (node) sub.set(n, node);
+    }
+    const c = parseTerm(concl);
+    if (!c || c.k !== 'bin' || (c.op !== '=' && c.op !== '↔')) return null;
+    let lhs = substTerm(c.l, sub);
+    let rhs = substTerm(c.r, sub);
+    if (rev) [lhs, rhs] = [rhs, lhs];
+    return { lhs, rhs, vars: new Set([...vars].filter(v => !sub.has(v))) };
+  }
+
+  /** Equation for one rule of `rw [...]`; `sigOf(name)` gives a constant's signature (may be async). */
+  async function ruleEquation(rule, text, sigOf) {
+    let term = rule.term.trim();
+    let rev = Boolean(rule.rev);
+    const show = term.match(/^\(?\s*show\s+([\s\S]+?)\s+(?:from|by)\b/);
+    if (show) return ruleEquationFrom(show[1], [], {}, rev, text);
+    term = term.replace(/^@/, '');
+    let head = applicationHead(term);
+    if (!head) return null;
+    const positional = [];
+    const named = {};
+    for (const a of splitApp(term).slice(1)) {
+      const nm = a.match(/^\(\s*([^\s:()]+)\s*:=\s*([\s\S]+)\)$/);
+      if (nm) named[nm[1]] = nm[2].trim();
+      else positional.push(a);
+    }
+    if (/\.symm$/.test(head)) { rev = !rev; head = head.slice(0, -5); }
+    let sig = /^[\w'Ͱ-Ͽ₀-ₜ]+$/.test(head) ? localType(head, text) : null;
+    if (!sig && sigOf) sig = await sigOf(head);
+    return sig ? ruleEquationFrom(sig, positional, named, rev, text) : null;
+  }
+
+  /** Does a tactic at `pos` still affect the hovered (last) line? Bullets, nesting and `by` blocks scope it. */
+  function tacticInScope(text, pos, hoverStart) {
+    const ls = text.lastIndexOf('\n', pos - 1) + 1;
+    if (/\bby\b/.test(text.slice(ls, pos))) return false; // nested `by` on the same line: local to it
+    const col = (text.slice(ls).match(/^\s*(?:·\s*)?/) || [''])[0].length;
+    let p = text.indexOf('\n', pos);
+    if (p === -1) return false;
+    p++;
+    while (p <= hoverStart && p < text.length) {
+      const e = text.indexOf('\n', p);
+      const line = text.slice(p, e === -1 ? text.length : e);
+      if (line.trim() && (line.match(/^\s*/) || [''])[0].length < col) return false;
+      if (e === -1) break;
+      p = e + 1;
+    }
+    return true;
+  }
+
+  /**
+   * Tactics before the hovered line that change hypothesis `name` after position `after`:
+   * `{ kind: 'rw', rules, nth }` (rw / rwa / rewrite / erw / nth_rw), `{ kind: 'change', type }`,
+   * or `{ kind: 'opaque' }` for tactics that can't be replayed from the text (simp, norm_num, …).
+   */
+  function hypothesisChanges(name, text, after) {
+    const hoverStart = text.lastIndexOf('\n') + 1;
+    const changes = [];
+    const targets = (locs) => namesIn(locs.replace(/⊢/g, ' ')).includes(name) || /(^|\s)\*(\s|$)/.test(locs);
+    const usable = (pos) => {
+      if (pos <= after || pos >= hoverStart) return false;
+      const ls = text.lastIndexOf('\n', pos - 1) + 1;
+      return !/--/.test(text.slice(ls, pos)) && tacticInScope(text, pos, hoverStart);
+    };
+    const oneLine = (s) => s.replace(/\s+/g, ' ').trim();
+    let m;
+    const rwRe = /\b(rw|rwa|rewrite|erw|nth_rw|nth_rewrite)\b\s*(\d+)?\s*\[/g;
+    while ((m = rwRe.exec(text)) !== null) {
+      if (!usable(m.index)) continue;
+      const open = m.index + m[0].length - 1;
+      const close = matchClose(text, open);
+      if (close === -1) continue;
+      const tail = text.slice(close + 1).match(/^\s*at\s+([^\n;]*)/);
+      if (!tail || !targets(tail[1].replace(/<;>.*$/, ''))) continue;
+      const rules = splitTop(text.slice(open + 1, close), ',').filter(Boolean).map(r => ({
+        term: r.replace(/^(←|<-)\s*/, '').trim(), rev: /^(←|<-)/.test(r)
+      }));
+      changes.push({ kind: 'rw', pos: m.index, rules, nth: m[2] ? parseInt(m[2], 10) : 0, text: oneLine(text.slice(m.index, close + 1) + tail[0]) });
+    }
+    const changeRe = /\bchange\s+([^\n]+?)\s+at\s+([^\n;]*)/g;
+    while ((m = changeRe.exec(text)) !== null) {
+      if (usable(m.index) && targets(m[2])) changes.push({ kind: 'change', pos: m.index, type: m[1].trim(), text: oneLine(m[0]) });
+    }
+    const opaqueRe = /\b(simp|simp_rw|dsimp|norm_num|push_neg|push_cast|norm_cast|field_simp|ring_nf|unfold|delta|conv|lift|zify|qify|rify|abel_nf|simp_arith|cancel_denoms|nontriviality)\b[^\n]*?\bat\s+([^\n;]*)/g;
+    while ((m = opaqueRe.exec(text)) !== null) {
+      if (usable(m.index) && targets(m[2])) changes.push({ kind: 'opaque', pos: m.index, text: oneLine(m[0]) });
+    }
+    const allRe = /\b(simp_all|subst_vars|subst)\b[^\n]*/g;
+    while ((m = allRe.exec(text)) !== null) {
+      if (usable(m.index)) changes.push({ kind: 'opaque', pos: m.index, text: oneLine(m[0]) });
+    }
+    const replaceRe = new RegExp(`\\breplace\\s+${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*:=`, 'g');
+    while ((m = replaceRe.exec(text)) !== null) {
+      if (usable(m.index)) changes.push({ kind: 'opaque', pos: m.index, text: oneLine(text.slice(m.index, text.indexOf('\n', m.index) === -1 ? text.length : text.indexOf('\n', m.index))) });
+    }
+    return changes.sort((a, b) => a.pos - b.pos);
+  }
+
+  /**
+   * Replay `changes` on `baseType`. `rw`-style rewrites and `change` are applied; replay stops
+   * at a tactic it can't model. Resolves to { type, applied, stoppedAt?, failedAt?, failedRule? }.
+   */
+  async function replayChanges(baseType, changes, text, sigOf) {
+    let type = baseType;
+    const applied = [];
+    for (const ch of changes) {
+      if (ch.kind === 'change') { type = ch.type; applied.push(ch); continue; }
+      if (ch.kind === 'opaque') return { type, applied, stoppedAt: ch };
+      let tree = parseTerm(type);
+      if (!tree) return { type, applied, failedAt: ch };
+      for (const rule of ch.rules) {
+        let eq = null;
+        try { eq = await ruleEquation(rule, text, sigOf); } catch (err) { eq = null; }
+        const next = eq && rewriteTerm(tree, eq.lhs, eq.rhs, eq.vars, ch.nth);
+        if (!next) return { type, applied, failedAt: ch, failedRule: rule.term };
+        tree = next;
+      }
+      type = showTerm(tree);
+      applied.push(ch);
+    }
+    return { type, applied };
+  }
+
+  /** Tooltip fields for a local whose type was replayed: { typeSignature, docstring }. */
+  function describeReplay(info, result) {
+    const r = info.replay;
+    const code = (c) => `\`${c.text.length > 80 ? c.text.slice(0, 77) + '…' : c.text}\``;
+    const declared = `declared as \`${r.baseType}\``;
+    const blocked = result.stoppedAt || result.failedAt;
+    let type = result.type;
+    let signature;
+    if (r.projection) {
+      const proj = blocked ? null : projectionChain(type, r.projection);
+      signature = `${info.name} : ${proj ? proj.type : '_'}`;
+      if (proj) type = proj.type;
+    } else {
+      signature = `${info.name} : ${type}`;
+    }
+    let doc;
+    if (!blocked) {
+      doc = `${r.lead} Type after ${result.applied.map(code).join(', ')}, replayed from the rewrite rules' statements (${declared}).`;
+    } else {
+      const why = result.stoppedAt
+        ? `${code(result.stoppedAt)} changes it, and that can't be replayed without Lean`
+        : `${code(result.failedAt)} changes it, but the rewrite couldn't be replayed${result.failedRule ? ` (rule \`${result.failedRule}\`)` : ''}`;
+      signature += '  -- outdated';
+      doc = `${r.lead} **Outdated:** ${why}. ` +
+        (r.projection ? `Its base was \`${result.type}\` before that tactic.` : 'Shown is the type before that tactic') +
+        (result.applied.length ? ` (after ${result.applied.map(code).join(', ')}).` : '.') + ` Originally ${declared}.`;
+    }
+    return { typeSignature: signature, docstring: doc };
+  }
+
+  /** Apply anonymous projections `[1, 2, …]` to a type; null if a step isn't known. */
+  function projectionChain(type, indices) {
+    let t = type;
+    for (const n of indices) {
+      const p = projectionType(t, n);
+      if (!p) return null;
+      t = p.type;
+    }
+    return { type: t };
   }
 
   // --- Where the hovered line lives: repo, commit, path, line (for file-scope lookup) ---
@@ -1365,6 +2045,15 @@
     projectionType,
     projectionInfo,
     laterChanges,
+    parseTerm,
+    showTerm,
+    matchTerm,
+    rewriteTerm,
+    peelSignature,
+    ruleEquation,
+    hypothesisChanges,
+    replayChanges,
+    describeReplay,
     parenReceiver,
     applicationHead,
     typeHead,

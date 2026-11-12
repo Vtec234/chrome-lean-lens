@@ -299,6 +299,67 @@
     return out;
   }
 
+  /** `chrome.runtime.sendMessage` as a promise (resolves to null on failure). */
+  function sendMessageP(message) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage(message, (res) => resolve(chrome.runtime.lastError ? null : res));
+      } catch (err) {
+        resolve(null);
+      }
+    });
+  }
+
+  /**
+   * Signature (`binders : conclusion`) of a constant used as a rewrite rule: a declaration
+   * from this PR if it has exactly that name, else Loogle (via the worker), else a PR
+   * declaration matched by its short name.
+   */
+  async function constantSignature(name, fileRef) {
+    const pr = window.LeanPRScanner;
+    const strip = (d) => d.typeSignature.replace(/^\S+\s+\S+\s*/, '');
+    const exact = pr && pr.declarations.get(name);
+    if (exact && (exact.name === name || exact.name === `_root_.${name}`)) return strip(exact);
+    const res = await sendMessageP({ action: 'CONSTANT_SIGNATURE', name, fileRef });
+    if (res && res.type) return res.type;
+    const loose = pr && pr.find(name);
+    return loose && loose.typeSignature ? strip(loose) : null;
+  }
+
+  /**
+   * Finish a local-variable tooltip that needs more work: a type inferred by the worker
+   * (`obtain h | h := le_or_gt b 1`), a structure field (`e.1`), and replaying the tactics
+   * that changed the hypothesis since it was bound (`rw [Set.uIcc_of_le h] at hy`).
+   */
+  async function refineLocal(shown, contextText, fileRef) {
+    const ctx = window.VersoBinderContext;
+    let info = Object.assign({}, shown);
+    if (info.inferNeeded) {
+      const res = await sendMessageP(Object.assign({ action: 'INFER_PATTERN', fileRef }, info.inferNeeded));
+      if (res && res.typeSignature) {
+        info.typeSignature = res.typeSignature;
+        info.docstring = `Local variable from \`${info.inferNeeded.term}\`; type inferred from \`${res.from} : … → ${res.conclusion}\`` +
+          (res.note ? ` (${res.note})` : '') + '.';
+        if (info.replay) {
+          info.replay = Object.assign({}, info.replay, { baseType: res.typeSignature.slice(info.name.length + 3), lead: info.docstring });
+        }
+      }
+    }
+    if (info.structureNeeded) {
+      const res = await sendMessageP(Object.assign({ action: 'STRUCTURE_FIELD' }, info.structureNeeded));
+      if (res && res.field) {
+        info.typeSignature = `${info.name} : ${res.field.type}`;
+        info.docstring = `Field \`${res.field.name}\` of \`${res.structure}\`.\n\n` + info.docstring;
+      }
+    }
+    if (info.replay && info.replay.baseType && ctx) {
+      const result = await ctx.replayChanges(info.replay.baseType, info.replay.changes, contextText,
+        (name) => constantSignature(name, fileRef));
+      info = Object.assign(info, ctx.describeReplay(info, result));
+    }
+    return info;
+  }
+
   /**
    * Is the hovered word comment / docstring prose? GitHub wraps comments in `.pl-c`.
    * Code in backticks inside a docstring still counts as code.
@@ -331,29 +392,12 @@
     // 0. Local variables shadow everything else: show their type.
     if (lookup.local) {
       window.VersoTooltipView.show(lookup.local, boundingRect);
-      if (lookup.local.inferNeeded) {
-        // `obtain h | h := le_or_gt b 1`: the worker instantiates the lemma and destructures it.
-        const shown = lookup.local;
+      const needsMore = lookup.local.inferNeeded || lookup.local.structureNeeded || lookup.local.replay;
+      if (needsMore) {
         const fileRef = window.VersoBinderContext && window.VersoBinderContext.fileRefFromDom(tokenInfo.textNode);
-        chrome.runtime.sendMessage(Object.assign({ action: "INFER_PATTERN", fileRef }, shown.inferNeeded), (res) => {
-          if (lastHoveredToken !== token || !res || !res.typeSignature) return;
-          window.VersoTooltipView.show(Object.assign({}, shown, {
-            typeSignature: res.typeSignature,
-            docstring: `Local variable from \`${shown.inferNeeded.term}\`; type inferred from \`${res.from} : … → ${res.conclusion}\`` +
-              (res.note ? ` (${res.note})` : '') + '.'
-          }), boundingRect);
-        });
-      }
-      if (lookup.local.structureNeeded) {
-        // Structure projection: the worker reads the n-th field from the constructor.
-        const shown = lookup.local;
-        chrome.runtime.sendMessage({ action: "STRUCTURE_FIELD", ...shown.structureNeeded }, (res) => {
-          if (lastHoveredToken !== token || !res || !res.field) return;
-          window.VersoTooltipView.show(Object.assign({}, shown, {
-            typeSignature: `${shown.name} : ${res.field.type}`,
-            docstring: `Field \`${res.field.name}\` of \`${res.structure}\`.\n\n` + shown.docstring
-          }), boundingRect);
-        });
+        refineLocal(lookup.local, lookup.contextText, fileRef).then((info) => {
+          if (lastHoveredToken === token && info) window.VersoTooltipView.show(info, boundingRect);
+        }).catch(() => { /* keep the provisional tooltip */ });
       }
       return;
     }
@@ -564,7 +608,7 @@
   });
 
   // Exposed for the test suite.
-  window.VersoContentInternals = { receiverFor, lookupContext, isInProse, isInAttribute };
+  window.VersoContentInternals = { receiverFor, lookupContext, isInProse, isInAttribute, refineLocal };
 
   // Startup
   loadSettings();

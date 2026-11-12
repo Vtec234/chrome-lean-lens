@@ -495,11 +495,11 @@ const uIccDecl = [
   "    rw [abs_of_nonneg h]",
   "    exact (abs_le).mpr ⟨by linarith [hy.1], hy.2⟩"
 ].join("\n");
+// `hy` is rewritten before use: the projection is resolved by replaying the rewrite (section 14).
 const p1 = bc.projectionInfo("hy.1", uIccDecl);
-assert.strictEqual(p1.typeSignature, "hy.1 : (0 : ℝ) ⊓ s ≤ y");
-assert(p1.docstring.includes("rw [Set.uIcc_of_le h] at hy"), "warns that hy was rewritten");
-assert.strictEqual(bc.projectionInfo("hy.2", uIccDecl).typeSignature, "hy.2 : y ≤ (0 : ℝ) ⊔ s");
-assert(bc.localVariableInfo("hy", uIccDecl).docstring.includes("is changed before this point"), "hovering hy itself also warns");
+assert.strictEqual(p1.typeSignature, "hy.1 : _", "provisional until the rewrite is replayed");
+assert(p1.replay && p1.docstring.includes("rw [Set.uIcc_of_le h] at hy"), "names the rewrite it applies");
+assert(bc.localVariableInfo("hy", uIccDecl).replay, "hovering hy itself also replays the rewrite");
 assert.strictEqual(bc.projectionInfo("hz.1", uIccDecl), null, "unknown bases are not projections");
 assert.strictEqual(bc.projectionInfo("hy.le", uIccDecl), null, "named fields are not anonymous projections");
 const needs = bc.projectionInfo("e.1", "theorem foo (e : α ≃ β) : True := by\n  exact e.1");
@@ -618,6 +618,64 @@ assert(pend && pend.term === "le_or_gt b 1" && pend.caseIdx === 2, JSON.stringif
 assert.strictEqual(bc.inferReceiverNamespace("hx0", obt), "LT.lt");
 console.log("   ✓ Local type inference verified.\n");
 
-console.log("==================================================");
-console.log("  ALL TESTS PASSED SUCCESSFULLY (100% OK)");
-console.log("==================================================");
+// 14. Replaying `rw … at h` (async: collected and awaited before the final verdict)
+console.log("14. Testing rewrite replay...");
+const asyncChecks = [];
+const roundTrip = ["y ∈ Set.uIcc (0 : ℝ) s", "|x| < 1", "a * b * c = 1", "c * (a * b) = 1", "¬a = b", "∀ x ∈ s, f x = 0",
+  "‖f x - g x‖ ≤ ε", "(f ∘ g) x = f (g x)", "x⁻¹ * x = 1", "↑n + 1 = ↑(n + 1)", "-(a - b) = b - a", "x ∈ {z : ℂ | |z.im| < a}",
+  "‖fourierCoeff f k‖ ≤ M * Real.exp (-(2 * π * a / T) * |(k : ℝ)|)", "a ≤ b ∧ b ≤ c → a ≤ c"];
+for (const t of roundTrip) assert.strictEqual(bc.showTerm(bc.parseTerm(t)), t, `parse/print round trip: ${t}`);
+assert.strictEqual(bc.parseTerm("x +"), null, "malformed terms don't parse");
+
+const SIGS = {
+  "Set.uIcc_of_le": "{α : Type u_1} [Lattice α] {a b : α} (h : a ≤ b) : Set.uIcc a b = Set.Icc a b",
+  "Set.uIcc_of_ge": "{α : Type u_1} [Lattice α] {a b : α} (h : b ≤ a) : Set.uIcc a b = Set.Icc b a",
+  "mul_comm": "{G : Type u_1} [CommMagma G] (a b : G) : a * b = b * a",
+  "sub_nonneg": "{α : Type u_1} [AddGroup α] [LE α] [AddRightMono α] {a b : α} : 0 ≤ a - b ↔ b ≤ a",
+  "abs_of_nonneg": "{α : Type u_1} [Lattice α] [AddGroup α] {a : α} [AddLeftMono α] (h : 0 ≤ a) : |a| = a",
+  "Nat.succ_eq_add_one": "(n : ℕ) : n.succ = n + 1",
+  "add_zero": "{M : Type u} [AddZeroClass M] (a : M) : a + 0 = a",
+  "add_comm": "{G : Type u_1} [AddCommMagma G] (a b : G) : a + b = b + a",
+  "div_eq_iff": "{G₀ : Type u_3} [GroupWithZero G₀] {a b c : G₀} (hb : b ≠ 0) : a / b = c ↔ a = c * b"
+};
+const sigOf = async (n) => SIGS[n] || null;
+const replayed = (text, name) => {
+  const info = name.includes(".") ? bc.projectionInfo(name, text) : bc.localVariableInfo(name, text);
+  if (!info.replay) return Promise.resolve(info.typeSignature);
+  return bc.replayChanges(info.replay.baseType, info.replay.changes, text, sigOf).then(r => bc.describeReplay(info, r).typeSignature);
+};
+const expectReplay = (text, name, want, why) =>
+  asyncChecks.push(replayed(text, name).then(got => assert.strictEqual(got, want, why)));
+
+const uIccFull = uIccDecl + "\n  · rw [Set.uIcc_of_ge h] at hy\n    rw [abs_of_nonpos h]\n    exact (abs_le).mpr ⟨by linarith [hy.1], by linarith [hy.2]⟩";
+expectReplay(uIccDecl, "hy", "hy : y ∈ Set.Icc (0 : ℝ) s", "rw with a lemma (Lean: hy : y ∈ Set.Icc 0 s)");
+expectReplay(uIccDecl, "hy.1", "hy.1 : (0 : ℝ) ≤ y", "projection after the rewrite");
+expectReplay(uIccFull, "hy", "hy : y ∈ Set.Icc s (0 : ℝ)", "only the rewrite in the current `·` case applies");
+expectReplay("example (a b c : ℕ) (h : a = b + c) (hb : b = 2) : a = 2 + c := by\n  rw [hb] at h\n  exact h", "h", "h : a = 2 + c", "local equation");
+expectReplay("example (x y : ℝ) (h : x * y = 1) : True := by\n  rw [mul_comm] at h\n  trivial", "h", "h : y * x = 1", "first instance fixes the variables");
+expectReplay("example (a b c : ℝ) (h : a * b * c = 1) : True := by\n  nth_rw 1 [mul_comm] at h\n  trivial", "h", "h : c * (a * b) = 1", "outermost instance first, parentheses where needed");
+expectReplay("example (a b : ℝ) (h : a ≤ b) : True := by\n  rw [← sub_nonneg] at h\n  trivial", "h", "h : 0 ≤ b - a", "reversed iff");
+expectReplay("example (x : ℝ) (h : |x| < 1) (hx : 0 ≤ x) : x < 1 := by\n  rw [abs_of_nonneg hx] at h\n  exact h", "h", "h : x < 1", "hypothesis argument fixes variables");
+expectReplay("example (a : ℝ) (h : 2 * a = 4) : True := by\n  rw [show (2 : ℝ) * a = a * 2 by ring] at h\n  trivial", "h", "h : a * 2 = 4", "`show … by` rules");
+expectReplay("example (n : ℕ) (h : n.succ = 5) : True := by\n  rw [Nat.succ_eq_add_one] at h\n  trivial", "h", "h : n + 1 = 5", "dot notation in the lemma");
+expectReplay("example (a b : ℝ) (h : a + b = b + a + 0) : True := by\n  rw [add_zero, add_comm] at h\n  trivial", "h", "h : b + a = b + a", "several rules in order");
+expectReplay("example (f : ℕ → ℕ) (hf : ∀ n, f n = n + 1) (h : f 3 = 4) : True := by\n  rw [hf 3] at h\n  trivial", "h", "h : 3 + 1 = 4", "local ∀-equation with an argument");
+expectReplay("example (x : ℝ) (h : x ∈ Set.Icc (0:ℝ) 1) : True := by\n  simp only [Set.mem_Icc] at h\n  trivial", "h", "h : x ∈ Set.Icc (0:ℝ) 1  -- outdated", "simp can't be replayed: flagged, not presented as current");
+expectReplay("example (x : ℝ) (h : x ∈ Set.Icc (0:ℝ) 1) : True := by\n  simp only [Set.mem_Icc] at h\n  exact h.1", "h.1", "h.1 : _  -- outdated", "projections of an outdated type are unknown");
+expectReplay("example (a b : ℕ) (h : a = b) (hb : b = 2) : True := by\n  have : a = 2 := by rw [hb] at h; exact h\n  exact trivial", "h", "h : a = b", "a rewrite inside a nested `by` doesn't leak out");
+expectReplay("example (p q : Prop) (hpq : p ↔ q) (hp : p ∧ True) : q := by\n  rw [hpq] at hp\n  exact hp.1", "hp", "hp : q ∧ True", "rewriting with an iff");
+expectReplay("example (x : ℝ) (h : x = 1) : True := by\n  change x = 1 at h\n  trivial", "h", "h : x = 1", "`change … at h`");
+expectReplay("example (a b c : ℝ) (hc : c ≠ 0) (h : a / c = b) : True := by\n  rw [div_eq_iff hc] at h\n  trivial", "h", "h : a = b * c",
+  "the lemma's own variables can't capture locals with the same names (Lean: a = b * c)");
+assert.deepStrictEqual(JSON.parse(JSON.stringify(bc.hypothesisChanges("hy", "(hy : P)\n  rw [a] at hy hz ⊢\n  -- rw [b] at hy\n  norm_num at *\n  exact hy", 0).map(c => c.kind))),
+  ["rw", "opaque"], "comments are ignored; `at *` counts");
+
+Promise.all(asyncChecks).then(() => {
+  console.log("   ✓ Rewrite replay verified.\n");
+  console.log("==================================================");
+  console.log("  ALL TESTS PASSED SUCCESSFULLY (100% OK)");
+  console.log("==================================================");
+}, (err) => {
+  console.error(err);
+  process.exit(1);
+});

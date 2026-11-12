@@ -1024,6 +1024,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true; // Keep message channel open for async response
   }
 
+  if (action === "CONSTANT_SIGNATURE") {
+    // Statement of a rewrite rule's constant, for replaying `rw … at h` in the page.
+    (async () => {
+      const hit = await loogleExact(await qualifyConstant(request.name, request.fileRef));
+      return hit && hit.type ? { name: hit.name, type: hit.type } : null;
+    })().then(sendResponse, () => sendResponse(null));
+    return true;
+  }
+
   if (action === "INFER_PATTERN") {
     inferPattern(request).then((r) => sendResponse(r));
     return true;
