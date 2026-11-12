@@ -4,8 +4,6 @@ A Chrome extension for reviewing **Lean 4** pull requests on GitHub. Hover over 
 
 It works on both GitHub diff views (the classic `/files` view and the newer `/changes` view) and on file pages.
 
-> Lean Lens was originally called *Verso*. It does not use [Verso](https://github.com/leanprover/verso); its tooltips are only styled after Lean's documentation hovers.
-
 ---
 
 ## What a hover shows
