@@ -670,6 +670,54 @@ expectReplay("example (a b c : ℝ) (hc : c ≠ 0) (h : a / c = b) : True := by\
 assert.deepStrictEqual(JSON.parse(JSON.stringify(bc.hypothesisChanges("hy", "(hy : P)\n  rw [a] at hy hz ⊢\n  -- rw [b] at hy\n  norm_num at *\n  exact hy", 0).map(c => c.kind))),
   ["rw", "opaque"], "comments are ignored; `at *` counts");
 
+// 15. Checked against Lean on PR 45909: binders, `have h := lemma args`, ranges, big operators
+console.log("15. Testing cases from checking PR 45909 against Lean...");
+// Big-operator bodies use Mathlib's precedences (∑ body: 67), so `+ f n` is outside the sum.
+assert.strictEqual(bc.parseTerm("∑ x ∈ Finset.range n, f x + f n").k, "bin", "∑ x ∈ s, f x + f n = (∑ …) + f n");
+assert.strictEqual(bc.showTerm(bc.parseTerm("∑ x ∈ Finset.range n, (f x + f n)")), "∑ x ∈ Finset.range n, (f x + f n)");
+// Binders match up to annotations and renaming; ranges match as terms.
+const intA = bc.parseTerm("∫ y in (0 : ℝ)..s, g ((y : ℂ) * Complex.I)");
+const intB = bc.parseTerm("∫ y : ℝ in (0:ℝ)..s, g ((y:ℂ) * Complex.I)");
+const intC = bc.parseTerm("∫ (t : ℝ) in 0..s, g (↑t * Complex.I)");
+assert(bc.matchTerm(intA, intB, new Set(), new Map()) && bc.matchTerm(intA, intC, new Set(), new Map()), "same integral, different spelling");
+assert(!bc.matchTerm(intA, bc.parseTerm("∫ y in (0 : ℝ)..T, g ((y : ℂ) * Complex.I)"), new Set(), new Map()), "different range");
+// `a..b` ranges are substituted; field accesses are not.
+assert.strictEqual(bc.replaceWord("x in a..b, f x", "b", "T"), "x in a..T, f x");
+assert.strictEqual(bc.replaceWord("x.b + b", "b", "T"), "x.b + T");
+
+const hrectDecl = [
+  "theorem foo : True := by",
+  "  have hrect' : (∫ x : ℝ in (0:ℝ)..T, g ((x:ℂ)))",
+  "      + Complex.I • (∫ y : ℝ in (0:ℝ)..s, g ((T:ℂ) + (y:ℂ) * Complex.I)) = 0 := by",
+  "    simpa using hrect",
+  "  have hvert_int : ∫ y in (0 : ℝ)..s, g ((T : ℂ) + (y : ℂ) * Complex.I)",
+  "      = ∫ y in (0 : ℝ)..s, g ((y : ℂ) * Complex.I) :=",
+  "    intervalIntegral.integral_congr (fun y hy => hvert y hy)",
+  "  rw [hvert_int] at hrect'",
+  "  linear_combination hrect'"
+].join("\n");
+expectReplay(hrectDecl, "hrect'", "hrect' : (∫ x : ℝ in (0:ℝ)..T, g (x : ℂ)) + Complex.I • (∫ y in (0 : ℝ)..s, g ((y : ℂ) * Complex.I)) = 0",
+  "rewriting an integral spelled differently in the hypothesis (Lean agrees)");
+
+// `have hb := lemma (a := …) … (f := fun x => …)`: instantiate and beta-reduce, as Lean does.
+const NORM_INT = "{E : Type u_5} [NormedAddCommGroup E] [NormedSpace ℝ E] {a b C : ℝ} {f : ℝ → E} (h : ∀ x ∈ Set.uIoc a b, ‖f x‖ ≤ C) : ‖∫ (x : ℝ) in a..b, f x‖ ≤ C * |b - a|";
+const haveDecl = [
+  "theorem foo : True := by",
+  "    have hb := norm_integral_le_of_norm_le_const (a := (0 : ℝ)) (b := T)",
+  "      (C := M * Real.exp (2 * π * k * s / T))",
+  "      (f := fun x : ℝ => H ((x : ℂ) + (s : ℂ) * Complex.I))",
+  "      (fun x _ => hpoint x)",
+  "    rwa [sub_zero, abs_of_pos hT.out] at hb"
+].join("\n");
+const hbInfo = bc.localVariableInfo("hb", haveDecl);
+assert(hbInfo.inferNeeded && hbInfo.inferNeeded.term.startsWith("norm_integral_le_of_norm_le_const (a := (0 : ℝ))"), "the whole multi-line term is read");
+asyncChecks.push(bc.inferPending(hbInfo.inferNeeded, haveDecl, async () => NORM_INT).then(r => assert.strictEqual(r.typeSignature,
+  "hb : ‖∫ (x : ℝ) in (0 : ℝ)..T, H ((x : ℂ) + (s : ℂ) * Complex.I)‖ ≤ M * Real.exp (2 * π * k * s / T) * |T - (0 : ℝ)|",
+  "Lean: ‖∫ (x : ℝ) in 0..T, H (↑x + ↑s * Complex.I)‖ ≤ M * rexp (2 * π * ↑k * s / T) * |T - 0|")));
+// A local function applied to arguments: `have hb := hbound (-s) (by …)`.
+const localApp = "theorem foo : True := by\n  have hbound : ∀ s : ℝ, |s| < a → ‖c‖ ≤ M * Real.exp (e * s) := by\n    intro s hsb\n    exact sorry\n  have hb := hbound (-s) (by rwa [abs_neg])\n  exact hb";
+assert.strictEqual(bc.localVariableInfo("hb", localApp).typeSignature, "hb : ‖c‖ ≤ M * Real.exp (e * -s)");
+
 Promise.all(asyncChecks).then(() => {
   console.log("   ✓ Rewrite replay verified.\n");
   console.log("==================================================");

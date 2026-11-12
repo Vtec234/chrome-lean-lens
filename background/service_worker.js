@@ -664,8 +664,9 @@ function signatureBinders(sig) {
 }
 
 function replaceWord(text, name, value) {
+  // Not inside a longer name or a field access `x.name`; after a range `a..name` it counts.
   const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return text.replace(new RegExp(`(^|[^\\w'.\\u2080-\\u2089])${esc}(?![\\w'\\u2080-\\u2089])`, 'g'), (_, pre) => pre + value);
+  return text.replace(new RegExp(`(?<![\\w'\\u2080-\\u209C])(?<!(?:^|[^.])\\.)${esc}(?![\\w'\\u2080-\\u209C])`, 'g'), () => value);
 }
 
 /**

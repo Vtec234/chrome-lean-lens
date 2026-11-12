@@ -617,9 +617,13 @@
     return x;
   };
 
+  /**
+   * Replace the identifier `word` (not part of a longer name or a field access `x.word`;
+   * after a range `a..word` it counts as a name).
+   */
   function replaceWord(text, word, value) {
     const esc = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return text.replace(new RegExp(`(^|[^\\w'.\\u2080-\\u209C])${esc}(?![\\w'\\u2080-\\u209C])`, 'g'), (_, pre) => pre + value);
+    return text.replace(new RegExp(`(?<![\\w'\\u2080-\\u209C])(?<!(?:^|[^.])\\.)${esc}(?![\\w'\\u2080-\\u209C])`, 'g'), () => value);
   }
 
   /** Split at depth-0 occurrences of `sep`. */
@@ -963,6 +967,21 @@
       }
       if (head) return { types: [], source: `\`${term}\``, caseIdx, pending: { pattern: pat, term, name } };
       return null;
+    }
+
+    // have x := TERM (no type): the type of TERM, from its head's signature.
+    m = line.match(/^(?:have|haveI|let)\s+([^\s:=()]+)\s*:=\s*/);
+    if (m && m[1] === name) {
+      const term = fullTermAt(text, pos + m[0].length);
+      if (!term || /^(by|fun|λ|⟨)\b|^[(⟨]/.test(term)) return null;
+      const parts = appParts(term);
+      if (!parts) return null;
+      const local = /^[\w'\u0370-\u03FF\u2080-\u209C]+$/.test(parts.head) ? localType(parts.head, text) : null;
+      if (local) {
+        const app = applicationTypeFrom(local, parts.positional, parts.named, text);
+        return app ? { types: [{ type: app.type, tag: null }], source: `\`${parts.head}\`'s type` } : null;
+      }
+      return { types: [], source: `\`${term}\``, caseIdx: 0, pending: { pattern: name, term, name } };
     }
 
     // set x := v with hx
@@ -1325,6 +1344,8 @@
     '•': [73, 'r'], '^': [75, 'r'], '×ˢ': [82, 'r'], '∘': [90, 'r']
   };
   const T_BINDER_HEADS = new Set(['∀', '∃', '∃!', '∑', '∏', '⋃', '⋂', '⨆', '⨅', '∫', 'λ', 'Π']);
+  // Precedence of a binder notation's body (Mathlib: `∑ x ∈ s, f x` takes `term:67`, `∫ … , r:60`).
+  const T_BODY_PREC = { '∑': 67, '∏': 67, '∫': 60, '⋃': 60, '⋂': 60, '⨆': 60, '⨅': 60 };
   const T_STOP_WORDS = new Set(['at', 'with', 'from', 'by', 'using', 'then', 'else', 'in', 'do']);
   const T_OPENERS = ['(', '[', '{', '⟨', '[['];
   const T_CLOSERS = [')', ']', '}', '⟩', ']]'];
@@ -1410,7 +1431,7 @@
     const binders = tRawUntil(st, stops);
     const sep = tNext(st);
     if (!sep || sep.k !== 'op' || !stops.includes(sep.v)) throw new Error('binder');
-    return { k: 'bind', head, binders, sep: sep.v, body: tExpr(st, 0) };
+    return { k: 'bind', head, binders, sep: sep.v, body: tExpr(st, T_BODY_PREC[head] || 0) };
   }
 
   function tPrefix(st) {
@@ -1523,7 +1544,9 @@
         break;
       }
       case 'bind':
-        s = n.head === 'fun' || n.head === 'λ' ? `fun ${n.binders} ${n.sep} ${showTerm(n.body)}` : `${n.head} ${n.binders}, ${showTerm(n.body)}`;
+        s = n.head === 'fun' || n.head === 'λ'
+          ? `fun ${n.binders} ${n.sep} ${showTerm(n.body)}`
+          : `${n.head} ${n.binders}, ${showTerm(n.body, T_BODY_PREC[n.head] || 0)}`;
         break;
       default: s = '?';
     }
@@ -1601,15 +1624,64 @@
         return tp.args.length === tt.args.length && matchTerm(tp.f, tt.f, vars, sub) &&
           tp.args.every((e, i) => matchTerm(e, tt.args[i], vars, sub));
       case 'bin': return tp.op === tt.op && matchTerm(tp.l, tt.l, vars, sub) && matchTerm(tp.r, tt.r, vars, sub);
-      case 'bind': return tp.head === tt.head && tRawEq(tp.binders, tt.binders) && matchTerm(tp.body, tt.body, vars, sub);
+      case 'bind': {
+        if (tp.head !== tt.head) return false;
+        const bp = binderParts(tp.binders), bt = binderParts(tt.binders);
+        if (bp.names.length !== bt.names.length || bp.op !== bt.op || (bp.range === null) !== (bt.range === null)) return false;
+        if (bp.range !== null) {
+          const rp = bp.range.split('..'), rt = bt.range.split('..');
+          if (rp.length !== rt.length) return false;
+          for (let i = 0; i < rp.length; i++) {
+            const a = parseTerm(rp[i]), b = parseTerm(rt[i]);
+            if (a && b ? !matchTerm(a, b, vars, sub) : !tRawEq(rp[i], rt[i])) return false;
+          }
+        }
+        // Alpha-equivalence: rename the pattern's bound variables to the target's.
+        const ren = new Map(bp.names.map((nm, i) => [nm, { k: 'id', v: bt.names[i] }]));
+        return matchTerm(substTerm(tp.body, ren), tt.body, vars, sub);
+      }
       default: return false;
     }
   }
   const sameTerm = (a, b) => matchTerm(a, b, new Set(), new Map());
 
+  /**
+   * Bound names, binder relation and range of a binder list, ignoring type annotations:
+   * `y : ℝ in (0:ℝ)..s` and `y in (0 : ℝ)..s` → { names: [y], op: 'in', range: '(0:ℝ)..s' }.
+   */
+  function binderParts(b) {
+    let t = (b || '').replace(/\s+/g, ' ').trim();
+    let op = null;
+    let range = null;
+    const rel = t.match(/\s(in|∈|∉|<|≤|>|≥|≠|⊆)\s/);
+    if (rel) {
+      op = rel[1];
+      range = t.slice(rel.index + rel[0].length).trim();
+      t = t.slice(0, rel.index).trim();
+    }
+    let names = [];
+    const groups = [...t.matchAll(/[({⦃[]\s*([^(){}⦃⦄[\]:]+?)\s*:/g)];
+    if (groups.length) groups.forEach(g => names.push(...g[1].trim().split(/\s+/)));
+    else names = t.split(':')[0].trim().split(/\s+/);
+    return { names: names.filter(Boolean), op, range };
+  }
+
   /** Substitute variables (Map name → node) into `n`. */
   function substTerm(n, sub) {
     if (!n) return n;
+    if (n.k === 'app' && n.f.k === 'id' && sub.has(n.f.v)) {
+      // `f x` with `f := fun x => b` becomes `b[x := …]`, as Lean's instantiation beta-reduces.
+      const fn = tCore(sub.get(n.f.v));
+      if (fn && fn.k === 'bind' && (fn.head === 'fun' || fn.head === 'λ')) {
+        const params = boundNamesOf(fn.binders);
+        const args = n.args.map(a => substTerm(a, sub));
+        if (params.length && args.length >= params.length) {
+          const body = substTerm(fn.body, new Map(params.map((p, i) => [p, args[i]])));
+          const rest = args.slice(params.length);
+          return rest.length ? { k: 'app', f: Object.assign({}, body, { paren: true }), args: rest } : body;
+        }
+      }
+    }
     if (n.k === 'id') {
       if (sub.has(n.v)) return sub.get(n.v);
       const dot = n.v.indexOf('.');
@@ -1760,16 +1832,19 @@
    * positional / named arguments, and direction. Hypothesis arguments fix variables through
    * their types (`h : 0 ≤ s` for `(h : a ≤ b)` gives `a := 0, b := s`).
    */
-  function ruleEquationFrom(sig, positional, named, rev, text) {
+  /**
+   * Instantiate a signature with an application's arguments. The signature's own variables are
+   * renamed apart first, so arguments mentioning a local with the same name (`div_eq_iff hc`,
+   * `hc : c ≠ 0`, while the lemma also has a `c`) can't be captured. Explicit arguments fill
+   * explicit binders in order; hypothesis arguments fix variables through their types
+   * (`h : 0 ≤ s` for `(h : a ≤ b)` gives `a := 0, b := s`); named arguments win.
+   */
+  function instantiateSignature(sig, positional, named, text) {
     const peeled = peelSignature(sig);
-    // Rename the rule's own variables apart, so arguments that mention a local with the same
-    // name (`div_eq_iff hc` with `hc : c ≠ 0`, where the lemma also has a `c`) can't be captured.
     const own = [...new Set(peeled.binders.flatMap(b => b.names))];
     const fresh = (n) => `__pv_${n}`;
     const ren = (str) => own.reduce((acc, n) => replaceWord(acc, n, fresh(n)), str || '');
     const binders = peeled.binders.map(b => ({ names: b.names.map(fresh), type: ren(b.type), explicit: b.explicit }));
-    const concl = ren(peeled.concl);
-    named = Object.fromEntries(Object.entries(named).map(([k, v]) => [own.includes(k) ? fresh(k) : k, v]));
     const vars = new Set(binders.flatMap(b => b.names));
     const slots = binders.filter(b => b.explicit).flatMap(b => (b.names.length ? b.names : [null]).map(n => ({ name: n, type: b.type })));
     const sub = new Map();
@@ -1777,8 +1852,7 @@
       const slot = slots[k];
       if (!slot || a === '_' || a === '?_') return;
       const node = parseTerm(a);
-      if (!node) return;
-      if (slot.name) sub.set(slot.name, node);
+      if (node && slot.name) sub.set(slot.name, node);
       const argType = /^[^\s()]+$/.test(a) ? localType(a, text) : null;
       const slotT = argType && slot.type && parseTerm(slot.type);
       const argT = argType && parseTerm(argType);
@@ -1789,14 +1863,83 @@
     });
     for (const [n, v] of Object.entries(named)) {
       const node = parseTerm(v);
-      if (node) sub.set(n, node);
+      if (node && own.includes(n)) sub.set(fresh(n), node);
     }
-    const c = parseTerm(concl);
+    return { concl: ren(peeled.concl), vars, sub, own, fresh };
+  }
+
+  function ruleEquationFrom(sig, positional, named, rev, text) {
+    const inst = instantiateSignature(sig, positional, named, text);
+    const c = parseTerm(inst.concl);
     if (!c || c.k !== 'bin' || (c.op !== '=' && c.op !== '↔')) return null;
-    let lhs = substTerm(c.l, sub);
-    let rhs = substTerm(c.r, sub);
+    let lhs = substTerm(c.l, inst.sub);
+    let rhs = substTerm(c.r, inst.sub);
     if (rev) [lhs, rhs] = [rhs, lhs];
-    return { lhs, rhs, vars: new Set([...vars].filter(v => !sub.has(v))) };
+    return { lhs, rhs, vars: new Set([...inst.vars].filter(v => !inst.sub.has(v))) };
+  }
+
+  /**
+   * Type of `head args…` from `head`'s signature: its conclusion with the arguments
+   * substituted. Variables no argument determines keep their names and are reported.
+   */
+  function applicationTypeFrom(sig, positional, named, text) {
+    const inst = instantiateSignature(sig, positional, named, text);
+    const c = parseTerm(inst.concl);
+    if (!c) return null;
+    const out = substTerm(c, inst.sub);
+    const unresolved = [...freeNames(out)].filter(x => inst.vars.has(x)).map(x => x.slice(5));
+    const back = new Map(inst.own.map(n => [inst.fresh(n), { k: 'id', v: n }]));
+    return { type: showTerm(substTerm(out, back)), unresolved };
+  }
+
+  /** Head, positional and named arguments of an application `f a (b := c) d`. */
+  function appParts(term) {
+    const t = (term || '').trim().replace(/^@/, '');
+    const head = applicationHead(t);
+    if (!head) return null;
+    const positional = [];
+    const named = {};
+    for (const a of splitApp(t).slice(1)) {
+      const nm = a.match(/^\(\s*([^\s:()]+)\s*:=\s*([\s\S]+)\)$/);
+      if (nm) named[nm[1]] = nm[2].trim();
+      else positional.push(a);
+    }
+    return { head, positional, named };
+  }
+
+  /**
+   * Types for a pattern bound to a term with a constant head — `obtain h | h := le_or_gt b 1`,
+   * `have hb := foo hx (c := M)` — given `sigOf(name)` for constants (PR declarations, Loogle).
+   * Resolves to { typeSignature, note, from, conclusion, unresolved } or null.
+   */
+  async function inferPending(pending, text, sigOf) {
+    const parts = appParts(pending.term);
+    if (!parts) return null;
+    let sig = /^[\w'\u0370-\u03FF\u2080-\u209C]+$/.test(parts.head) ? localType(parts.head, text) : null;
+    if (!sig && sigOf) sig = await sigOf(parts.head);
+    if (!sig) return null;
+    const app = applicationTypeFrom(sig, parts.positional, parts.named, text);
+    if (!app) return null;
+    const out = new Map();
+    destructure(parsePattern(pending.pattern), app.type, out);
+    const types = (out.get(pending.name) || []).filter(t => t.type);
+    if (!types.length) return null;
+    const f = formatInferred(pending.name, { types, caseIdx: pending.caseIdx || 0 });
+    return { typeSignature: f.typeSignature, note: f.note, from: parts.head, conclusion: app.type, unresolved: app.unresolved };
+  }
+
+  /** The term starting at `start`, including continuation lines indented deeper than its line. */
+  function fullTermAt(text, start) {
+    const ls = text.lastIndexOf('\n', start - 1) + 1;
+    const indent = (text.slice(ls).match(/^\s*/) || [''])[0].length;
+    let end = text.indexOf('\n', start);
+    while (end !== -1) {
+      const next = text.indexOf('\n', end + 1);
+      const line = text.slice(end + 1, next === -1 ? text.length : next);
+      if (!line.trim() || (line.match(/^\s*/) || [''])[0].length <= indent) break;
+      end = next;
+    }
+    return text.slice(start, end === -1 ? text.length : end).replace(/--[^\n]*/g, '').replace(/\s+/g, ' ').trim();
   }
 
   /** Equation for one rule of `rw [...]`; `sigOf(name)` gives a constant's signature (may be async). */
@@ -1805,16 +1948,10 @@
     let rev = Boolean(rule.rev);
     const show = term.match(/^\(?\s*show\s+([\s\S]+?)\s+(?:from|by)\b/);
     if (show) return ruleEquationFrom(show[1], [], {}, rev, text);
-    term = term.replace(/^@/, '');
-    let head = applicationHead(term);
-    if (!head) return null;
-    const positional = [];
-    const named = {};
-    for (const a of splitApp(term).slice(1)) {
-      const nm = a.match(/^\(\s*([^\s:()]+)\s*:=\s*([\s\S]+)\)$/);
-      if (nm) named[nm[1]] = nm[2].trim();
-      else positional.push(a);
-    }
+    const parts = appParts(term);
+    if (!parts) return null;
+    let head = parts.head;
+    const { positional, named } = parts;
     if (/\.symm$/.test(head)) { rev = !rev; head = head.slice(0, -5); }
     let sig = /^[\w'Ͱ-Ͽ₀-ₜ]+$/.test(head) ? localType(head, text) : null;
     if (!sig && sigOf) sig = await sigOf(head);
@@ -2054,6 +2191,8 @@
     hypothesisChanges,
     replayChanges,
     describeReplay,
+    inferPending,
+    applicationTypeFrom,
     parenReceiver,
     applicationHead,
     typeHead,

@@ -334,12 +334,14 @@
   async function refineLocal(shown, contextText, fileRef) {
     const ctx = window.VersoBinderContext;
     let info = Object.assign({}, shown);
-    if (info.inferNeeded) {
-      const res = await sendMessageP(Object.assign({ action: 'INFER_PATTERN', fileRef }, info.inferNeeded));
+    if (info.inferNeeded && ctx) {
+      // Instantiate the term's head (a PR declaration or a Loogle constant) with its arguments.
+      const res = await ctx.inferPending(info.inferNeeded, contextText, (name) => constantSignature(name, fileRef));
       if (res && res.typeSignature) {
         info.typeSignature = res.typeSignature;
-        info.docstring = `Local variable from \`${info.inferNeeded.term}\`; type inferred from \`${res.from} : … → ${res.conclusion}\`` +
-          (res.note ? ` (${res.note})` : '') + '.';
+        info.docstring = `Local variable from \`${info.inferNeeded.term.length > 80 ? info.inferNeeded.term.slice(0, 77) + '…' : info.inferNeeded.term}\`; ` +
+          `type inferred from the statement of \`${res.from}\`` + (res.note ? ` (${res.note})` : '') +
+          (res.unresolved && res.unresolved.length ? `; \`${res.unresolved.join('`, `')}\` couldn't be determined from the arguments` : '') + '.';
         if (info.replay) {
           info.replay = Object.assign({}, info.replay, { baseType: res.typeSignature.slice(info.name.length + 3), lead: info.docstring });
         }
