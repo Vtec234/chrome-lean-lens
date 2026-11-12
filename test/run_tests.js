@@ -192,9 +192,22 @@ const mockLoogleHits = [
 ];
 
 // Load the real selection logic from the service worker (stubbing the chrome API).
+// A working in-memory chrome.storage and a captured message listener (exercised in section 17).
+const fakeStorage = {};
+const workerListeners = [];
 context.chrome = {
-  runtime: { onMessage: { addListener: () => {} } },
-  storage: { local: { get: () => {}, set: () => {}, clear: () => {} } }
+  runtime: { onMessage: { addListener: (fn) => workerListeners.push(fn) } },
+  storage: { local: {
+    get: (keys, cb) => {
+      const out = {};
+      const wanted = keys === null ? Object.keys(fakeStorage) : [].concat(keys);
+      wanted.forEach(k => { if (k in fakeStorage) out[k] = fakeStorage[k]; });
+      if (cb) cb(out);
+    },
+    set: (obj, cb) => { Object.assign(fakeStorage, obj); if (cb) cb(); },
+    remove: (keys, cb) => { [].concat(keys).forEach(k => delete fakeStorage[k]); if (cb) cb(); },
+    clear: (cb) => { Object.keys(fakeStorage).forEach(k => delete fakeStorage[k]); if (cb) cb(); }
+  } }
 };
 loadScript('background/service_worker.js');
 const selectLoogleHit = context.selectLoogleHit;
@@ -785,6 +798,56 @@ asyncChecks.push(context.projectDeclarations({ owner: "AxiomMath", repo: "Rogers
   assert.deepStrictEqual(plain.map(d => `${d.name}${d.inPR ? "*" : ""}`), ["a_thm*", "QTheory.b_thm", "c_def"]);
   assert(!fetched.some(p => p.startsWith("Mathlib/")), "Mathlib imports are left to Loogle");
 }));
+
+// 17. Every message the worker handles works end to end (no network in tests: lookups find nothing).
+console.log("17. Testing the worker's message handlers...");
+assert.strictEqual(workerListeners.length, 1, "the worker registers one message listener");
+const workerSrc = fs.readFileSync(path.join(__dirname, '..', 'background/service_worker.js'), 'utf8');
+const handlerBlock = workerSrc.slice(workerSrc.indexOf('const MESSAGE_HANDLERS = {'), workerSrc.indexOf('const MESSAGE_FALLBACKS'));
+const handled = [...handlerBlock.matchAll(/^  ([A-Z_]+): /gm)].map(m => m[1]);
+assert(handled.length >= 9, `found the handler table (${handled.join(', ')})`);
+// Every action the page, popup or options page sends must have a handler (the content
+// script answers GET_PAGE_INFO / SETTINGS_UPDATED itself).
+const senders = ['content/content.js', 'popup/popup.js', 'options/options.js'].map(f => fs.readFileSync(path.join(__dirname, '..', f), 'utf8')).join('\n');
+const sent = new Set([...senders.matchAll(/action:\s*["']([A-Z_]+)["']/g)].map(m => m[1]));
+['GET_PAGE_INFO', 'SETTINGS_UPDATED'].forEach(a => sent.delete(a));
+for (const a of sent) assert(handled.includes(a), `the worker handles ${a}`);
+const sampleRequests = {
+  LOOKUP_TOKEN: { token: 'foo_bar', subToken: 'foo_bar' },
+  PROJECT_DECLARATIONS: { owner: 'o', repo: 'r', sha: 'abc', paths: ['A.lean'] },
+  CONSTANT_SIGNATURE: { name: 'foo_bar' },
+  INFER_PATTERN: { pattern: 'h', term: 'foo_bar x', name: 'h' },
+  STRUCTURE_FIELD: { type: 'α ≃ β', index: 1, rest: [] },
+  GET_SETTINGS: {},
+  SET_SETTINGS: { settings: { hoverDelay: 300 } },
+  CLEAR_CACHE: {},
+  TEST_LOCAL_SERVER: { url: 'http://127.0.0.1:9' }
+};
+// Handlers run concurrently; the worker logs failures as "[Lean Lens] message handler failed: ACTION …".
+const realWarn = console.warn;
+const handlerFailures = [];
+console.warn = (...a) => {
+  const text = a.map(x => (x instanceof Error ? `${x.name}: ${x.message}` : String(x))).join(' ');
+  if (/message handler failed/.test(text)) handlerFailures.push(text);
+  else realWarn(...a);
+};
+const handlerRuns = handled.map(action => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => reject(new Error(`${action}: no response`)), 10000);
+  let keptOpen;
+  try {
+    keptOpen = workerListeners[0](Object.assign({ action }, sampleRequests[action] || {}), {}, (res) => { clearTimeout(timer); resolve(res); });
+  } catch (err) {
+    clearTimeout(timer);
+    reject(new Error(`${action} threw: ${err.message}`));
+    return;
+  }
+  if (keptOpen !== true) { clearTimeout(timer); reject(new Error(`${action} doesn't respond asynchronously`)); }
+}));
+asyncChecks.push(Promise.all(handlerRuns).then(() => {
+  console.warn = realWarn;
+  assert.deepStrictEqual(handlerFailures, [], `message handlers failed:\n${handlerFailures.join('\n')}`);
+}, (err) => { console.warn = realWarn; throw err; }));
+assert.strictEqual(workerListeners[0]({ action: 'NO_SUCH_ACTION' }, {}, () => {}), false, "unknown actions are ignored");
 
 Promise.all(asyncChecks).then(() => {
   console.log("   ✓ Rewrite replay verified.\n");

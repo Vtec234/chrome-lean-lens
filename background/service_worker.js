@@ -702,7 +702,7 @@ function signatureBinders(sig) {
   const pairs = { '(': ')', '{': '}', '[': ']', '⦃': '⦄' };
   let i = 0;
   while (i < sig.length) {
-    while (sig[i] === ' ') i++;
+    while (i < sig.length && /\s/.test(sig[i])) i++; // groups may be separated by newlines
     const open = sig[i];
     if (!pairs[open]) break;
     let depth = 0, j = i;
@@ -712,7 +712,10 @@ function signatureBinders(sig) {
     }
     const group = sig.slice(i + 1, j);
     const colon = group.indexOf(' : ');
-    if (colon !== -1) groups.push({ names: group.slice(0, colon).trim().split(/\s+/), type: group.slice(colon + 3).trim(), explicit: open === '(' });
+    // A default value (`(left_inv : LeftInverse invFun toFun := by …)`) isn't part of the type.
+    const dflt = colon === -1 ? -1 : group.indexOf(' := ', colon);
+    const type = group.slice(colon + 3, dflt === -1 ? group.length : dflt).replace(/\s+/g, ' ').trim();
+    if (colon !== -1) groups.push({ names: group.slice(0, colon).trim().split(/\s+/), type, explicit: open === '(' });
     else groups.push({ names: [], type: group.trim(), explicit: false }); // anonymous instance `[Fact p]`
     i = j + 1;
   }
@@ -803,13 +806,37 @@ const NUMERIC_FIELDS = {
 };
 
 /** Name of field number `n` of structure `ns` (from the table, or `ns.mk`'s explicit binders). */
-async function numericFieldName(ns, n) {
-  if (NUMERIC_FIELDS[ns]) return NUMERIC_FIELDS[ns][n - 1] || null;
+/** Fields of structure `ns` in order, from `ns.mk`'s explicit parameters: [{ name, type }]. */
+async function structureFields(ns) {
   const hit = await loogleExact(`${ns}.mk`);
   if (!hit || !hit.type) return null;
-  const explicit = signatureBinders(hit.type).filter(b => b.names.length && /^\(/.test(hit.type.slice(hit.type.indexOf(b.names[0]) - 1)));
-  const fields = explicit.flatMap(b => b.names);
-  return fields[n - 1] || null;
+  return signatureBinders(hit.type).filter(b => b.explicit).flatMap(b => b.names.map(name => ({ name, type: b.type })));
+}
+
+async function numericFieldName(ns, n) {
+  if (NUMERIC_FIELDS[ns]) return NUMERIC_FIELDS[ns][n - 1] || null;
+  const fields = await structureFields(ns);
+  return (fields && fields[n - 1] && fields[n - 1].name) || null;
+}
+
+/**
+ * The field reached by anonymous projections `.index.rest…` of a value of structure type
+ * `type` (`e.1` with `e : α ≃ β` is `Equiv.toFun : α → β`): { name, type, structure } or null.
+ */
+async function structureField(type, index, rest) {
+  const bc = self.VersoBinderContext;
+  if (!bc) return null;
+  let head = bc.typeHead(type, null);
+  let current = null;
+  for (const n of [index, ...(rest || [])]) {
+    if (!head) return null;
+    const fields = await structureFields(head);
+    const field = fields && fields[n - 1];
+    if (!field) return null;
+    current = { name: field.name, type: field.type, structure: head };
+    head = bc.typeHead(field.type, null);
+  }
+  return current;
 }
 
 /** `const.path₁.….field`, typing each step from Loogle signatures. */
@@ -1089,57 +1116,28 @@ async function handleLookupWithAlt(request) {
   return primary;
 }
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  const { action } = request;
-
-  if (action === "LOOKUP_TOKEN") {
-    handleLookupWithAlt(request).then((result) => {
-      sendResponse({ success: Boolean(result), data: result });
-    });
-    return true; // Keep message channel open for async response
-  }
-
-  if (action === "PROJECT_DECLARATIONS") {
-    projectDeclarations(request).then((declarations) => sendResponse({ declarations }), () => sendResponse({ declarations: [] }));
-    return true;
-  }
-
-  if (action === "CONSTANT_SIGNATURE") {
-    // Statement of a rewrite rule's constant, for replaying `rw … at h` in the page.
-    (async () => {
-      const hit = await loogleExact(await qualifyConstant(request.name, request.fileRef));
-      return hit && hit.type ? { name: hit.name, type: hit.type } : null;
-    })().then(sendResponse, () => sendResponse(null));
-    return true;
-  }
-
-  if (action === "INFER_PATTERN") {
-    inferPattern(request).then((r) => sendResponse(r));
-    return true;
-  }
-
-  if (action === "STRUCTURE_FIELD") {
-    structureField(request.type, request.index, request.rest).then((f) => {
-      sendResponse(f ? { field: { name: f.name, type: f.type }, structure: f.structure } : null);
-    });
-    return true;
-  }
-
-  if (action === "GET_SETTINGS") {
-    getSettings().then((settings) => {
-      sendResponse({ success: true, settings, stats: queryStats });
-    });
-    return true;
-  }
-
-  if (action === "SET_SETTINGS") {
-    chrome.storage.local.set({ [SETTINGS_KEY]: request.settings }, () => {
-      sendResponse({ success: true });
-    });
-    return true;
-  }
-
-  if (action === "CLEAR_CACHE") {
+// Message handlers: each returns the response (or a promise of it).
+const MESSAGE_HANDLERS = {
+  LOOKUP_TOKEN: async (request) => {
+    const result = await handleLookupWithAlt(request);
+    return { success: Boolean(result), data: result };
+  },
+  PROJECT_DECLARATIONS: async (request) => ({ declarations: await projectDeclarations(request) }),
+  // Statement of a rewrite rule's constant, for replaying `rw … at h` in the page.
+  CONSTANT_SIGNATURE: async (request) => {
+    const hit = await loogleExact(await qualifyConstant(request.name, request.fileRef));
+    return hit && hit.type ? { name: hit.name, type: hit.type } : null;
+  },
+  INFER_PATTERN: (request) => inferPattern(request),
+  STRUCTURE_FIELD: async (request) => {
+    const f = await structureField(request.type, request.index, request.rest);
+    return f ? { field: { name: f.name, type: f.type }, structure: f.structure } : null;
+  },
+  GET_SETTINGS: async () => ({ success: true, settings: await getSettings(), stats: queryStats }),
+  SET_SETTINGS: (request) => new Promise((resolve) => {
+    chrome.storage.local.set({ [SETTINGS_KEY]: request.settings }, () => resolve({ success: true }));
+  }),
+  CLEAR_CACHE: () => new Promise((resolve) => {
     memoryCache.clear();
     rawQueryCache.clear();
     fileTextCache.clear();
@@ -1147,15 +1145,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     // Remove cached lookups only; keep the user's settings.
     chrome.storage.local.get(null, (all) => {
       const keys = Object.keys(all || {}).filter(k => k.startsWith('cache_') || k === TACTIC_CACHE_KEY);
-      chrome.storage.local.remove(keys, () => sendResponse({ success: true }));
+      chrome.storage.local.remove(keys, () => resolve({ success: true }));
     });
-    return true;
+  }),
+  TEST_LOCAL_SERVER: async (request) => {
+    const res = await queryLocalVerso("Nat", request.url || "http://127.0.0.1:8000");
+    return { success: Boolean(res), details: res };
   }
+};
 
-  if (action === "TEST_LOCAL_SERVER") {
-    queryLocalVerso("Nat", request.url || "http://127.0.0.1:8000").then((res) => {
-      sendResponse({ success: Boolean(res), details: res });
+// What the page gets when a handler fails, so it never waits forever.
+const MESSAGE_FALLBACKS = { LOOKUP_TOKEN: { success: false, data: null }, PROJECT_DECLARATIONS: { declarations: [] } };
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  const handler = request && Object.prototype.hasOwnProperty.call(MESSAGE_HANDLERS, request.action) && MESSAGE_HANDLERS[request.action];
+  if (!handler) return false;
+  Promise.resolve()
+    .then(() => handler(request)) // also catches errors thrown synchronously
+    .then(sendResponse, (err) => {
+      console.warn('[Lean Lens] message handler failed:', request.action, err);
+      sendResponse(Object.prototype.hasOwnProperty.call(MESSAGE_FALLBACKS, request.action) ? MESSAGE_FALLBACKS[request.action] : null);
     });
-    return true;
-  }
+  return true; // respond asynchronously
 });
