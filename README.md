@@ -1,130 +1,90 @@
-# Verso: Lean 4 GitHub Code Inspector (Chrome Extension)
+# Lean Lens: Lean 4 Hover Inspector for GitHub
 
-A Chrome extension designed specifically for **Lean 4** code intelligence on GitHub, tailored for **pull request reviews** and repository browsing. Hovering your cursor over any Lean identifier, tactic, or definition instantly displays its definition, type signature, and docstrings rendered in **Verso**'s documentation style.
+A Chrome extension for reviewing **Lean 4** pull requests on GitHub. Hover over an identifier, tactic or local variable in a diff and Lean Lens shows its type signature, docstring and where it comes from, without leaving the page.
 
----
+It works on both GitHub diff views (the classic `/files` view and the newer `/changes` view) and on file pages.
 
-## Key Features
-
-1. **GitHub PR Review Intelligence (In-PR Declaration Scanner)**:
-   - When reviewing a PR, new lemmas or definitions introduced in the PR diff aren't published to upstream documentation yet.
-   - Verso automatically scans the PR diff (unified and split diffs) to index newly added/modified `def`, `theorem`, `lemma`, `inductive`, `structure`, `class`, and `instance` declarations along with their `/-- ... -/` docstrings.
-   - Displays a prominent **"✨ Defined in this PR"** badge and provides a **"Jump to line in PR &rarr;"** button that scrolls directly to where the lemma was introduced.
-
-2. **Loogle & Mathlib 4 Deep Integration**:
-   - Queries the official [Loogle](https://loogle.lean-lang.org/) semantic engine for Lean 4 and Mathlib definitions.
-   - Direct deep-links to the exact symbol in the official Mathlib 4 API documentation.
-
-3. **Built-in Zero-Latency Knowledge Base**:
-   - Includes an offline dictionary of core Lean 4 tactics (`simp`, `rw`, `apply`, `exact`, `intro`, `cases`, `rcases`, `induction`, `obtain`, `ext`, `ring`, `linarith`, `omega`, `norm_num`, `aesop`, `tauto`, etc.) and prelude types (`Nat`, `Int`, `Real`, `List`, `Finset.sum`, `Continuous`, etc.).
-   - Instant response with zero network latency.
-
-4. **Verso-Inspired Tooltip Presentation**:
-   - Styled after Verso's interactive documentation (`.hover-info`):
-     - Syntax-highlighted code blocks for signatures (`∀`, `∃`, `→`, implicit binders `{α : Type}`, typeclasses `[Group G]`).
-     - Rendered markdown docstrings (with formatting, bullet lists, inline code, and math expressions).
-     - Color-coded badges for declaration kinds (`def`, `theorem`, `lemma`, `structure`, `tactic`).
-   - Adapts to GitHub's **dark and light themes** automatically.
-
-5. **Reviewer Productivity Controls**:
-   - **Pin Mode (<kbd>Alt</kbd> or 📌 icon)**: Pins the tooltip so you can select, copy, scroll, or keep it open while comparing code side-by-side.
-   - **Quick Copy**: One-click button to copy the identifier name or type signature.
-   - **Popup Symbol Search**: Search any Lean 4 symbol or tactic right from the extension popup icon in your browser toolbar without switching tabs.
-   - **Optional Local Companion Server**: For private Lean projects or offline environments, run `server/companion_server.py` to query local Lake builds.
+> Lean Lens was originally called *Verso*. It does not use [Verso](https://github.com/leanprover/verso); its tooltips are only styled after Lean's documentation hovers.
 
 ---
 
-## Installation Guide
+## What a hover shows
 
-### Loading into Google Chrome (or Chromium / Brave / Edge)
+- **Mathlib / Lean declarations**: signature, docstring, module and a link to the Mathlib docs, via [Loogle](https://loogle.lean-lang.org/).
+- **Declarations added in the PR**: indexed from the diff (`theorem`, `lemma`, `def`, `structure`, `alias`, …) with multi-line signatures and docstrings, plus a "Jump to line in PR" button.
+- **Tactics**: docstrings for ~470 tactics, parsed from Mathlib's tactic reference and cached for a week (`fun_prop`, `positivity`, `filter_upwards`, …).
+- **Local variables and hypotheses**: their type, whether written (`(hb : 0 < b)`, `have h : …`, `by_cases h : …`, file-level `variable`s) or inferred:
+  - `intro` / `rintro` / `fun`: binders peeled off the goal (`∀ x ∈ s, …`, `A → B`, `s ⊆ t`);
+  - `obtain` / `rcases`: patterns destructured through `∃` / `∧` / `↔` / `∨` (for constant terms such as `le_or_gt b 1`, the lemma's signature is instantiated with the arguments); the `·` bullet you hover in picks the case;
+  - anonymous projections such as `hy.1`, `hy.2`;
+  - a warning when the hypothesis was changed earlier (`rw … at h`, `simp at h`).
+- **Named arguments**: `(b := a)` shows the parameter `b` of the function being applied.
 
-1. Open Chrome and navigate to:
-   ```
-   chrome://extensions
-   ```
-2. In the top-right corner, toggle **Developer mode** to **ON**.
-3. Click the **Load unpacked** button in the top-left.
-4. Select the project directory:
-   ```
-   /Users/seewoolee/Documents/development/chrome-verso
-   ```
-5. The extension **"Verso: Lean 4 GitHub Code Inspector"** will appear in your extensions list.
+## How names are resolved
 
----
+Lean Lens works from the text of the diff, the file at the PR's commit (fetched from `raw.githubusercontent.com`) and Loogle; it does not run Lean.
 
-## How to Test
-
-### 1. Test using the Included PR Review Demo Page
-We include a realistic GitHub PR diff simulator in `test/demo_pr.html`:
-
-1. In Chrome, press <kbd>Cmd</kbd> + <kbd>O</kbd> (or <kbd>Ctrl</kbd> + <kbd>O</kbd>) and open:
-   ```
-   /Users/seewoolee/Documents/development/chrome-verso/test/demo_pr.html
-   ```
-2. Hover over:
-   - `continuous_extend_dense` &rarr; Notice the **✨ Defined in this PR** badge and docstring. Click **"Jump to line 123 in PR"**!
-   - `simp`, `rw`, `obtain`, `intro` &rarr; Notice the tactic docstrings and usage guides.
-   - `Continuous`, `TopologicalSpace`, `Finset.sum` &rarr; Notice the type signatures and documentation links.
-   - Press <kbd>Alt</kbd> while hovering to pin the tooltip.
-
-### 2. Test on Real GitHub Pull Requests
-Open any Lean 4 repository or PR on GitHub (for example, on [leanprover-community/mathlib4](https://github.com/leanprover-community/mathlib4/pulls) or [leanprover/lean4](https://github.com/leanprover/lean4/pulls)):
-1. Navigate to the **"Files changed"** tab of any Lean PR.
-2. Hover over Lean keywords, types, or declarations.
-3. The Verso inspector tooltip will appear with the corresponding definition and docstring!
+- **Dot notation** (`hl.nodup`, `(ContinuousAt.tendsto h).mono_left`, `hT.out.le`): the receiver's type is read from its binder, a file-level `variable`, a PR declaration, or a Loogle signature (conclusion plus argument substitution), step by step for longer chains. Bundled-map notations (`→ₗ[R]`, `≃+*`, `→ₘₛₗ[σ]`, ~60 in total) map to their structures.
+- **Bare names** (`cons`, `pairwise_sort`): the `namespace` / `section` / `open` scope at the hovered line decides which candidates exist; root names and exported class fields (`mul_zero`, `star`) win over opened namespaces, then the current namespace.
+- When several candidates remain, the tooltip lists them instead of guessing.
+- Comments, docstring prose (except code in backticks), attributes, universe names and section labels are ignored.
 
 ---
 
-## Extension Structure
+## Installation
+
+1. Open `chrome://extensions` and switch on **Developer mode** (top right).
+2. Click **Load unpacked** and select the cloned `chrome-lean-lens` folder.
+3. Open a Lean PR on GitHub (for example in [mathlib4](https://github.com/leanprover-community/mathlib4/pulls)), go to **Files changed**, and hover.
+
+After pulling updates, click **Reload** on the extension card and refresh the GitHub tab.
+
+## Testing
+
+```bash
+node test/run_tests.js
+```
+
+`test/demo_pr.html` is a static page that imitates a GitHub PR diff for trying tooltips offline.
+
+---
+
+## Project layout
 
 ```
-chrome-verso/
+chrome-lean-lens/
 ├── manifest.json                  # Manifest V3 configuration
-├── icons/                         # 16, 32, 48, 128px icons & vector SVG
+├── icons/                         # Icons (generate_icons.py redraws them)
 ├── background/
-│   └── service_worker.js         # API coordinator (Loogle, caching, local server)
+│   └── service_worker.js          # Loogle, file scope, tactic docs, caching, companion server
 ├── content/
-│   ├── builtins_db.js            # Offline Lean 4 core tactics & types dictionary
-│   ├── lean_tokenizer.js         # Identifies dotted tokens & handles Lean syntax
-│   ├── pr_scanner.js             # Parses PR diffs for local definitions & docstrings
-│   ├── tooltip_view.js           # Verso-styled hover UI & markdown renderer
-│   ├── content.js                # Coordinates events on GitHub pages & diffs
-│   └── content.css               # Tooltip styling with light/dark theme support
-├── popup/
-│   ├── popup.html                # Popup UI with instant symbol search & status
-│   ├── popup.css
-│   └── popup.js
-├── options/
-│   ├── options.html              # Settings for hover delay, sources, and themes
-│   ├── options.css
-│   └── options.js
-├── server/
-│   ├── companion_server.py       # Optional local Lean Lake companion server
-│   └── README.md
-├── test/
-│   ├── demo_pr.html              # Interactive GitHub PR review test bed
-│   └── run_tests.js              # Automated unit tests
-└── README.md
+│   ├── lean_tokenizer.js          # Token under the cursor, tactic position, notation
+│   ├── binder_context.js          # Binders, type heads, receivers, local type inference
+│   ├── pr_scanner.js              # Declarations added in the PR
+│   ├── builtins_db.js             # Offline docs for core tactics and types
+│   ├── tooltip_view.js            # Tooltip UI and Markdown rendering
+│   ├── content.js                 # Hover handling and lookup orchestration
+│   └── content.css                # Tooltip styles (light / dark)
+├── popup/                         # Toolbar popup with symbol search
+├── options/                       # Settings page
+├── server/                        # Optional local companion server
+└── test/                          # Unit tests and the demo page
 ```
 
----
+## Options
 
-## Configuration & Options
+Right-click the toolbar icon → **Options**:
+- **Hover delay** (default 250 ms)
+- **PR declaration scanner**, **Loogle lookups**, **built-in tactic docs**: on/off
+- **Theme**: match GitHub, Slate Dark, or Clean Light
+- **Local companion server**: host/port for private projects
 
-Click the Verso icon in the Chrome toolbar and click the gear icon (or right-click &rarr; **Options**) to configure:
-- **Hover Trigger Delay**: Slider from 100ms to 1000ms (default 250ms).
-- **In-PR Local Declaration Scanner**: Toggle on/off PR-local definitions indexing.
-- **Loogle Lean 4 / Mathlib API**: Toggle on/off online semantic lookups.
-- **Built-in Knowledge Base**: Toggle on/off tactic explanations.
-- **Visual Theme**: Match GitHub (automatic), Verso Dark, or Verso Light.
-- **Local Verso Server**: Configure local host/port (e.g., `http://127.0.0.1:8000`) for private Lean projects.
+## Local companion server (optional)
 
----
+For private Lean repositories that Loogle doesn't index:
 
-## Local Companion Server (Optional)
-
-If you are reviewing PRs for private Lean repositories not indexed on Loogle:
 ```bash
 python3 server/companion_server.py --port 8000 --project /path/to/my-lean-project
 ```
-Enable **"Local Verso Companion Server"** in the extension options page and click **"Test Connection"**.
+
+Then enable **Local companion server** in the options and click **Test Connection**. The server searches the project's `.lean` files for declarations by name; it does not run Lean.

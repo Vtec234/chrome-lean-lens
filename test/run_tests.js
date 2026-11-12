@@ -1,5 +1,5 @@
 /**
- * Automated test suite for Verso Lean Chrome Extension.
+ * Automated test suite for the Lean Lens Chrome extension.
  * Tests tokenizer, PR diff scanner, builtins database, and HTML rendering.
  */
 
@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-console.log("=== Running Verso Lean Extension Test Suite ===\n");
+console.log("=== Running Lean Lens Test Suite ===\n");
 
 // Setup minimal DOM simulation in VM context
 const context = {

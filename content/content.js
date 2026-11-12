@@ -1,5 +1,5 @@
 /**
- * Main Content Script for Verso GitHub Extension.
+ * Main content script for Lean Lens.
  * Coordinates hover detection, token resolution, PR diff scanning, and tooltip rendering.
  * Built with hysteresis and debouncing to eliminate flickering.
  */
@@ -389,7 +389,7 @@
     // in the namespace of the receiver's type, as Lean does (`List.SortedLT.nodup`).
     const { queryToken, fileRef, contextText, receiver, namedArg, structField } = lookup;
 
-    // 3. Query background worker (Loogle / Local Verso)
+    // 3. Query background worker (Loogle / local companion server)
     // To prevent flicker, do NOT show loading immediately.
     // If the lookup takes longer than 180ms, only then show a subtle loading spinner.
     if (loadingTimer) clearTimeout(loadingTimer);
@@ -420,7 +420,7 @@
           if (res && res.success && res.data) {
             window.VersoTooltipView.show(res.data, boundingRect);
           } else {
-            // Not found in Loogle/Verso; quietly hide tooltip without flashing
+            // Not found; quietly hide tooltip without flashing
             window.VersoTooltipView.hide(false);
           }
         }

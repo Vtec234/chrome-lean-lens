@@ -1,6 +1,6 @@
-# Verso Local Companion Server
+# Lean Lens Local Companion Server
 
-The Verso Local Companion Server is an optional lightweight helper script designed for users reviewing pull requests or code involving private Lean repositories or offline development environments.
+The Lean Lens local companion server is an optional lightweight helper script designed for users reviewing pull requests or code involving private Lean repositories or offline development environments.
 
 ## Features
 - Runs with zero external dependencies (pure standard library Python 3).
@@ -17,9 +17,9 @@ The Verso Local Companion Server is an optional lightweight helper script design
 
 2. Start the companion server:
    ```bash
-   python3 /path/to/chrome-verso/server/companion_server.py --port 8000
+   python3 /path/to/chrome-lean-lens/server/companion_server.py --port 8000
    ```
 
 3. In the Chrome extension options page:
-   - Check **"Enable Local Verso Companion Server"**
+   - Check **"Enable local companion server"**
    - Click **"Test Connection"** to verify that `http://127.0.0.1:8000` is active.

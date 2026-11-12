@@ -4,17 +4,17 @@
       <stop offset="0%" stop-color="#1f2438"/>
       <stop offset="100%" stop-color="#111422"/>
     </linearGradient>
-    <linearGradient id="armLeft" x1="0%" y1="0%" x2="100%" y2="100%">
+    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#38bdf8"/>
       <stop offset="100%" stop-color="#0284c7"/>
     </linearGradient>
-    <linearGradient id="armRight" x1="0%" y1="0%" x2="100%" y2="100%">
+    <linearGradient id="handle" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#c084fc"/>
       <stop offset="100%" stop-color="#7c3aed"/>
     </linearGradient>
   </defs>
   <rect x="8" y="8" width="112" height="112" rx="26" fill="url(#bgGrad)" stroke="#6366f1" stroke-width="4"/>
-  <path d="M 32 34 L 64 96" stroke="url(#armLeft)" stroke-width="14" stroke-linecap="round"/>
-  <path d="M 64 96 L 96 34" stroke="url(#armRight)" stroke-width="14" stroke-linecap="round"/>
-  <circle cx="64" cy="48" r="9" fill="#fbbf24"/>
+  <path d="M 77 77 L 99 99" stroke="url(#handle)" stroke-width="14" stroke-linecap="round"/>
+  <circle cx="56" cy="56" r="27.5" fill="#1c2034" stroke="url(#ring)" stroke-width="11"/>
+  <circle cx="56" cy="56" r="9.5" fill="#fbbf24"/>
 </svg>

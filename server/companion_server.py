@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Verso Companion Server for Local Lean Projects.
+Lean Lens companion server for local Lean projects.
 Runs a lightweight HTTP server on localhost to serve definitions and docstrings
-directly from local Lake / Lean 4 environments or local Verso output.
+directly from the .lean files of a local Lake / Lean 4 project.
 
 Usage:
   python3 companion_server.py [--port 8000] [--project /path/to/lean-project]
@@ -17,12 +17,12 @@ import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-class VersoServerHandler(BaseHTTPRequestHandler):
+class LeanLensServerHandler(BaseHTTPRequestHandler):
     project_dir = "."
 
     def log_message(self, format, *args):
         # Concise logging
-        sys.stderr.write(f"[Verso Server] {self.address_string()} - {format % args}\n")
+        sys.stderr.write(f"[Lean Lens server] {self.address_string()} - {format % args}\n")
 
     def send_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -65,7 +65,7 @@ class VersoServerHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({
                 "status": "ok",
-                "service": "Verso Lean Companion Server",
+                "service": "Lean Lens Companion Server",
                 "project_dir": os.path.abspath(self.project_dir)
             }).encode("utf-8"))
             return
@@ -127,16 +127,16 @@ class VersoServerHandler(BaseHTTPRequestHandler):
         return None
 
 def main():
-    parser = argparse.ArgumentParser(description="Verso Companion Server for Lean 4")
+    parser = argparse.ArgumentParser(description="Lean Lens companion server for Lean 4")
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on (default: 8000)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface (default: 127.0.0.1)")
     parser.add_argument("--project", type=str, default=".", help="Lean project directory")
     args = parser.parse_args()
 
-    VersoServerHandler.project_dir = args.project
-    server = HTTPServer((args.host, args.port), VersoServerHandler)
+    LeanLensServerHandler.project_dir = args.project
+    server = HTTPServer((args.host, args.port), LeanLensServerHandler)
     print(f"==================================================")
-    print(f"  Verso Companion Server started")
+    print(f"  Lean Lens companion server started")
     print(f"  Address: http://{args.host}:{args.port}")
     print(f"  Project: {os.path.abspath(args.project)}")
     print(f"==================================================")

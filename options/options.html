@@ -2,16 +2,16 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Verso Inspector Settings</title>
+  <title>Lean Lens Settings</title>
   <link rel="stylesheet" href="options.css">
 </head>
 <body>
   <div class="options-container">
     <header class="options-header">
       <div class="header-left">
-        <img src="../icons/icon48.png" alt="Verso Logo" class="logo">
+        <img src="../icons/icon48.png" alt="Lean Lens logo" class="logo">
         <div>
-          <h1>Verso: Lean 4 GitHub Inspector</h1>
+          <h1>Lean Lens: Lean 4 Hover Inspector</h1>
           <p class="subtitle">Customize hover behavior, data sources, and PR review intelligence</p>
         </div>
       </div>
@@ -33,8 +33,8 @@
           <label for="theme-select">Visual Theme</label>
           <select id="theme-select">
             <option value="auto">Auto (Match GitHub Theme)</option>
-            <option value="dark">Verso Slate Dark</option>
-            <option value="light">Verso Clean Light</option>
+            <option value="dark">Slate Dark</option>
+            <option value="light">Clean Light</option>
           </select>
         </div>
       </div>
@@ -74,16 +74,16 @@
         </div>
       </div>
 
-      <!-- Section 3: Optional Local Verso Server -->
+      <!-- Section 3: Optional local companion server -->
       <div class="card">
-        <h2 class="card-title">Local Verso / Lake Server (Optional)</h2>
-        <p class="card-desc">Connect to a local Verso server or Lake environment for private or offline repositories.</p>
+        <h2 class="card-title">Local Companion Server (Optional)</h2>
+        <p class="card-desc">Connect to the bundled companion server (<code>server/companion_server.py</code>), which searches the <code>.lean</code> files of a local project. Useful for private or offline repositories.</p>
 
         <div class="checkbox-group">
           <label class="checkbox-label">
             <input type="checkbox" id="enable-local-verso">
             <div>
-              <strong>Enable Local Verso Companion Server</strong>
+              <strong>Enable local companion server</strong>
             </div>
           </label>
         </div>

@@ -1,6 +1,6 @@
 /**
- * Verso Hover Tooltip View Component.
- * Renders rich, interactive, syntax-highlighted tooltips in GitHub matching Verso's design.
+ * Lean Lens hover tooltip view component.
+ * Renders rich, interactive, syntax-highlighted tooltips in GitHub (styled like Lean's documentation hovers).
  */
 
 (function () {
@@ -199,12 +199,12 @@
         sourceEl.textContent = data.declaredAt ? `Declared with \`variable\` (line ${data.declaredAt})` : 'Local variable';
         docsLink.classList.add('verso-hidden');
       } else if (data.source === 'local_verso') {
-        sourceEl.textContent = `Local Verso Server`;
+        sourceEl.textContent = `Local companion server`;
         docsLink.href = data.sourceUrl || '#';
-        docsLink.textContent = `Verso Manual →`;
+        docsLink.textContent = `Open source →`;
         docsLink.classList.remove('verso-hidden');
       } else {
-        sourceEl.textContent = `Loogle / Verso Lean 4 API`;
+        sourceEl.textContent = `Loogle / Mathlib docs`;
         docsLink.href = data.sourceUrl || `https://leanprover-community.github.io/mathlib4_docs/`;
         docsLink.textContent = `Mathlib Docs →`;
         docsLink.classList.remove('verso-hidden');

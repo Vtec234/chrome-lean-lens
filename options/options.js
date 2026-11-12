@@ -93,7 +93,7 @@ document.addEventListener('DOMContentLoaded', () => {
       { action: "TEST_LOCAL_SERVER", url: localVersoUrl.value.trim() },
       (res) => {
         if (res && res.success) {
-          serverTestResult.textContent = '✓ Connected! Local Verso server is responding.';
+          serverTestResult.textContent = '✓ Connected! The local companion server is responding.';
           serverTestResult.style.color = '#3fb950';
         } else {
           serverTestResult.textContent = '✗ Could not connect to local server. Make sure companion server is running.';

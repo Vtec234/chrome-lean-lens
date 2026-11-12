@@ -1,5 +1,5 @@
 /**
- * Popup Logic for Verso Lean Inspector
+ * Popup logic for Lean Lens
  */
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -36,7 +36,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     if (!activeTab.url.includes("github.com")) {
-      setStatus(false, "Verso is ready (Open a GitHub Lean PR or file)");
+      setStatus(false, "Lean Lens is ready (open a GitHub Lean PR or file)");
       return;
     }
 
@@ -117,7 +117,7 @@ document.addEventListener('DOMContentLoaded', () => {
     resultBox.classList.remove('hidden');
     resultName.textContent = token;
     resultKind.textContent = '...';
-    resultSignature.textContent = 'Looking up definition in Verso / Loogle...';
+    resultSignature.textContent = 'Looking up definition in Loogle...';
     resultDocstring.textContent = '';
 
     chrome.runtime.sendMessage({ action: "LOOKUP_TOKEN", token: token }, (res) => {

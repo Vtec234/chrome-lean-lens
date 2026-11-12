@@ -1,12 +1,15 @@
 /**
- * Background Service Worker for Verso Chrome Extension.
- * Coordinates definition queries across Loogle, local Verso servers, and caches.
+ * Background service worker for Lean Lens.
+ * Coordinates definition queries across Loogle, the local companion server, and caches.
  */
 
 // Shared binder parsing (also used by the content script).
 if (typeof importScripts === 'function') {
   try { importScripts('../content/binder_context.js'); } catch (err) { /* lookups still work without it */ }
 }
+
+const SETTINGS_KEY = "lean_lens_settings";
+const LEGACY_SETTINGS_KEY = "verso_settings";
 
 const DEFAULT_SETTINGS = {
   enabled: true,
@@ -28,8 +31,14 @@ let queryStats = { totalQueries: 0, cacheHits: 0, loogleHits: 0, localHits: 0 };
  */
 async function getSettings() {
   return new Promise((resolve) => {
-    chrome.storage.local.get(["verso_settings"], (res) => {
-      resolve(Object.assign({}, DEFAULT_SETTINGS, res.verso_settings || {}));
+    chrome.storage.local.get([SETTINGS_KEY, LEGACY_SETTINGS_KEY], (res) => {
+      let saved = res[SETTINGS_KEY];
+      // One-time migration from the extension's former name ("Verso").
+      if (!saved && res[LEGACY_SETTINGS_KEY]) {
+        saved = res[LEGACY_SETTINGS_KEY];
+        chrome.storage.local.set({ [SETTINGS_KEY]: saved }, () => chrome.storage.local.remove(LEGACY_SETTINGS_KEY));
+      }
+      resolve(Object.assign({}, DEFAULT_SETTINGS, saved || {}));
     });
   });
 }
@@ -64,7 +73,7 @@ function getMathlibDocsUrl(moduleName, declName) {
 }
 
 /**
- * Query Local Verso Companion Server if enabled.
+ * Query the local companion server if enabled.
  */
 async function queryLocalVerso(token, localUrl) {
   try {
@@ -940,7 +949,7 @@ async function handleLookupToken(token, subToken, fileRef, contextText, tacticPo
 
   const settings = await getSettings();
 
-  // 3. Try Local Verso Server if enabled
+  // 3. Try the local companion server if enabled
   if (settings.enableLocalVerso && settings.localVersoUrl) {
     const localResult = await queryLocalVerso(token, settings.localVersoUrl);
     if (localResult) {
@@ -1035,7 +1044,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (action === "SET_SETTINGS") {
-    chrome.storage.local.set({ verso_settings: request.settings }, () => {
+    chrome.storage.local.set({ [SETTINGS_KEY]: request.settings }, () => {
       sendResponse({ success: true });
     });
     return true;
@@ -1043,8 +1052,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (action === "CLEAR_CACHE") {
     memoryCache.clear();
-    chrome.storage.local.clear(() => {
-      sendResponse({ success: true });
+    rawQueryCache.clear();
+    fileTextCache.clear();
+    tacticDocsPromise = null;
+    // Remove cached lookups only; keep the user's settings.
+    chrome.storage.local.get(null, (all) => {
+      const keys = Object.keys(all || {}).filter(k => k.startsWith('cache_') || k === TACTIC_CACHE_KEY);
+      chrome.storage.local.remove(keys, () => sendResponse({ success: true }));
     });
     return true;
   }

@@ -91,7 +91,7 @@
         this.scannedFileCount = filesFound;
         this.lastScanTime = Date.now();
       } catch (err) {
-        console.warn('[Verso] Error scanning PR diff:', err);
+        console.warn('[Lean Lens] Error scanning PR diff:', err);
       } finally {
         this.isScanning = false;
       }
