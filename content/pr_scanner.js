@@ -39,6 +39,205 @@
     return -1;
   }
 
+  // --- Section variables: which `variable`s a declaration takes, as Lean decides ---
+  //
+  // A declaration gets the section variables it mentions (a `def` in its body too, a `theorem`
+  // only in its statement), the variables those depend on, and every instance argument whose
+  // variables are all included. `variable {K} in` / `omit [..] in` / `include x in` change this
+  // for the next declaration only; without `in`, until the end of the section.
+
+  const BR_OPEN = '([{⦃⟨', BR_CLOSE = ')]}⦄⟩';
+  const IDENT_RE = /[A-Za-z_Ͱ-Ͽἀ-῿℀-⅏][\w'!?Ͱ-Ͽἀ-῿₀-ₜ℀-⅏]*/g;
+  const namesOf = (s) => new Set(((s || '').replace(/--[^\n]*/g, ' ').match(IDENT_RE)) || []);
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+
+  function closeOf(t, i) {
+    for (let k = i + 1, depth = 0; k < t.length; k++) {
+      if (BR_OPEN.includes(t[k])) depth++;
+      else if (BR_CLOSE.includes(t[k])) { if (depth === 0) return k; depth--; }
+    }
+    return -1;
+  }
+
+  /** Index of ` : ` at bracket depth 0 in a binder group's inside, or -1. */
+  function groupColon(t) {
+    for (let k = 0, depth = 0; k < t.length; k++) {
+      if (BR_OPEN.includes(t[k])) depth++;
+      else if (BR_CLOSE.includes(t[k])) depth--;
+      else if (depth === 0 && t[k] === ':' && t[k + 1] !== '=') return k;
+    }
+    return -1;
+  }
+
+  /** Binder groups `(K L : Type*)`, `[NormedField K]`, `{K L}` (an update, no type), and bare names. */
+  function binderGroups(text) {
+    const groups = [];
+    const bare = [];
+    for (let i = 0; i < text.length;) {
+      const ch = text[i];
+      if ('({[⦃'.includes(ch)) {
+        const close = closeOf(text, i);
+        if (close === -1) break;
+        const inner = text.slice(i + 1, close).trim();
+        const c = groupColon(inner);
+        if (c === -1) groups.push(ch === '[' ? { bi: ch, names: [], type: inner } : { bi: ch, names: inner.split(/\s+/).filter(Boolean), type: null });
+        else groups.push({ bi: ch, names: inner.slice(0, c).trim().split(/\s+/).filter(Boolean), type: inner.slice(c + 1).trim() });
+        i = close + 1;
+      } else {
+        const m = text.slice(i).match(/^[^\s({[⦃]+/);
+        if (m) { bare.push(m[0]); i += m[0].length; } else i++;
+      }
+    }
+    return { groups, bare };
+  }
+
+  /** The text before a top-level `in` keyword (a one-shot command) and after it, or null. */
+  function splitIn(text) {
+    for (let k = 0, depth = 0; k < text.length; k++) {
+      const ch = text[k];
+      if (BR_OPEN.includes(ch)) depth++;
+      else if (BR_CLOSE.includes(ch)) depth--;
+      else if (depth === 0 && /\s/.test(text[k - 1] || ' ') && /^in(?![\w'])/.test(text.slice(k))) {
+        return { args: text.slice(0, k), after: text.slice(k + 2).trim() };
+      }
+    }
+    return null;
+  }
+
+  class VariableScope {
+    constructor() { this.frames = [VariableScope.frame()]; this.pending = null; }
+    static frame() { return { vars: [], updates: new Map(), omits: [], includes: new Set() }; }
+    push() { this.frames.push(VariableScope.frame()); }
+    pop() { if (this.frames.length > 1) this.frames.pop(); }
+
+    /**
+     * A `variable` / `omit` / `include` command (text after the keyword). With a top-level
+     * `in`, it applies to the next declaration only; returns the text after `in` (maybe a
+     * declaration on the same line).
+     */
+    command(keyword, text) {
+      const split = splitIn(text);
+      const target = split ? (this.pending = this.pending || VariableScope.frame()) : this.frames[this.frames.length - 1];
+      const { groups, bare } = binderGroups(split ? split.args : text);
+      if (keyword === 'variable') {
+        for (const g of groups) {
+          if (g.type === null) g.names.forEach(n => target.updates.set(n, g.bi)); // `variable {K L}`: binder kinds
+          else if (g.bi === '[' && !g.names.length) target.vars.push({ bi: '[', name: null, type: g.type });
+          else g.names.forEach(n => target.vars.push({ bi: g.bi, name: n, type: g.type }));
+        }
+      } else if (keyword === 'omit') {
+        groups.forEach(g => (g.bi === '[' && !g.names.length ? target.omits.push({ type: norm(g.type) }) : g.names.forEach(n => target.omits.push({ name: n }))));
+        bare.forEach(n => target.omits.push({ name: n }));
+      } else if (keyword === 'include') {
+        [...groups.flatMap(g => g.names), ...bare].forEach(n => target.includes.add(n));
+      }
+      return split ? split.after : '';
+    }
+
+    /**
+     * The variables in scope at a declaration, in order: [{ bi, name, type, included }], where
+     * `included` marks the ones it takes. `header` is its own binders and type; `body` what
+     * follows (counted for definitions, not theorems).
+     */
+    variablesFor(kind, header, body) {
+      const frames = this.pending ? [...this.frames, this.pending] : this.frames;
+      let vars = frames.flatMap(f => f.vars);
+      vars = vars.filter((v, i) => !v.name || !vars.slice(i + 1).some(w => w.name === v.name)); // later ones shadow
+      const omits = frames.flatMap(f => f.omits);
+      vars = vars.filter(v => !omits.some(o => (o.name && o.name === v.name) || (o.type && v.bi === '[' && norm(v.type) === o.type)));
+      if (!vars.length) return [];
+      const biOf = (v) => {
+        for (let k = frames.length - 1; k >= 0; k--) if (v.name && frames[k].updates.has(v.name)) return frames[k].updates.get(v.name);
+        return v.bi;
+      };
+      // Names the declaration mentions, minus its own binders (which shadow variables).
+      const own = new Set(binderGroups(header.slice(0, Math.max(0, groupColon(header)))).groups.flatMap(g => g.names));
+      const used = namesOf(/^(theorem|lemma)$/.test(kind) ? header : `${header}\n${body || ''}`);
+      own.forEach(n => used.delete(n));
+      const includes = new Set(frames.flatMap(f => [...f.includes]));
+      const varNames = new Set(vars.filter(v => v.name).map(v => v.name));
+      const depsOf = (v) => [...namesOf(v.type)].filter(n => varNames.has(n) && n !== v.name);
+      const inc = new Set();
+      const chosen = new Set();
+      for (let changed = true; changed;) {
+        changed = false;
+        for (const v of vars) {
+          if (chosen.has(v)) continue;
+          const named = v.name && (used.has(v.name) || includes.has(v.name) || inc.has(v.name));
+          const instance = v.bi === '[' && depsOf(v).every(n => inc.has(n));
+          if (named || instance) {
+            chosen.add(v);
+            if (v.name) inc.add(v.name);
+            depsOf(v).forEach(n => inc.add(n));
+            changed = true;
+          }
+        }
+      }
+      return vars.map(v => ({ bi: biOf(v), name: v.name, type: v.type, included: chosen.has(v) }));
+    }
+
+    /** After a declaration: one-shot changes are used up. */
+    declared() { this.pending = null; }
+  }
+
+  const CLOSE_OF = { '(': ')', '{': '}', '[': ']', '⦃': '⦄' };
+
+  /**
+   * The signature Lean gives a declaration: the variables it takes, then its own binders and
+   * type. `Type*` / `Sort*` are named `Type u_1`, `Type u_2`, … in order over all the variables
+   * in scope (Lean elaborates them all, then drops the unused ones), then its own binders.
+   */
+  function withVariables(vars, header) {
+    let k = 0;
+    const used = new Set((header.match(/\bu_\d+\b/g) || []).concat(...vars.map(v => (v.type || '').match(/\bu_\d+\b/g) || [])));
+    const fresh = () => { do k++; while (used.has(`u_${k}`)); return `u_${k}`; };
+    const named = (t) => (t || '').replace(/\b(Type|Sort)\*/g, (m, s) => `${s} ${fresh()}`);
+    const binders = vars.map(v => ({ bi: v.bi, name: v.name, type: named(v.type), included: v.included })).filter(v => v.included);
+    const own = named(header);
+    // Consecutive variables with the same binder kind and type print as one group (`{a b : ℝ}`).
+    const parts = [];
+    for (const b of binders) {
+      const last = parts[parts.length - 1];
+      if (b.bi === '[') parts.push(b.name ? `[${b.name} : ${b.type}]` : `[${b.type}]`);
+      else if (last && last.bi === b.bi && last.type === b.type) last.names.push(b.name);
+      else parts.push({ bi: b.bi, names: [b.name], type: b.type });
+    }
+    const text = parts.map(p => (typeof p === 'string' ? p : `${p.bi}${p.names.join(' ')} : ${p.type}${CLOSE_OF[p.bi]}`)).join(' ');
+    return text ? `${text} ${own}`.trim() : own;
+  }
+
+  // A command that isn't a declaration we index but ends a `… in` chain (`example`, `instance : …`).
+  const OTHER_COMMAND = /^(?:@\[[^\]]*\]\s*)*(?:(?:private|protected|public|noncomputable|scoped|local|partial|nonrec|unsafe|meta)\s+)*(?:example|instance|theorem|lemma|def|abbrev|structure|class|inductive|opaque|axiom|alias|attribute|macro|syntax|notation|elab|infix|infixl|infixr|prefix|postfix)\b/;
+  const SCOPE_OPEN = /^(?:namespace\s+\S+|(?:@\[[^\]]*\]\s*)?(?:(?:noncomputable|public|private)\s+)*section\b)/;
+
+  /**
+   * Feed one line to the variable scope. Returns { skip: lines consumed beyond this one,
+   * rest: text left on the line (a declaration after `variable … in`) } for a scope command,
+   * or null for anything else.
+   */
+  function trackScope(vscope, t, lineAt, i) {
+    if (SCOPE_OPEN.test(t)) { vscope.declared(); vscope.push(); return { skip: 0, rest: '' }; }
+    if (/^end\b/.test(t)) { vscope.declared(); vscope.pop(); return { skip: 0, rest: '' }; }
+    const cmd = t.match(/^(variable|omit|include)\b([\s\S]*)$/);
+    if (!cmd) return null;
+    // The command continues on indented lines.
+    let text = cmd[2];
+    let j = i + 1;
+    for (let line = lineAt(j); line !== null && /^\s+\S/.test(line) && !DECL_REGEX.test(line.trim()); line = lineAt(++j)) text += '\n' + line;
+    return { skip: j - i - 1, rest: vscope.command(cmd[1], text) };
+  }
+
+  /** A definition's body: the rest of its signature text, then the indented lines after it. */
+  function bodyAfter(rest, sigEnd, lineAt, from) {
+    let body = sigEnd !== -1 ? rest.slice(sigEnd) : '';
+    for (let j = from, n = 0; n < 400; j++, n++) {
+      const line = lineAt(j);
+      if (line === null || (line.trim() && !/^\s/.test(line))) break;
+      body += '\n' + line;
+    }
+    return body;
+  }
+
   class LeanPRScanner {
     constructor() {
       this.declarations = new Map();
@@ -183,10 +382,12 @@
       let inDocstring = false;
 
       const textOf = (row) => (row.textContent || '').replace(/^[+\s]/, '').trimEnd();
+      const vscope = new VariableScope();
+      const lineAt = (j) => (j < rows.length ? textOf(rows[j]) : null);
 
       for (let i = 0; i < rows.length; i++) {
         const row = rows[i];
-        const lineText = textOf(row);
+        let lineText = textOf(row);
 
         // Check for docstring delimiters /-- and -/
         if (lineText.includes('/--')) {
@@ -208,19 +409,34 @@
           continue;
         }
 
-        const trimmed = lineText.trim();
+        let trimmed = lineText.trim();
+        const scoped = trackScope(vscope, trimmed, lineAt, i);
+        if (scoped) {
+          i += scoped.skip;
+          if (!scoped.rest) continue;
+          trimmed = scoped.rest; // `variable {L} in theorem …` on one line
+        }
         const match = trimmed.match(DECL_REGEX);
+        if (!match && OTHER_COMMAND.test(trimmed)) vscope.declared();
         if (match) {
           const kind = match[1];
           const name = match[2];
           let rest = match[3] || '';
 
           // Signatures often span lines: keep reading until `:=`, `where`, `|` or ` by`.
-          for (let j = i + 1; j < rows.length && j <= i + 15 && signatureEnd(rest, kind === 'alias') === -1; j++) {
+          let j = i + 1;
+          // (An `alias` is one line: its signature can't be told apart from the next command.)
+          for (; kind !== 'alias' && j < rows.length && j <= i + 15 && signatureEnd(rest, false) === -1; j++) {
             rest += '\n' + textOf(rows[j]);
           }
           const sigEnd = signatureEnd(rest, kind === 'alias');
-          const body = (sigEnd !== -1 ? rest.substring(0, sigEnd) : rest).replace(/\s+/g, ' ').trim();
+          let body = (sigEnd !== -1 ? rest.substring(0, sigEnd) : rest).replace(/\s+/g, ' ').trim();
+          // With the section variables it takes (`gelfandRadiusNorm (K : Type u_1) (L : Type u_2) … (x : L)`).
+          if (kind !== 'alias') {
+            const theorem = /^(theorem|lemma)$/.test(kind);
+            body = withVariables(vscope.variablesFor(kind, body, theorem ? '' : bodyAfter(rest, sigEnd, lineAt, j)), body);
+          }
+          vscope.declared();
           const signature = leanStyle(kind, name, body);
 
           const lineNum = this.extractLineNumber(row, i + 1);
@@ -278,11 +494,13 @@
       const module = filePath.replace(/\.lean$/, '').replace(/\//g, '.');
       const frames = [];
       const decls = [];
+      const vscope = new VariableScope();
+      const lineAt = (j) => (j < lines.length ? lines[j] : null);
       let doc = '';
       let inDoc = false;
       let comment = 0;
       for (let i = 0; i < lines.length; i++) {
-        const t = lines[i].trim();
+        let t = lines[i].trim();
         if (inDoc) {
           const end = t.indexOf('-/');
           doc += '\n' + (end === -1 ? t : t.slice(0, end).trim());
@@ -302,20 +520,33 @@
         }
         if (!t || t.startsWith('--')) continue;
         let m = t.match(/^namespace\s+(\S+)/);
-        if (m) { frames.push(m[1]); doc = ''; continue; }
-        if (/^(?:@\[[^\]]*\]\s*)?(?:(?:noncomputable|public|private)\s+)*section\b/.test(t)) { frames.push(null); continue; }
-        if (/^end\b/.test(t)) { frames.pop(); continue; }
+        if (m) { frames.push(m[1]); doc = ''; vscope.declared(); vscope.push(); continue; }
+        if (/^(?:@\[[^\]]*\]\s*)?(?:(?:noncomputable|public|private)\s+)*section\b/.test(t)) { frames.push(null); vscope.declared(); vscope.push(); continue; }
+        if (/^end\b/.test(t)) { frames.pop(); vscope.declared(); vscope.pop(); continue; }
+        const scoped = trackScope(vscope, t, lineAt, i);
+        if (scoped) {
+          i += scoped.skip;
+          if (!scoped.rest) continue;
+          t = scoped.rest; // `variable {L} in theorem …` on one line
+        }
         m = t.match(DECL_REGEX);
         if (!m) {
+          if (OTHER_COMMAND.test(t)) vscope.declared();
           if (!t.startsWith('@[')) doc = '';
           continue;
         }
         const kind = m[1];
         const declared = m[2];
         let rest = m[3] || '';
-        for (let j = i + 1; j < lines.length && j <= i + 15 && signatureEnd(rest, kind === 'alias') === -1; j++) rest += '\n' + lines[j];
+        let j = i + 1;
+        for (; kind !== 'alias' && j < lines.length && j <= i + 15 && signatureEnd(rest, false) === -1; j++) rest += '\n' + lines[j];
         const sigEnd = signatureEnd(rest, kind === 'alias');
-        const body = (sigEnd !== -1 ? rest.substring(0, sigEnd) : rest).replace(/\s+/g, ' ').trim();
+        let body = (sigEnd !== -1 ? rest.substring(0, sigEnd) : rest).replace(/\s+/g, ' ').trim();
+        if (kind !== 'alias') {
+          const theorem = /^(theorem|lemma)$/.test(kind);
+          body = withVariables(vscope.variablesFor(kind, body, theorem ? '' : bodyAfter(rest, sigEnd, lineAt, j)), body);
+        }
+        vscope.declared();
         const ns = frames.filter(Boolean).join('.');
         const name = declared.startsWith('_root_.') ? declared.slice(7) : (ns ? `${ns}.${declared}` : declared);
         decls.push({
@@ -338,7 +569,15 @@
         for (const k of keys) {
           if (!k) continue;
           const existing = this.declarations.get(k);
-          if (existing && existing.element) continue;
+          if (existing && existing.element) {
+            // Keep the page's entry (it can jump to the line), but the whole file at the PR's
+            // commit knows the `variable`s it takes, which the diff's hunks may not show.
+            if (existing.filePath === d.filePath && existing.name === d.declaredAs && d.signature) {
+              existing.signature = d.signature;
+              existing.typeSignature = d.typeSignature;
+            }
+            continue;
+          }
           this.declarations.set(k, d);
         }
         if (d.shortName && !this.declarations.has(d.shortName)) this.declarations.set(d.shortName, d);

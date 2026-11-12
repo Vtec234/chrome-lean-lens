@@ -985,6 +985,78 @@ console.log("18. Testing gap hovers (terms and their types)...");
 }
 console.log("   ✓ Gap hovers verified.\n");
 
+// 19. Section variables: a declaration's signature includes the `variable`s it takes, as Lean
+//     decides (PR 45935: `gelfandRadiusNorm (x : L)` is `gelfandRadiusNorm K L x`). Expected
+//     signatures are Lean's own hovers on the same code (lean-lsp).
+console.log("19. Testing section variables in declaration signatures...");
+{
+  const src = [
+    'variable (K L M : Type*) [Field K] [Field L] [Field M] [Algebra K L] [Algebra K M]',
+    '  [Algebra L M] [IsScalarTower K L M] {F : Type*} [FunLike F L M] [AlgHomClass F K L M]',
+    '',
+    'section',
+    '',
+    'variable [FiniteDimensional K L]',
+    '',
+    'open Classical in',
+    '/-- A probe. -/',
+    'noncomputable def gNorm (x : L) : ℝ := if algebraMap K L 1 = x then 1 else 0',
+    '',
+    'variable {K L} in',
+    'theorem gNorm_eq_zero {x : L} (hx : algebraMap K L 1 ≠ x) : gNorm K L x = 0 := by',
+    '  simp [gNorm, hx]',
+    '',
+    'variable {M K L} in',
+    'omit [Algebra L M] [IsScalarTower K L M] in',
+    'theorem gNorm_map (f : F) (x : L) : gNorm K L x = gNorm K L x := rfl',
+    '',
+    'theorem gNorm_self (x : K) : gNorm K K x = gNorm K K x := rfl',
+    '',
+    'end',
+    '',
+    'theorem outside (x : L) : x = x := by',
+    '  have := gNorm K L x',
+    '  rfl',
+    '',
+    'include K in',
+    'theorem included (x : L) : x = x := rfl',
+    '',
+    'alias outside_def := outside',
+    'theorem after_alias (x : M) : x = x := rfl'
+  ].join('\n');
+  const sigs = new Map(prScanner.scanSource(src, 'Probe.lean').map(d => [d.name, d.typeSignature]));
+  // Lean's hovers: theorems take the variables their statement mentions, the ones those
+  // depend on, and every instance argument whose variables are all included…
+  assert.strictEqual(sigs.get('gNorm_eq_zero'), 'gNorm_eq_zero.{u_1, u_2} {K : Type u_1} {L : Type u_2} [Field K] [Field L] [Algebra K L] [FiniteDimensional K L] {x : L} (hx : algebraMap K L 1 ≠ x) : gNorm K L x = 0');
+  // …with universes named when the `variable` command is elaborated (`F` is `u_4` without `M`).
+  assert.strictEqual(sigs.get('gNorm_map'), 'gNorm_map.{u_1, u_2, u_4} {K : Type u_1} {L : Type u_2} [Field K] [Field L] [Algebra K L] {F : Type u_4} [FiniteDimensional K L] (f : F) (x : L) : gNorm K L x = gNorm K L x');
+  assert.strictEqual(sigs.get('gNorm_self'), 'gNorm_self.{u_1} (K : Type u_1) [Field K] (x : K) : gNorm K K x = gNorm K K x');
+  // A definition also takes the variables its body mentions (`K` here).
+  assert(sigs.get('gNorm').startsWith('gNorm.{u_1, u_2} (K : Type u_1) (L : Type u_2) [Field K] [Field L] [Algebra K L]'), sigs.get('gNorm'));
+  // A theorem doesn't take variables only its proof mentions; the section's variable is gone after `end`.
+  assert.strictEqual(sigs.get('outside'), 'outside.{u_2} (L : Type u_2) [Field L] (x : L) : x = x');
+  assert.strictEqual(sigs.get('included'), 'included.{u_1, u_2} (K : Type u_1) (L : Type u_2) [Field K] [Field L] [Algebra K L] (x : L) : x = x', '`include K in`');
+  assert.strictEqual(sigs.get('outside_def'), 'alias outside_def := outside', 'an alias is one line');
+  assert.strictEqual(sigs.get('after_alias'), 'after_alias.{u_3} (M : Type u_3) [Field M] (x : M) : x = x', 'the line after an alias is read');
+  // Diff rows give the same; a fetched full file upgrades a page entry (hunks may hide `variable`s).
+  prScanner.reset();
+  const rowsOf = (lines) => lines.map(l => ({ textContent: l, classList: { contains: () => false }, getAttribute: () => null, closest: () => null }));
+  prScanner.scanDiffLines({ querySelectorAll: (sel) => (sel === '.diff-text-inner' ? rowsOf(['noncomputable def gNorm (x : L) : ℝ := if algebraMap K L 1 = x then 1 else 0']) : []) }, 'Probe.lean');
+  const pageDecl = prScanner.declarations.get('gNorm');
+  assert.strictEqual(pageDecl.typeSignature, 'gNorm (x : L) : ℝ', 'without the `variable` line, the page only knows the written binders');
+  prScanner.addDeclarations(prScanner.scanSource(src, 'Probe.lean'));
+  assert.strictEqual(prScanner.declarations.get('gNorm'), pageDecl, 'the page entry is kept (it can jump to the line)');
+  assert(pageDecl.signature.startsWith('(K : Type u_1) (L : Type u_2) [Field K]'), `…with the full file's signature: ${pageDecl.signature}`);
+  prScanner.reset();
+  // Gap hovers apply arguments to the full signature: `gelfandRadiusNorm K L x : ℝ`.
+  asyncChecks.push(bc.termTypeOf(bc.parseTerm('gNorm K L x'), 'gNorm K L x', 'example (K L : Type*) (x : L) : True := by\n  trivial',
+    async (n) => (n === 'gNorm' ? '(K : Type u_1) (L : Type u_2) [Field K] [Field L] [Algebra K L] (x : L) : ℝ' : null)).then(t => assert.strictEqual(t, 'ℝ', 'all three arguments')));
+  // A norm is a bundled function: `gelfandRadiusNormAux K L x : ℝ` for `gelfandRadiusNormAux K L : AlgebraNorm K L`.
+  asyncChecks.push(bc.termTypeOf(bc.parseTerm('gAux K L x'), 'gAux K L x', 'example (K L : Type*) (x : L) : True := by\n  trivial',
+    async (n) => (n === 'gAux' ? '(K : Type u_1) (L : Type u_2) [NormedField K] [Field L] [Algebra K L] : AlgebraNorm K L' : null)).then(t => assert.strictEqual(t, 'ℝ', 'applying an AlgebraNorm')));
+}
+console.log("   ✓ Section variables verified.\n");
+
 Promise.all(asyncChecks).then(() => {
   console.log("   ✓ Rewrite replay verified.\n");
   console.log("==================================================");

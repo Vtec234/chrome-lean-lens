@@ -2036,6 +2036,23 @@
     };
   }
 
+  // Bundled functions written as structures (not arrows): what applying one to a point gives,
+  // from the structure's arguments (`AlgebraNorm K L` is a function `L → ℝ`).
+  const FUN_LIKE = {
+    AlgebraNorm: (a) => a.length === 2 && 'ℝ', RingNorm: (a) => a.length === 1 && 'ℝ', RingSeminorm: (a) => a.length === 1 && 'ℝ',
+    MulRingNorm: (a) => a.length === 1 && 'ℝ', MulRingSeminorm: (a) => a.length === 1 && 'ℝ', Seminorm: (a) => a.length === 2 && 'ℝ',
+    AddGroupNorm: (a) => a.length === 1 && 'ℝ', AddGroupSeminorm: (a) => a.length === 1 && 'ℝ', GroupNorm: (a) => a.length === 1 && 'ℝ',
+    GroupSeminorm: (a) => a.length === 1 && 'ℝ', NonarchAddGroupNorm: (a) => a.length === 1 && 'ℝ',
+    AbsoluteValue: (a) => a.length === 2 && showTerm(a[1], 1025)
+  };
+  function funLikeCodomain(t) {
+    t = tCore(t);
+    if (!t || t.k !== 'app' || t.f.k !== 'id') return null;
+    const make = FUN_LIKE[t.f.v.replace(/^.*\./, '')];
+    const cod = make && make(t.args);
+    return cod ? parseTerm(cod) : null;
+  }
+
   /** Expected types of the `n` components of `⟨…⟩` for type `t`: `A ∧ B ∧ C`, `A ↔ B`; or null. */
   function tupleParts(t, n) {
     t = tCore(t);
@@ -2102,9 +2119,11 @@
         if (!argT || argT.k !== 'bin' || argT.op !== '∈' || !sameTerm(argT.r, c.l)) return null;
         concl = { k: 'bin', op: '∈', l: argT.l, r: c.r };
       } else {
-        // A bundled map (`e : A ≃ B`, `f : M →+* N`) applied to a point lands in its codomain.
-        const cod = codomainOf(showTerm(concl));
-        const codT = cod && parseTerm(cod);
+        // A bundled map (`e : A ≃ B`, `f : M →+* N`, `‖·‖ : AlgebraNorm K L`) applied to a point
+        // lands in its codomain, through the coercion to a function.
+        const fun = funLikeCodomain(c);
+        const cod = fun ? null : codomainOf(showTerm(concl));
+        const codT = fun || (cod && parseTerm(cod));
         if (!codT) return null;
         concl = codT;
       }
