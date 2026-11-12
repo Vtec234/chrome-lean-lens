@@ -195,6 +195,16 @@
         docsLink.href = data.sourceUrl || `https://leanprover-community.github.io/mathlib4_docs/`;
         docsLink.textContent = `Mathlib Docs →`;
         docsLink.classList.remove('verso-hidden');
+      } else if (data.source === 'project') {
+        // Read from the repository at the PR's commit (a collapsed diff, or an imported project file).
+        sourceEl.textContent = `${data.inPR ? 'Changed in this PR · ' : ''}${data.filePath}:${data.lineNumber}`;
+        if (data.repo && data.sha) {
+          docsLink.href = `https://github.com/${data.repo}/blob/${data.sha}/${data.filePath}#L${data.lineNumber}`;
+          docsLink.textContent = 'View source →';
+          docsLink.classList.remove('verso-hidden');
+        } else {
+          docsLink.classList.add('verso-hidden');
+        }
       } else if (data.source === 'local_var') {
         sourceEl.textContent = data.declaredAt ? `Declared with \`variable\` (line ${data.declaredAt})` : 'Local variable';
         docsLink.classList.add('verso-hidden');

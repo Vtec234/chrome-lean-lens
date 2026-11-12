@@ -79,7 +79,7 @@
 
   const NAME_CHARS = "[^\\s:()\\[\\]{}⦃⦄⟨⟩,]+";
   const BINDER_NAMES = new RegExp(`^\\s*(${NAME_CHARS}(?:\\s+${NAME_CHARS})*)\\s*:(?!=)`);
-  const BINDER_KW = new RegExp(`(?:\\bfun|λ|∀|∃|∃!|Π|∑|∏|⋃|⋂|⨆|⨅|∫|∮)\\s+(${NAME_CHARS}(?:\\s+${NAME_CHARS})*)\\s*:(?!=)`, 'g');
+  const BINDER_KW = new RegExp(`(?:\\bfun|λ|∀|∃!?|Π|∑'?|∏'?|⋃|⋂|⨆|⨅|∫|∮)\\s+(${NAME_CHARS}(?:\\s+${NAME_CHARS})*)\\s*:(?!=)`, 'g');
   // `have h : T`, `have h (x) : T`, `by_cases h : P`, `generalize h : e = x`, …
   const LOCAL_DECL = new RegExp(`\\b(?:have|haveI|replace|let|suffices|obtain|by_cases!?|generalize|if)\\s+(${NAME_CHARS})((?:\\s*[({\\[⦃][^(){}\\[\\]⦃⦄]*[)}\\]⦄])*)\\s*:(?!=)`, 'g');
 
@@ -175,7 +175,7 @@
         k--;
         continue;
       }
-      return /(?:\bfun|λ|∀|∃!?|Π|∑|∏|⋃|⋂|⨆|⨅|∫|∮|\bhave\s+\S+|\blet\s+\S+)$/.test(text.slice(Math.max(0, k - 20), k + 1));
+      return /(?:\bfun|λ|∀|∃!?|Π|∑'?|∏'?|⋃|⋂|⨆|⨅|∫|∮|\bhave\s+[^\s:()]+|\blet\s+[^\s:()]+)$/.test(text.slice(Math.max(0, k - 20), k + 1));
     }
   }
 
@@ -311,7 +311,9 @@
    */
   function typeHead(type, resolveVar) {
     if (!type) return null;
-    let t = type.replace(/\s+/g, ' ').trim();
+    let t = type.replace(/\s+/g, ' ').trim()
+      // Notation for types: `ℝ≥0∞` is ENNReal (not the infix `≥`), `ℝ≥0` NNReal, …
+      .replace(/ℝ≥0∞/g, 'ENNReal').replace(/ℝ≥0/g, 'NNReal').replace(/ℚ≥0/g, 'NNRat').replace(/ℕ∞/g, 'ENat');
 
     // Strip redundant outer parentheses.
     while (t.startsWith('(') && matchClose(t, 0) === t.length - 1) t = t.slice(1, -1).trim();
@@ -321,7 +323,14 @@
     if (t.startsWith('¬')) return 'Not';
 
     // A lambda / binder at top level runs to the end: operators after it belong to its body.
-    const cut = t.search(/\s(fun\b|λ|∀|∃|Π)|=>|↦/);
+    // (Only at depth 0: `(∀ᶠ x in l, ∀ i ∈ I, p i x) ↔ …` is still an `↔`.)
+    let cut = -1;
+    for (let i = 0, depth = 0; i < t.length && cut === -1; i++) {
+      const ch = t[i];
+      if (OPENERS[ch]) depth++;
+      else if (CLOSERS.has(ch)) depth = Math.max(0, depth - 1);
+      else if (depth === 0 && i > 0 && /^(\s(fun\b|λ|∀|∃|Π)|=>|↦)/.test(t.slice(i, i + 5))) cut = i;
+    }
     const head = cut > 0 ? t.slice(0, cut) : t;
     if (topLevelIndexOf(head, '↔') > 0) return 'Iff';
     const arrow = topLevelArrow(head);
@@ -337,6 +346,9 @@
     for (const [op, h] of INFIX_HEADS) {
       if (topLevelIndexOf(head, op) > 0) return h;
     }
+    // `R⟦X⟧` is a power series ring, `R[X]` a polynomial ring.
+    if (/⟦X⟧$/.test(t)) return 'PowerSeries';
+    if (/\[X\]$/.test(t) && !/\s/.test(t.replace(/^\(.*\)/, ''))) return 'Polynomial';
     // `(term).Field`: generalized field notation on a term we can't type; the field's
     // name is a partial namespace (`((cantorNF b o).map Prod.fst).SortedGT` → `SortedGT`).
     if (t.startsWith('(')) {
@@ -374,6 +386,7 @@
   function conclusionOf(type) {
     if (!type) return null;
     let t = type.replace(/\s+/g, ' ').trim();
+    if (/^:(?!=)/.test(t)) t = t.slice(1).trim(); // a signature with no parameters: `: T`
     // Loogle signatures: leading binder groups, then ` : conclusion`.
     let i = 0;
     while (i < t.length && OPENERS[t[i]] && t[i] !== '⟨') {
@@ -583,7 +596,7 @@
     scan(/\b(?:induction|cases|ext|funext|choose|peel)\b[^\n]*\bwith\b([^\n|]*)$/gm, 'introduced by a tactic');
     scan(/^\s*\|\s*[\w.']+([^\n]*?)=>/gm, 'bound in a match / induction case');
     scan(/(?:∀|∃|Π|λ)\s+([^:,\n]*?),/g, 'bound by a quantifier');
-    scan(/(?:∑|∏|⋃|⋂|⨆|⨅|∫|∮)\s+([^:,\n]*?)\s*(?:\bin\b|∈|,)/g, 'bound by a big operator / integral');
+    scan(/(?:∑'?|∏'?|⋃|⋂|⨆|⨅|∫|∮)\s+([^:,\n]*?)\s*(?:\bin\b|∈|,)/g, 'bound by a big operator / integral');
     scan(/\b(?:by_contra!?|by_contra'|contrapose!?|by_cases!?)\s+([^\s:]+)\s*$/gm, 'introduced by `by_contra` / `by_cases`');
     scan(/\{\s*([^:{}|]+?)\s*\|(?!\|)/g, 'bound in a set-builder');
     scan(/\bset\s+[^\n]*?\bwith\s+←?\s*([^\s]+)/g, 'introduced by `set … with`');
@@ -601,7 +614,7 @@
         }
       }
     }
-    const defRe = /\b(?:let|set|have)\s+([^\s:=]+)\s*:=\s*([^\n]*?)(?:\bwith\b|$)/gm;
+    const defRe = /\b(?:let|set|have)\s+([^\s:=()]+)(?:\s*[({⦃[](?:[^(){}⦃⦄[\]]|[({[][^(){}[\]]*[)}\]])*[)}⦄\]])*\s*:=\s*([^\n]*?)(?:\bwith\b|$)/gm;
     let dm;
     while ((dm = defRe.exec(text)) !== null) {
       if (dm[1] === name) consider(dm.index, 'defined locally', dm[2].trim());
@@ -970,18 +983,19 @@
     }
 
     // have x := TERM (no type): the type of TERM, from its head's signature.
-    m = line.match(/^(?:have|haveI|let)\s+([^\s:=()]+)\s*:=\s*/);
+    m = line.match(/^(?:have|haveI|let)\s+([^\s:=()]+)((?:\s*[({⦃[](?:[^(){}⦃⦄[\]]|[({[][^(){}[\]]*[)}\]])*[)}⦄\]])*)\s*:=\s*/);
     if (m && m[1] === name) {
       const term = fullTermAt(text, pos + m[0].length);
       if (!term || /^(by|fun|λ|⟨)\b|^[(⟨]/.test(term)) return null;
       const parts = appParts(term);
       if (!parts) return null;
+      const params = m[2].trim(); // `have hag (i : ℕ) := …` has type `∀ (i : ℕ), …`
       const local = /^[\w'\u0370-\u03FF\u2080-\u209C]+$/.test(parts.head) ? localType(parts.head, text) : null;
       if (local) {
         const app = applicationTypeFrom(local, parts.positional, parts.named, text);
-        return app ? { types: [{ type: app.type, tag: null }], source: `\`${parts.head}\`'s type` } : null;
+        return app ? { types: [{ type: params ? `∀ ${params}, ${app.type}` : app.type, tag: null }], source: `\`${parts.head}\`'s type` } : null;
       }
-      return { types: [], source: `\`${term}\``, caseIdx: 0, pending: { pattern: name, term, name } };
+      return { types: [], source: `\`${term}\``, caseIdx: 0, pending: { pattern: name, term, name, params } };
     }
 
     // set x := v with hx
@@ -1330,7 +1344,7 @@
 
   const T_START = /[A-Za-z_Ͱ-ΟΡ΢Τ-κμ-Ͽἀ-῿℀-⅏\u{1D400}-\u{1D7FF}]/u;
   const T_CONT = /[A-Za-z0-9_'!?Ͱ-ΟΡ΢Τ-κμ-Ͽἀ-῿₀-ₜᵢ-ᵪ℀-⅏\u{1D400}-\u{1D7FF}]/u;
-  const T_OPS = ['[[', ']]', '×ˢ', '×ℂ', '⁻¹', ':=', '=>', '∃!', '<-', '↔', '→', '←', '∧', '∨', '¬', '≠', '≤', '≥',
+  const T_OPS = ["∑'", "∏'", '[[', ']]', '×ˢ', '×ℂ', '⁻¹', ':=', '=>', '∃!', '<-', '↔', '→', '←', '∧', '∨', '¬', '≠', '≤', '≥',
     '∈', '∉', '⊆', '⊂', '⊇', '⊃', '∩', '∪', '⊓', '⊔', '•', '∘', '∣', '×', 'ᶜ', '↑', '⇑', '↦', '‖', '⟨', '⟩',
     '(', ')', '[', ']', '{', '}', ',', '|', '+', '-', '*', '/', '%', '^', '=', '<', '>', '\\', '∑', '∏', '∫',
     '∀', '∃', '⋃', '⋂', '⨆', '⨅', 'λ', 'Π', '·', ':', '∞', '⊤', '⊥', '∅'];
@@ -1343,9 +1357,9 @@
     '∩': [70, 'l'], '*': [70, 'l'], '/': [70, 'l'], '%': [70, 'l'], '\\': [70, 'l'], '×ℂ': [72, 'l'],
     '•': [73, 'r'], '^': [75, 'r'], '×ˢ': [82, 'r'], '∘': [90, 'r']
   };
-  const T_BINDER_HEADS = new Set(['∀', '∃', '∃!', '∑', '∏', '⋃', '⋂', '⨆', '⨅', '∫', 'λ', 'Π']);
+  const T_BINDER_HEADS = new Set(['∀', '∃', '∃!', '∑', '∏', "∑'", "∏'", '⋃', '⋂', '⨆', '⨅', '∫', 'λ', 'Π']);
   // Precedence of a binder notation's body (Mathlib: `∑ x ∈ s, f x` takes `term:67`, `∫ … , r:60`).
-  const T_BODY_PREC = { '∑': 67, '∏': 67, '∫': 60, '⋃': 60, '⋂': 60, '⨆': 60, '⨅': 60 };
+  const T_BODY_PREC = { '∑': 67, '∏': 67, "∑'": 67, "∏'": 67, '∫': 60, '⋃': 60, '⋂': 60, '⨆': 60, '⨅': 60 };
   const T_STOP_WORDS = new Set(['at', 'with', 'from', 'by', 'using', 'then', 'else', 'in', 'do']);
   const T_OPENERS = ['(', '[', '{', '⟨', '[['];
   const T_CLOSERS = [')', ']', '}', '⟩', ']]'];
@@ -1760,6 +1774,7 @@
    */
   function peelSignature(type) {
     let t = (type || '').replace(/\s+/g, ' ').trim();
+    if (/^:(?!=)/.test(t)) t = t.slice(1).trim(); // no parameters: `: T`
     const binders = [];
     let i = 0;
     while (i < t.length && '({[⦃'.includes(t[i])) {
@@ -1767,7 +1782,9 @@
       if (close === -1) break;
       const g = t.slice(i + 1, close);
       const c = g.indexOf(' : ');
-      if (c !== -1) binders.push({ names: g.slice(0, c).trim().split(/\s+/), type: g.slice(c + 3).trim(), explicit: t[i] === '(' });
+      // A default value (`(hq : P := by simp)`) isn't part of the type.
+      const dflt = c === -1 ? -1 : g.indexOf(' := ', c);
+      if (c !== -1) binders.push({ names: g.slice(0, c).trim().split(/\s+/), type: g.slice(c + 3, dflt === -1 ? g.length : dflt).trim(), explicit: t[i] === '(' });
       else binders.push({ names: [], type: g.trim(), explicit: false });
       i = close + 1;
       while (t[i] === ' ') i++;
@@ -1892,6 +1909,33 @@
     return { type: showTerm(substTerm(out, back)), unresolved };
   }
 
+  /**
+   * Type of `recv.field` from the field constant's signature: the receiver fills the first
+   * explicit parameter whose type has the receiver's head (Lean's rule), matched as terms
+   * so infix types work (`self : a ↔ b` against `P ↔ Q`). Returns the conclusion text.
+   */
+  function receiverResultType(sig, receiverType) {
+    const inst = instantiateSignature(sig, [], {}, '');
+    const peeled = peelSignature(sig);
+    const recvT = parseTerm(receiverType);
+    const head = typeHead(receiverType, null);
+    if (!recvT || !head) return null;
+    // The receiver's parameter: one whose type has the receiver's head, explicit first
+    // (`Fact.out` takes it as the instance `[self : Fact p]`).
+    const typed = peeled.binders.filter(b => b.type && typeHead(b.type, null) === head);
+    const slot = typed.find(b => b.explicit) || typed[0];
+    if (!slot) return null;
+    // The parameter's type, with the signature's variables renamed apart like the conclusion.
+    const slotT = parseTerm(inst.own.reduce((acc, n) => replaceWord(acc, n, inst.fresh(n)), slot.type));
+    const sub = new Map(inst.sub);
+    if (!slotT || !matchTerm(slotT, recvT, inst.vars, sub)) return null;
+    sub.forEach((v, k) => inst.sub.set(k, v));
+    const c = parseTerm(inst.concl);
+    if (!c) return null;
+    const back = new Map(inst.own.map(n => [inst.fresh(n), { k: 'id', v: n }]));
+    return showTerm(substTerm(substTerm(c, inst.sub), back));
+  }
+
   /** Head, positional and named arguments of an application `f a (b := c) d`. */
   function appParts(term) {
     const t = (term || '').trim().replace(/^@/, '');
@@ -1922,7 +1966,8 @@
     if (!app) return null;
     const out = new Map();
     destructure(parsePattern(pending.pattern), app.type, out);
-    const types = (out.get(pending.name) || []).filter(t => t.type);
+    const types = (out.get(pending.name) || []).filter(t => t.type)
+      .map(t => (pending.params ? Object.assign({}, t, { type: `∀ ${pending.params}, ${t.type}` }) : t));
     if (!types.length) return null;
     const f = formatInferred(pending.name, { types, caseIdx: pending.caseIdx || 0 });
     return { typeSignature: f.typeSignature, note: f.note, from: parts.head, conclusion: app.type, unresolved: app.unresolved };
@@ -2079,6 +2124,22 @@
     return { typeSignature: signature, docstring: doc };
   }
 
+  /**
+   * Base name and fields of a term used as a receiver: `(hasSum_map_coeff h m).mul_right (q ^ m)`
+   * → { base: 'hasSum_map_coeff', path: ['mul_right'] }. Null when the base isn't a name.
+   */
+  function termChain(text) {
+    let n = parseTerm(text);
+    const path = [];
+    for (let guard = 0; n && guard < 30; guard++) {
+      n = tCore(n);
+      if (n.k === 'app') { n = n.f; continue; }
+      if (n.k === 'proj') { path.unshift(n.f); n = n.e; continue; }
+      break;
+    }
+    return n && n.k === 'id' ? { base: n.v, path } : null;
+  }
+
   /** Apply anonymous projections `[1, 2, …]` to a type; null if a step isn't known. */
   function projectionChain(type, indices) {
     let t = type;
@@ -2193,12 +2254,15 @@
     describeReplay,
     inferPending,
     applicationTypeFrom,
+    receiverResultType,
+    termChain,
     parenReceiver,
     applicationHead,
     typeHead,
     inferReceiverNamespace,
     declarationContext,
     contextFromDom,
-    fileRefFromDom
+    fileRefFromDom,
+    pageRevision
   };
 })();

@@ -21,6 +21,7 @@ const context = {
   Date: Date
 };
 context.window = context;
+context.self = context; // the service worker reaches shared scripts through `self`
 
 function loadScript(relPath) {
   const fullPath = path.join(__dirname, '..', relPath);
@@ -717,6 +718,73 @@ asyncChecks.push(bc.inferPending(hbInfo.inferNeeded, haveDecl, async () => NORM_
 // A local function applied to arguments: `have hb := hbound (-s) (by …)`.
 const localApp = "theorem foo : True := by\n  have hbound : ∀ s : ℝ, |s| < a → ‖c‖ ≤ M * Real.exp (e * s) := by\n    intro s hsb\n    exact sorry\n  have hb := hbound (-s) (by rwa [abs_neg])\n  exact hb";
 assert.strictEqual(bc.localVariableInfo("hb", localApp).typeSignature, "hb : ‖c‖ ≤ M * Real.exp (e * -s)");
+
+// 16. Non-Mathlib PRs (AxiomMath/RogersRamanujan#3): files read at the PR's commit
+console.log("16. Testing project indexing for collapsed diffs and non-Mathlib repos...");
+const src = [
+  "module",
+  "public import RogersRamanujan.NumberTheory.QTheory.Defs",
+  "public import Mathlib.Analysis.Normed.Ring.Basic",
+  "/-! # Module doc",
+  "theorem notReal : True := trivial -/",
+  "namespace QTheory",
+  "/-- Pentagonal sum. -/",
+  "theorem hasSum_qPochhammerInf_self {R : Type*} [CommRing R]",
+  "    {q : R} (hq : IsTopologicallyNilpotent q := by simp) :",
+  "    HasSum (fun k : ℤ ↦ q ^ k) (q; q)_∞ := by",
+  "  simp",
+  "section",
+  "theorem _root_.enormAt_X : enormAt φ q X = ‖q‖ₑ := rfl",
+  "end",
+  "@[deprecated (since := \"2026-11-12\")] alias old_name := hasSum_qPochhammerInf_self",
+  "end QTheory"
+].join("\n");
+const scanned = JSON.parse(JSON.stringify(prScanner.scanSource(src, "RogersRamanujan/NumberTheory/QTheory/Pentagonal.lean")));
+assert.deepStrictEqual(scanned.map(d => d.name), ["QTheory.hasSum_qPochhammerInf_self", "enormAt_X", "QTheory.old_name"], "namespaces qualify names; comments are skipped");
+assert(scanned[0].typeSignature.endsWith(": HasSum (fun k : ℤ ↦ q ^ k) (q; q)_∞"), `a default value inside a binder doesn't end the signature: ${scanned[0].typeSignature}`);
+assert.strictEqual(scanned[0].docstring, "Pentagonal sum.");
+assert.strictEqual(scanned[0].module, "RogersRamanujan.NumberTheory.QTheory.Pentagonal");
+prScanner.reset();
+prScanner.declarations.set("enormAt_X", { name: "enormAt_X", element: {}, source: "pr_diff" });
+prScanner.addDeclarations(scanned);
+assert.strictEqual(prScanner.find("enormAt_X").source, "pr_diff", "declarations read from the page keep priority");
+assert.strictEqual(prScanner.find("hasSum_qPochhammerInf_self").name, "QTheory.hasSum_qPochhammerInf_self", "short names find fetched declarations");
+assert.strictEqual(prScanner.find("QTheory.hasSum_qPochhammerInf_self").lineNumber, 8);
+
+// Tokens that aren't names: `∑'`, notation suffixes, simp options.
+assert.strictEqual(tok("  ∑' n : ℤ, f n", "'"), null);
+assert.strictEqual(tok("  enormAt φ q (a; g)_N ≠ ⊤", "_N"), null);
+assert.strictEqual(tok("  simp +contextual [coeff_X_pow]", "contextual"), null);
+assert.strictEqual(bc.localVariableInfo("m", "def evalAt (f : R⟦X⟧) : 𝕜 := ∑' m, φ (f.coeff m)").typeSignature, "m : _", "`∑'` binds its variable");
+// Notation types and heads.
+assert.strictEqual(bc.typeHead("ℝ≥0∞", null), "ENNReal");
+assert.strictEqual(bc.typeHead("(Polynomial ℤ)⟦X⟧", null), "PowerSeries");
+assert.strictEqual(bc.typeHead("R[X]", null), "Polynomial");
+assert.strictEqual(bc.typeHead("(∀ᶠ (x : α) in l, ∀ i ∈ I, p i x) ↔ ∀ i ∈ I, ∀ᶠ (x : α) in l, p i x", null), "Iff", "binders inside parentheses don't hide a top-level ↔");
+// The receiver fills its parameter, matched as a term (also instance parameters).
+assert.strictEqual(bc.receiverResultType("{p : Prop} [self : Fact p] : p", "Fact (0 < T)"), "0 < T");
+// (the type once the field is applied to its remaining arguments: `h.mpr hq : P x`)
+assert.strictEqual(bc.receiverResultType("{a b : Prop} (self : a ↔ b) : b → a", "P x ↔ Q x"), "P x");
+// `have h (i : ℕ) := lemma …` has a ∀ type.
+const paramHave = "theorem t (ha : 0 < a) : True := by\n  have hag (i : ℕ) := hpos ha i\n  exact trivial";
+asyncChecks.push(bc.inferPending(bc.localVariableInfo("hag", paramHave).inferNeeded, paramHave,
+  async () => "{a : ℝ} (ha : 0 < a) (i : ℕ) : 0 < a ^ i").then(r => assert.strictEqual(r.typeSignature, "hag : ∀ (i : ℕ), 0 < a ^ i")));
+
+// The worker follows in-repo imports (not Mathlib's) and marks the PR's own files.
+const fakeFiles = {
+  "RogersRamanujan/A.lean": "import RogersRamanujan.B\nimport Mathlib.Data.Nat.Basic\ntheorem a_thm : True := trivial",
+  "RogersRamanujan/B.lean": "public import RogersRamanujan.C\nnamespace QTheory\ntheorem b_thm : True := trivial\nend QTheory",
+  "RogersRamanujan/C.lean": "def c_def : ℕ := 0"
+};
+const realGetFileText = context.getFileText;
+const fetched = [];
+context.getFileText = async (ref) => { fetched.push(ref.path); return fakeFiles[ref.path] || null; };
+asyncChecks.push(context.projectDeclarations({ owner: "AxiomMath", repo: "RogersRamanujan", sha: "abc", paths: ["RogersRamanujan/A.lean"] }).then(ds => {
+  context.getFileText = realGetFileText;
+  const plain = JSON.parse(JSON.stringify(ds));
+  assert.deepStrictEqual(plain.map(d => `${d.name}${d.inPR ? "*" : ""}`), ["a_thm*", "QTheory.b_thm", "c_def"]);
+  assert(!fetched.some(p => p.startsWith("Mathlib/")), "Mathlib imports are left to Loogle");
+}));
 
 Promise.all(asyncChecks).then(() => {
   console.log("   ✓ Rewrite replay verified.\n");

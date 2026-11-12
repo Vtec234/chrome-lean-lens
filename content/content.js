@@ -41,7 +41,30 @@
     if (rescanDebounceTimer) clearTimeout(rescanDebounceTimer);
     rescanDebounceTimer = setTimeout(() => {
       window.LeanPRScanner.scanPage();
+      indexProjectFiles();
     }, 350);
+  }
+
+  // Declarations read from the PR's files at its commit (and, outside Mathlib, the project
+  // files they import): GitHub collapses large diffs, and Loogle only knows Mathlib.
+  let projectIndex = null; // promise while a request is running
+  const indexedPaths = new Set();
+  let indexedPage = null;
+
+  function indexProjectFiles() {
+    const m = location.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+    const ctx = window.VersoBinderContext;
+    if (!m || !ctx || !window.LeanPRScanner) return;
+    const page = `${m[1]}/${m[2]}#${m[3]}`;
+    if (indexedPage !== page) { indexedPage = page; indexedPaths.clear(); }
+    const paths = window.LeanPRScanner.filePaths().filter(p => !indexedPaths.has(p));
+    if (!paths.length) return;
+    paths.forEach(p => indexedPaths.add(p));
+    const rev = ctx.pageRevision();
+    const request = sendMessageP({ action: 'PROJECT_DECLARATIONS', owner: m[1], repo: m[2], pr: m[3], sha: rev.head, paths })
+      .then((res) => { if (res && res.declarations) window.LeanPRScanner.addDeclarations(res.declarations); })
+      .finally(() => { if (projectIndex === request) projectIndex = null; });
+    projectIndex = request;
   }
 
   /**
@@ -50,6 +73,7 @@
   function initPRScanner() {
     if (!settings.enablePRScanner) return;
     window.LeanPRScanner.scanPage();
+    indexProjectFiles();
 
     // Re-scan when GitHub mounts new virtualized diff chunks
     const observer = new MutationObserver((mutations) => {
@@ -131,6 +155,26 @@
         if (ns) return finish(ns, null, fields);
       }
       const head = inner && ctx.applicationHead(inner);
+      // `((f x).g y).h`: type the base, then each field in turn.
+      const nested = inner && !head ? ctx.termChain(inner) : null;
+      if (nested) {
+        const segs = nested.base.split('.');
+        if (isLocal(segs[0])) {
+          const ns = ctx.typeHead(ctx.conclusionOf(ctx.localType(segs[0], contextText)), resolveVar);
+          return ns ? finish(ns, null, [...segs.slice(1), ...nested.path, ...fields]) : null;
+        }
+        const prBase = window.LeanPRScanner && window.LeanPRScanner.find(nested.base);
+        if (prBase && prBase.typeSignature) {
+          const sig = prBase.typeSignature.replace(/^\S+\s+\S+\s*/, '');
+          const ns = ctx.typeHead(ctx.conclusionOf(sig), (v) => {
+            const vt = ctx.findBinderType(v, sig);
+            return vt ? ctx.typeHead(vt, null) : null;
+          });
+          if (ns) return finish(ns, null, [...nested.path, ...fields]);
+        }
+        const rest = [...nested.path, ...fields];
+        return { chain: { const: nested.base, path: rest.slice(0, -1), maybeVariable: /^[a-z_]/.test(nested.base), applied: true }, field: rest[rest.length - 1] };
+      }
       if (head) {
         const segs = head.split('.');
         if (segs.length === 1 && isLocal(head)) {
@@ -183,6 +227,20 @@
     if (fields.length === 2 && isLocal(fields[0]) && !/^[a-z_α-ω]/.test(fields[0])) {
       const ns = ctx.inferReceiverNamespace(fields[0], contextText);
       return ns ? { token: `${ns}.${fields[1]}` } : null;
+    }
+    // A constant declared in the PR or project (`enormAt_X.trans_lt`): its statement's head.
+    // Not for namespaces (`CNF.zero_right` is itself declared) or aliases (no written type).
+    const scanner = window.LeanPRScanner;
+    if (fields.length >= 2 && !isLocal(fields[0]) && /^[a-z_]/.test(fields[0]) && scanner && !scanner.declarations.has(fields.join('.'))) {
+      const prHead = scanner.declarations.get(fields[0]);
+      if (prHead && prHead.typeSignature && prHead.kind !== 'alias') {
+        const sig = prHead.typeSignature.replace(/^\S+\s+\S+\s*/, '');
+        const ns = ctx.typeHead(ctx.conclusionOf(sig), (v) => {
+          const vt = ctx.findBinderType(v, sig);
+          return vt ? ctx.typeHead(vt, null) : null;
+        });
+        if (ns) return finish(ns, null, fields.slice(1));
+      }
     }
     // Short capitalised names (`E.algebraMap_apply`) may be `variable`s, like lowercase ones.
     if (fields.length >= 2 && (/^[a-z_α-ω]/.test(fields[0]) || /^[A-Z][\w']?$/.test(fields[0])) && !isLocal(fields[0])) {
@@ -412,6 +470,11 @@
         (lookup.queryToken === token || !lookup.queryToken.includes('.') ? pr.find(token) || (subToken ? pr.find(subToken) : null) : null);
       if (prDecl) {
         window.VersoTooltipView.show(prDecl, boundingRect);
+        return;
+      }
+      // The PR's files are still being read: try again once they are.
+      if (projectIndex) {
+        projectIndex.then(() => { if (lastHoveredToken === token) triggerHoverLookup(tokenInfo); });
         return;
       }
     }

@@ -77,6 +77,11 @@
       if (!rawToken || /^\d+$/.test(rawToken) || /^_+$/.test(rawToken) || /^[?!]/.test(rawToken)) return null;
       // `foo%` is an elaborator (`fast_instance%`), not a constant.
       if (lineText[end] === '%') return null;
+      // The `'` of `∑'` / `∏'`, and suffixes of notation like `(a; g)_N`, aren't names.
+      if (rawToken === "'" || (rawToken.startsWith('_') && lineText[start - 1] === ')')) return null;
+      // `simp +contextual`, `simp -zeta`: tactic options, not names.
+      if ((lineText[start - 1] === '+' || lineText[start - 1] === '-') && /\s/.test(lineText[start - 2] || '') &&
+          /\b(simp|simp_all|simpa|dsimp|norm_num|field_simp|grind|aesop|omega|decide|positivity)\b[^\n]*$/.test(lineText.slice(0, start))) return null;
 
       // Decoration glued to an arrow (`→ₛₗ[σ]`, `≃+*`, `↪o`, `→L[𝕜]`) is part of a bundled-map
       // notation: report the whole operator so it can be mapped to its type.

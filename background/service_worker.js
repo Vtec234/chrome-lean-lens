@@ -5,7 +5,7 @@
 
 // Shared binder parsing (also used by the content script).
 if (typeof importScripts === 'function') {
-  try { importScripts('../content/binder_context.js'); } catch (err) { /* lookups still work without it */ }
+  try { importScripts('../content/binder_context.js', '../content/pr_scanner.js'); } catch (err) { /* lookups still work without them */ }
 }
 
 const SETTINGS_KEY = "lean_lens_settings";
@@ -502,11 +502,11 @@ async function lookupFileVariable(token, fileRef) {
 const fileTextCache = new Map(); // key → Promise<string|null>
 const prRevisionCache = new Map(); // owner/repo#pr → Promise<{head, base}|null>
 
-async function fetchText(url, ms = 5000) {
+async function fetchText(url, ms = 5000, init = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   try {
-    const res = await fetch(url, { signal: controller.signal });
+    const res = await fetch(url, Object.assign({ signal: controller.signal }, init));
     return res.ok ? await res.text() : null;
   } catch (err) {
     return null;
@@ -536,11 +536,67 @@ async function getFileText(fileRef) {
   if (!sha || !fileRef.path) return null;
   const key = `${fileRef.owner}/${fileRef.repo}@${sha}:${fileRef.path}`;
   if (!fileTextCache.has(key)) {
-    if (fileTextCache.size > 30) fileTextCache.delete(fileTextCache.keys().next().value);
+    if (fileTextCache.size > 300) fileTextCache.delete(fileTextCache.keys().next().value);
     const path = fileRef.path.split('/').map(encodeURIComponent).join('/');
-    fileTextCache.set(key, fetchText(`https://raw.githubusercontent.com/${fileRef.owner}/${fileRef.repo}/${sha}/${path}`));
+    fileTextCache.set(key, fetchText(`https://raw.githubusercontent.com/${fileRef.owner}/${fileRef.repo}/${sha}/${path}`)
+      // Private repositories: github.com's raw endpoint with the user's GitHub session.
+      .then(t => t !== null ? t : fetchText(`https://github.com/${fileRef.owner}/${fileRef.repo}/raw/${sha}/${path}`, 8000, { credentials: 'include' })));
   }
   return fileTextCache.get(key);
+}
+
+/** Modules a Lean file imports (`import A.B`, `public import A.B`, `import all A`). */
+function importsOf(text) {
+  const out = [];
+  const re = /^\s*(?:public\s+)?(?:meta\s+)?import\s+(?:all\s+)?([\w.'«»]+)/gm;
+  let m;
+  while ((m = re.exec(text)) !== null) out.push(m[1]);
+  return out;
+}
+
+/**
+ * Declarations in a PR's Lean files, read from the files at the PR's commit rather than the
+ * page (GitHub collapses large diffs). Outside Mathlib, also the project files they import,
+ * following imports within the repository (Loogle only knows Mathlib).
+ */
+async function projectDeclarations({ owner, repo, pr, sha, paths }) {
+  const scanner = self.LeanPRScanner;
+  if (!scanner || !paths || !paths.length) return [];
+  if (!sha && pr) {
+    const rev = await getPrRevision(owner, repo, pr);
+    sha = rev && rev.head;
+  }
+  if (!sha) return [];
+  const isMathlib = /^leanprover-community\/mathlib4?$/i.test(`${owner}/${repo}`);
+  const roots = new Set(paths.map(p => p.split('/')[0].replace(/\.lean$/, '')));
+  const changed = new Set(paths);
+  const queue = paths.filter(p => p.endsWith('.lean'));
+  const seen = new Set();
+  const decls = [];
+  const limit = isMathlib ? queue.length : 120;
+  while (queue.length && seen.size < limit) {
+    const batch = [];
+    while (queue.length && batch.length < 8 && seen.size + batch.length < limit) {
+      const p = queue.shift();
+      if (!seen.has(p) && !batch.includes(p)) batch.push(p);
+    }
+    batch.forEach(p => seen.add(p));
+    const texts = await Promise.all(batch.map(p => getFileText({ owner, repo, sha, path: p })));
+    batch.forEach((p, k) => {
+      const text = texts[k];
+      if (!text) return;
+      for (const d of scanner.scanSource(text, p)) {
+        decls.push(Object.assign(d, { inPR: changed.has(p), repo: `${owner}/${repo}`, sha }));
+      }
+      if (isMathlib) return;
+      for (const mod of importsOf(text)) {
+        if (!roots.has(mod.split('.')[0])) continue;
+        const fp = mod.replace(/\./g, '/') + '.lean';
+        if (!seen.has(fp) && !queue.includes(fp)) queue.push(fp);
+      }
+    });
+  }
+  return decls;
 }
 
 /** Does `name` exist? Returns the Loogle hit for it, or null. */
@@ -680,6 +736,11 @@ async function resultType(constName, receiverType) {
   if (!bc || !hit || !hit.type) return null;
   let conclusion = bc.conclusionOf(hit.type);
   if (!conclusion) return null;
+  if (receiverType && bc.receiverResultType) {
+    // Match the receiver against its parameter as terms (handles `a ↔ b`, `a ≤ b`, …).
+    const viaTerms = bc.receiverResultType(hit.type, receiverType);
+    if (viaTerms) return { type: viaTerms, sig: hit.type };
+  }
   const binders = signatureBinders(hit.type);
   if (receiverType) {
     const recvHead = bc.typeHead(receiverType, null);
@@ -920,7 +981,8 @@ async function handleLookupToken(token, subToken, fileRef, contextText, tacticPo
   if (fileRef && token && !token.includes('.')) {
     const variable = await lookupFileVariable(token, fileRef);
     if (variable) return variable;
-    if (token.length <= 1) return null; // one-letter names are never global lemmas
+    // One-letter lowercase names are locals; uppercase ones can be constants (`X`, `C`, `I`).
+    if (token.length <= 1 && !/^[A-Z]$/.test(token)) return null;
     const settings = await getSettings();
     if (settings.enableLoogle) {
       const scoped = await lookupInFileScope(token, fileRef, contextText);
@@ -967,6 +1029,15 @@ async function handleLookupToken(token, subToken, fileRef, contextText, tacticPo
       // Tactics aren't declarations, so Loogle can't find them.
       loogleResult = (await lookupTactic(token)) || loogleResult;
     }
+    if ((!loogleResult || loogleResult.ambiguous) && token.includes('.') && fileRef) {
+      // `Tendsto.sub` from a type head written unqualified (`open Filter`): qualify it in scope.
+      const [first, ...rest] = token.split('.');
+      const qualified = await qualifyConstant(first, fileRef);
+      if (qualified !== first) {
+        const hit = await loogleExact(`${qualified}.${rest.join('.')}`);
+        if (hit && hit.type) loogleResult = hitToResult(hit);
+      }
+    }
     if ((!loogleResult || loogleResult.ambiguous) && token.includes('.')) {
       // `MultilinearMap.ext_iff.mp`, `Finset.univ.erase`: a constant followed by fields.
       const segs = token.split('.');
@@ -978,7 +1049,10 @@ async function handleLookupToken(token, subToken, fileRef, contextText, tacticPo
         if (viaFields) loogleResult = viaFields;
       }
     }
-    if (!loogleResult) loogleResult = await lookupNamespace(token, fullChain);
+    // A namespace segment (`ENNReal.Tendsto` in `ENNReal.Tendsto.const_mul`) rather than a lemma.
+    if ((!loogleResult || (loogleResult.ambiguous && fullChain && fullChain.startsWith(token + '.')))) {
+      loogleResult = (await lookupNamespace(token, fullChain)) || loogleResult;
+    }
     if (loogleResult) {
       queryStats.loogleHits++;
       // Ambiguous results may come from a transient failure of the more specific
@@ -1023,6 +1097,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       sendResponse({ success: Boolean(result), data: result });
     });
     return true; // Keep message channel open for async response
+  }
+
+  if (action === "PROJECT_DECLARATIONS") {
+    projectDeclarations(request).then((declarations) => sendResponse({ declarations }), () => sendResponse({ declarations: [] }));
+    return true;
   }
 
   if (action === "CONSTANT_SIGNATURE") {
