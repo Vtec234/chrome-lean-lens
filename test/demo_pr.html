@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en" data-color-mode="dark">
+<head>
+  <meta charset="UTF-8">
+  <title>GitHub PR #14285: feat(Topology): continuous map extension - Pull Request Review</title>
+  <link rel="stylesheet" href="../content/content.css">
+  <style>
+    body {
+      background-color: #0d1117;
+      color: #e6edf3;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+      margin: 0;
+      padding: 24px;
+    }
+    .pr-container {
+      max-width: 1040px;
+      margin: 0 auto;
+    }
+    .pr-header {
+      border-bottom: 1px solid #30363d;
+      padding-bottom: 16px;
+      margin-bottom: 20px;
+    }
+    .pr-title {
+      font-size: 24px;
+      font-weight: 600;
+      color: #f0f6fc;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .pr-badge {
+      background: #238636;
+      color: #fff;
+      font-size: 13px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-weight: 500;
+    }
+    .file {
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      background: #0d1117;
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+    .file-header {
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      padding: 8px 16px;
+      display: flex;
+      align-items: center;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: 13px;
+      font-weight: 600;
+      color: #f0f6fc;
+    }
+    .diff-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 20px;
+    }
+    .diff-table td {
+      padding: 1px 8px;
+    }
+    .blob-num {
+      width: 45px;
+      text-align: right;
+      color: #6e7681;
+      user-select: none;
+      vertical-align: top;
+      border-right: 1px solid #21262d;
+    }
+    .blob-code-addition {
+      background-color: rgba(46, 160, 67, 0.15);
+    }
+    .blob-code-deletion {
+      background-color: rgba(248, 81, 73, 0.15);
+    }
+    .blob-code-context {
+      background-color: transparent;
+    }
+    .blob-code-inner {
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .pl-k { color: #ff7b72; }
+    .pl-s1 { color: #e6edf3; }
+    .pl-en { color: #d2a8ff; }
+    .pl-c { color: #8b949e; font-style: italic; }
+    .instruction-banner {
+      background: #161b22;
+      border: 1px solid #388bfd;
+      border-radius: 8px;
+      padding: 14px 18px;
+      margin-bottom: 24px;
+      font-size: 13px;
+    }
+    .instruction-banner h3 {
+      color: #58a6ff;
+      margin-top: 0;
+      margin-bottom: 6px;
+    }
+  </style>
+</head>
+<body>
+
+<div class="pr-container">
+  <div class="instruction-banner">
+    <h3>Verso GitHub Extension Live Demo &amp; PR Review Tester</h3>
+    <p>Hover cursor over any identifier or tactic in the diff below to test Verso tooltips:</p>
+    <ul>
+      <li><strong>PR-defined declaration:</strong> Hover over <code>continuous_extend_dense</code> or <code>DenseSubspace.lift</code> (defined in this PR diff!).</li>
+      <li><strong>Filter &amp; Analysis:</strong> Hover over <code>ZeroAtFilter</code>, <code>BoundedAtFilter</code>, <code>atImInfty</code>.</li>
+      <li><strong>Standard tactics:</strong> Hover over <code>simp</code>, <code>rw</code>, <code>intro</code>, <code>exact</code>, <code>obtain</code>, <code>omega</code>.</li>
+      <li><strong>Mathlib / Lean types:</strong> Hover over <code>Continuous</code>, <code>TopologicalSpace</code>, <code>Finset.sum</code>, <code>List.map</code>, <code>Real</code>, <code>Nat</code>.</li>
+      <li><strong>Shortcuts:</strong> Press <kbd>Alt</kbd> to pin tooltip, <kbd>Esc</kbd> to close.</li>
+    </ul>
+  </div>
+
+  <div class="pr-header">
+    <div class="pr-title">
+      <span class="pr-badge">Open</span>
+      feat(Topology): add continuous map extension lemmas and compact filters #14285
+    </div>
+  </div>
+
+  <!-- Simulated GitHub Diff File 1 -->
+  <div class="file" data-file-type=".lean" data-file-path="Mathlib/Topology/Maps.lean">
+    <div class="file-header" data-path="Mathlib/Topology/Maps.lean">
+      Mathlib/Topology/Maps.lean
+    </div>
+    <table class="diff-table">
+      <tbody>
+        <tr data-line-number="120">
+          <td class="blob-num">120</td>
+          <td class="blob-num">120</td>
+          <td class="blob-code blob-code-context">
+            <span class="blob-code-inner"><span class="pl-k">variable</span> {α β γ : <span class="pl-s1">Type</span>*} [<span class="pl-s1">TopologicalSpace</span> α] [<span class="pl-s1">TopologicalSpace</span> β]</span>
+          </td>
+        </tr>
+        <tr data-line-number="121">
+          <td class="blob-num">121</td>
+          <td class="blob-num">121</td>
+          <td class="blob-code blob-code-context">
+            <span class="blob-code-inner"><span class="pl-k">variable</span> {f : α → β} {s : <span class="pl-s1">Set</span> α}</span>
+          </td>
+        </tr>
+        <tr data-line-number="122">
+          <td class="blob-num"></td>
+          <td class="blob-num">122</td>
+          <td class="blob-code blob-code-addition">
+            <span class="blob-code-inner"><span class="pl-c">/-- Extension lemma for continuous maps on dense subspaces with values in regular spaces. -/</span></span>
+          </td>
+        </tr>
+        <tr data-line-number="123" id="line-123">
+          <td class="blob-num"></td>
+          <td class="blob-num">123</td>
+          <td class="blob-code blob-code-addition">
+            <span class="blob-code-inner"><span class="pl-k">lemma</span> <span class="pl-en">continuous_extend_dense</span> (hd : <span class="pl-s1">Dense</span> s) (hf : <span class="pl-s1">Continuous</span> f) : <span class="pl-s1">Continuous</span> (<span class="pl-s1">Dense.extend</span> hd f) := <span class="pl-k">by</span></span>
+          </td>
+        </tr>
+        <tr data-line-number="124">
+          <td class="blob-num"></td>
+          <td class="blob-num">124</td>
+          <td class="blob-code blob-code-addition">
+            <span class="blob-code-inner">  <span class="pl-s1">intro</span> x</span>
+          </td>
+        </tr>
+        <tr data-line-number="125">
+          <td class="blob-num"></td>
+          <td class="blob-num">125</td>
+          <td class="blob-code blob-code-addition">
+            <span class="blob-code-inner">  <span class="pl-s1">obtain</span> ⟨y, hy⟩ := <span class="pl-s1">hd.exists_mem_nhds</span> x</span>
+          </td>
+        </tr>
+        <tr data-line-number="126">
+          <td class="blob-num"></td>
+          <td class="blob-num">126</td>
+          <td class="blob-code blob-code-addition">
+            <span class="blob-code-inner">  <span class="pl-s1">rw</span> [← <span class="pl-s1">hy</span>]</span>
+          </td>
+        </tr>
+        <tr data-line-number="127">
+          <td class="blob-num"></td>
+          <td class="blob-num">127</td>
+          <td class="blob-code blob-code-addition">
+            <span class="blob-code-inner">  <span class="pl-s1">simp</span> [<span class="pl-s1">hf.tendsto</span>]</span>
+          </td>
+        </tr>
+        <tr data-line-number="128">
+          <td class="blob-num"></td>
+          <td class="blob-num">128</td>
+          <td class="blob-code blob-code-addition">
+            <span class="blob-code-inner">  <span class="pl-s1">exact</span> <span class="pl-s1">rfl</span></span>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Simulated GitHub Diff File 3: Complex Analysis & Modular Forms -->
+  <div class="file" data-file-type=".lean" data-file-path="Mathlib/Analysis/Complex/UpperHalfPlane/FunctionsBoundedAtImInfty.lean">
+    <div class="file-header" data-path="Mathlib/Analysis/Complex/UpperHalfPlane/FunctionsBoundedAtImInfty.lean">
+      Mathlib/Analysis/Complex/UpperHalfPlane/FunctionsBoundedAtImInfty.lean
+    </div>
+    <table class="diff-table">
+      <tbody>
+        <tr data-line-number="50">
+          <td class="blob-num"></td>
+          <td class="blob-num">50</td>
+          <td class="blob-code blob-code-addition">
+            <span class="blob-code-inner"><span class="pl-k">open</span> <span class="pl-s1">Filter</span> <span class="pl-s1">UpperHalfPlane</span></span>
+          </td>
+        </tr>
+        <tr data-line-number="51">
+          <td class="blob-num"></td>
+          <td class="blob-num">51</td>
+          <td class="blob-code blob-code-addition">
+            <span class="blob-code-inner"><span class="pl-c">/-- Easy lemma: vanishing functions along atImInfty satisfy ZeroAtFilter -/</span></span>
+          </td>
+        </tr>
+        <tr data-line-number="52">
+          <td class="blob-num"></td>
+          <td class="blob-num">52</td>
+          <td class="blob-code blob-code-addition">
+            <span class="blob-code-inner"><span class="pl-k">lemma</span> <span class="pl-en">zeroAtFilter_of_isZeroAtImInfty</span> {f : ℍ → ℂ} (h : <span class="pl-s1">ZeroAtFilter</span> <span class="pl-s1">atImInfty</span> f) : <span class="pl-s1">BoundedAtFilter</span> <span class="pl-s1">atImInfty</span> f := <span class="pl-k">by</span></span>
+          </td>
+        </tr>
+        <tr data-line-number="53">
+          <td class="blob-num"></td>
+          <td class="blob-num">53</td>
+          <td class="blob-code blob-code-addition">
+            <span class="blob-code-inner">  <span class="pl-s1">exact</span> <span class="pl-s1">h.boundedAtFilter</span></span>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+  <div class="file" data-file-type=".lean" data-file-path="Mathlib/Algebra/BigOperators.lean">
+    <div class="file-header" data-path="Mathlib/Algebra/BigOperators.lean">
+      Mathlib/Algebra/BigOperators.lean
+    </div>
+    <table class="diff-table">
+      <tbody>
+        <tr data-line-number="45">
+          <td class="blob-num"></td>
+          <td class="blob-num">45</td>
+          <td class="blob-code blob-code-addition">
+            <span class="blob-code-inner"><span class="pl-c">/-- Lift a dense subspace homomorphism across finite index sums. -/</span></span>
+          </td>
+        </tr>
+        <tr data-line-number="46" id="line-46">
+          <td class="blob-num"></td>
+          <td class="blob-num">46</td>
+          <td class="blob-code blob-code-addition">
+            <span class="blob-code-inner"><span class="pl-k">def</span> <span class="pl-en">DenseSubspace.lift</span> (s : <span class="pl-s1">Finset</span> <span class="pl-s1">Nat</span>) (f : <span class="pl-s1">Nat</span> → <span class="pl-s1">Real</span>) : <span class="pl-s1">Real</span> :=</span>
+          </td>
+        </tr>
+        <tr data-line-number="47">
+          <td class="blob-num"></td>
+          <td class="blob-num">47</td>
+          <td class="blob-code blob-code-addition">
+            <span class="blob-code-inner">  <span class="pl-s1">Finset.sum</span> s (<span class="pl-k">fun</span> i => f i)</span>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Load extension scripts directly for test bed preview -->
+<script src="../content/builtins_db.js"></script>
+<script src="../content/lean_tokenizer.js"></script>
+<script src="../content/pr_scanner.js"></script>
+<script src="../content/tooltip_view.js"></script>
+<script>
+  // Mock background message responder for demo page testing outside full extension runtime
+  window.chrome = window.chrome || {};
+  window.chrome.runtime = window.chrome.runtime || {
+    sendMessage: (msg, cb) => {
+      if (msg.action === "GET_SETTINGS") {
+        cb({ settings: { enabled: true, hoverDelay: 150, enablePRScanner: true, enableBuiltins: true } });
+      } else if (msg.action === "LOOKUP_TOKEN") {
+        const token = msg.token || '';
+        const shortName = msg.subToken || token.split('.').pop();
+        if (shortName === "ZeroAtFilter") {
+          cb({
+            success: true,
+            data: {
+              name: "Filter.ZeroAtFilter",
+              kind: "def",
+              typeSignature: "def Filter.ZeroAtFilter [Zero β] (l : Filter α) (f : α → β) : Prop :=\\n  ∀ᶠ x in l, f x = 0",
+              docstring: "A function is zero at a filter if it eventually equals zero along the filter.",
+              module: "Mathlib.Order.Filter.ZeroAndBoundedAtFilter",
+              source: "loogle",
+              sourceUrl: "https://leanprover-community.github.io/mathlib4_docs/Mathlib/Order/Filter/ZeroAndBoundedAtFilter.html#Filter.ZeroAtFilter"
+            }
+          });
+        } else if (shortName === "BoundedAtFilter") {
+          cb({
+            success: true,
+            data: {
+              name: "Filter.BoundedAtFilter",
+              kind: "def",
+              typeSignature: "def Filter.BoundedAtFilter [Norm β] (l : Filter α) (f : α → β) : Prop :=\\n  ∃ C, ∀ᶠ x in l, ‖f x‖ ≤ C",
+              docstring: "A function is bounded at a filter if its norm is eventually bounded by a constant along the filter.",
+              module: "Mathlib.Order.Filter.ZeroAndBoundedAtFilter",
+              source: "loogle",
+              sourceUrl: "https://leanprover-community.github.io/mathlib4_docs/Mathlib/Order/Filter/ZeroAndBoundedAtFilter.html#Filter.BoundedAtFilter"
+            }
+          });
+        } else {
+          const builtin = window.VersoBuiltins ? window.VersoBuiltins.get(msg.token) : null;
+          cb({ success: Boolean(builtin), data: builtin });
+        }
+      }
+    },
+    onMessage: { addListener: () => {} }
+  };
+</script>
+<script src="../content/content.js"></script>
+</body>
+</html>

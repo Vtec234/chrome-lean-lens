@@ -1,0 +1,403 @@
+/**
+ * Verso Hover Tooltip CSS for GitHub.
+ * Designed to look like Verso documentation (.hover-info) and integrate seamlessly with GitHub's UI.
+ */
+
+/* Root Tooltip Container */
+.verso-hover-container {
+  position: fixed;
+  z-index: 99999999;
+  max-width: 460px;
+  min-width: 300px;
+  pointer-events: auto;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  transition: opacity 0.15s cubic-bezier(0.16, 1, 0.3, 1), transform 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.verso-hover-container.verso-hidden {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(4px) scale(0.98);
+  display: none;
+}
+
+.verso-hover-container.verso-visible {
+  display: block;
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+/* Invisible bridge padding to prevent mouseleave flicker when moving between code and tooltip */
+.verso-hover-container::before {
+  content: "";
+  position: absolute;
+  top: -14px;
+  left: -14px;
+  right: -14px;
+  bottom: -14px;
+  pointer-events: auto;
+  z-index: -1;
+}
+
+.verso-hover-container.verso-pinned .verso-tooltip-card {
+  border-color: #6366f1 !important;
+  box-shadow: 0 12px 32px rgba(99, 102, 241, 0.25), 0 4px 12px rgba(0, 0, 0, 0.3) !important;
+}
+
+/* Tooltip Card */
+.verso-tooltip-card {
+  background: var(--verso-bg, #161b22);
+  color: var(--verso-text, #e6edf3);
+  border: 1px solid var(--verso-border, #30363d);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35), 0 2px 8px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(12px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* GitHub Light Theme Support */
+[data-color-mode="light"] .verso-hover-container,
+body:not([data-color-mode="dark"]):not(.dark-mode) .verso-hover-container {
+  --verso-bg: #ffffff;
+  --verso-text: #1f2328;
+  --verso-text-muted: #656d76;
+  --verso-border: #d0d7de;
+  --verso-code-bg: #f6f8fa;
+  --verso-header-bg: #f8fafc;
+  --verso-kw: #cf222e;
+  --verso-sym: #0969da;
+  --verso-implicit: #8250df;
+  --verso-inst: #1a7f37;
+}
+
+/* GitHub Dark Theme Support (Default) */
+[data-color-mode="dark"] .verso-hover-container,
+body.dark-mode .verso-hover-container,
+.verso-hover-container {
+  --verso-bg: #161b22;
+  --verso-text: #e6edf3;
+  --verso-text-muted: #8b949e;
+  --verso-border: #30363d;
+  --verso-code-bg: #0d1117;
+  --verso-header-bg: #1c2128;
+  --verso-kw: #ff7b72;
+  --verso-sym: #79c0ff;
+  --verso-implicit: #d2a8ff;
+  --verso-inst: #7ee787;
+}
+
+/* Header */
+.verso-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--verso-header-bg, #1c2128);
+  border-bottom: 1px solid var(--verso-border, #30363d);
+}
+
+.verso-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.verso-ident-title {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--verso-text, #e6edf3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 260px;
+}
+
+/* Kind Badges */
+.verso-kind-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 4px;
+  text-transform: lowercase;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", monospace;
+}
+
+.verso-kind-def {
+  background: rgba(56, 189, 248, 0.15);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+}
+
+.verso-kind-theorem, .verso-kind-lemma {
+  background: rgba(52, 211, 153, 0.15);
+  color: #34d399;
+  border: 1px solid rgba(52, 211, 153, 0.3);
+}
+
+.verso-kind-structure, .verso-kind-inductive {
+  background: rgba(192, 132, 252, 0.15);
+  color: #c084fc;
+  border: 1px solid rgba(192, 132, 252, 0.3);
+}
+
+.verso-kind-class, .verso-kind-instance {
+  background: rgba(45, 212, 191, 0.15);
+  color: #2dd4bf;
+  border: 1px solid rgba(45, 212, 191, 0.3);
+}
+
+.verso-kind-tactic {
+  background: rgba(251, 191, 36, 0.15);
+  color: #fbbf24;
+  border: 1px solid rgba(251, 191, 36, 0.3);
+}
+
+.verso-kind-ambiguous {
+  background: rgba(148, 163, 184, 0.15);
+  color: #94a3b8;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+
+.verso-kind-namespace {
+  background: rgba(250, 204, 21, 0.12);
+  color: #eab308;
+  border: 1px solid rgba(250, 204, 21, 0.3);
+}
+
+.verso-kind-variable {
+  background: rgba(244, 114, 182, 0.15);
+  color: #f472b6;
+  border: 1px solid rgba(244, 114, 182, 0.3);
+}
+
+/* Action Buttons */
+.verso-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.verso-action-btn {
+  background: transparent;
+  border: none;
+  color: var(--verso-text-muted, #8b949e);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+}
+
+.verso-action-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--verso-text, #e6edf3);
+}
+
+.verso-action-btn.verso-btn-active {
+  color: #818cf8;
+  background: rgba(99, 102, 241, 0.2);
+}
+
+.verso-action-btn.verso-btn-success {
+  color: #34d399;
+}
+
+/* Module Bar */
+.verso-module-bar {
+  padding: 3px 12px;
+  background: rgba(0, 0, 0, 0.15);
+  border-bottom: 1px solid var(--verso-border, #30363d);
+}
+
+.verso-module-name {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", monospace;
+  font-size: 11px;
+  color: var(--verso-text-muted, #8b949e);
+}
+
+/* Body */
+.verso-body {
+  padding: 10px 12px;
+  max-height: 380px;
+  overflow-y: auto;
+}
+
+/* Signature Code Block */
+.verso-signature-container {
+  margin-bottom: 8px;
+}
+
+.verso-code-block {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--verso-code-bg, #0d1117);
+  border: 1px solid var(--verso-border, #30363d);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--verso-text, #e6edf3);
+}
+
+/* Syntax Highlighting */
+.v-kw {
+  color: var(--verso-kw, #ff7b72);
+  font-weight: 600;
+}
+
+.v-sym {
+  color: var(--verso-sym, #79c0ff);
+  font-weight: 500;
+}
+
+.v-implicit {
+  color: var(--verso-implicit, #d2a8ff);
+}
+
+.v-inst {
+  color: var(--verso-inst, #7ee787);
+}
+
+.v-comment {
+  color: var(--verso-text-muted, #8b949e);
+  font-style: italic;
+}
+
+.v-str {
+  color: #a5d6ff;
+}
+
+/* PR Banner */
+.verso-pr-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+}
+
+.verso-pr-badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: #34d399;
+}
+
+.verso-pr-jump-btn {
+  background: #10b981;
+  color: #ffffff;
+  border: none;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.verso-pr-jump-btn:hover {
+  background: #059669;
+}
+
+/* Docstring */
+.verso-docstring {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--verso-text, #e6edf3);
+}
+
+.verso-docstring p {
+  margin: 6px 0;
+}
+
+.verso-docstring ul {
+  margin: 4px 0 6px 18px;
+  padding: 0;
+}
+
+.verso-docstring li {
+  margin-bottom: 3px;
+}
+
+.verso-inline-code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", monospace;
+  font-size: 11.5px;
+  background: rgba(110, 118, 129, 0.2);
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+
+.verso-no-doc {
+  font-style: italic;
+  color: var(--verso-text-muted, #8b949e);
+  font-size: 12px;
+}
+
+/* Footer */
+.verso-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: var(--verso-header-bg, #1c2128);
+  border-top: 1px solid var(--verso-border, #30363d);
+  font-size: 11px;
+  color: var(--verso-text-muted, #8b949e);
+}
+
+.verso-ext-link {
+  color: #58a6ff;
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.verso-ext-link:hover {
+  text-decoration: underline;
+}
+
+/* Loading Spinner */
+.verso-loading-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  border-top-color: #38bdf8;
+  border-radius: 50%;
+  animation: verso-spin 0.6s linear infinite;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+
+@keyframes verso-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Jump Target Highlight Flash */
+@keyframes verso-pulse-target {
+  0% { background-color: rgba(99, 102, 241, 0.4); outline: 2px solid #6366f1; }
+  50% { background-color: rgba(99, 102, 241, 0.2); outline: 2px solid #6366f1; }
+  100% { background-color: transparent; outline: none; }
+}
+
+.verso-highlight-target {
+  animation: verso-pulse-target 2.5s ease-out forwards !important;
+}
+
+/* Utilities */
+.verso-hidden {
+  display: none !important;
+}

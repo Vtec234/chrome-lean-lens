@@ -1,0 +1,61 @@
+{
+  "manifest_version": 3,
+  "name": "Verso: Lean 4 GitHub Code Inspector",
+  "version": "1.0.0",
+  "description": "Hover over Lean 4 code in GitHub files and PR reviews to view definitions, types, and docstrings using Verso & Loogle.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "default_title": "Verso Lean Inspector"
+  },
+  "options_ui": {
+    "page": "options/options.html",
+    "open_in_tab": false
+  },
+  "background": {
+    "service_worker": "background/service_worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://github.com/*"
+      ],
+      "js": [
+        "content/builtins_db.js",
+        "content/lean_tokenizer.js",
+        "content/binder_context.js",
+        "content/pr_scanner.js",
+        "content/tooltip_view.js",
+        "content/content.js"
+      ],
+      "css": [
+        "content/content.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://github.com/*",
+    "https://loogle.lean-lang.org/*",
+    "https://raw.githubusercontent.com/*",
+    "https://api.github.com/*",
+    "https://leanprover-community.github.io/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ]
+}

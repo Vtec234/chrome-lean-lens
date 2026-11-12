@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Verso Inspector Settings</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="options-container">
+    <header class="options-header">
+      <div class="header-left">
+        <img src="../icons/icon48.png" alt="Verso Logo" class="logo">
+        <div>
+          <h1>Verso: Lean 4 GitHub Inspector</h1>
+          <p class="subtitle">Customize hover behavior, data sources, and PR review intelligence</p>
+        </div>
+      </div>
+      <div id="save-status" class="save-status">Saved</div>
+    </header>
+
+    <div class="content-grid">
+      <!-- Section 1: Hover & Display -->
+      <div class="card">
+        <h2 class="card-title">Hover &amp; Display</h2>
+        
+        <div class="form-group">
+          <label for="hover-delay">Hover Trigger Delay: <span id="hover-delay-val">250ms</span></label>
+          <input type="range" id="hover-delay" min="100" max="1000" step="50" value="250">
+          <span class="help-text">Shorter delays trigger faster; longer delays prevent unintentional popups while scrolling.</span>
+        </div>
+
+        <div class="form-group">
+          <label for="theme-select">Visual Theme</label>
+          <select id="theme-select">
+            <option value="auto">Auto (Match GitHub Theme)</option>
+            <option value="dark">Verso Slate Dark</option>
+            <option value="light">Verso Clean Light</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Section 2: Data Sources & PR Intelligence -->
+      <div class="card">
+        <h2 class="card-title">Intelligence Sources</h2>
+
+        <div class="checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" id="enable-pr-scanner" checked>
+            <div>
+              <strong>In-PR Local Declaration Scanner</strong>
+              <p>Automatically indexes definitions and lemmas introduced or edited within the current GitHub PR diff.</p>
+            </div>
+          </label>
+        </div>
+
+        <div class="checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" id="enable-builtins" checked>
+            <div>
+              <strong>Built-in Lean 4 &amp; Tactics Knowledge Base</strong>
+              <p>Provides instant offline docstrings for tactics (simp, rw, omega, linarith) and standard prelude types.</p>
+            </div>
+          </label>
+        </div>
+
+        <div class="checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" id="enable-loogle" checked>
+            <div>
+              <strong>Loogle Lean 4 / Mathlib API</strong>
+              <p>Queries the official semantic engine for full Mathlib theorems, types, and docstrings.</p>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <!-- Section 3: Optional Local Verso Server -->
+      <div class="card">
+        <h2 class="card-title">Local Verso / Lake Server (Optional)</h2>
+        <p class="card-desc">Connect to a local Verso server or Lake environment for private or offline repositories.</p>
+
+        <div class="checkbox-group">
+          <label class="checkbox-label">
+            <input type="checkbox" id="enable-local-verso">
+            <div>
+              <strong>Enable Local Verso Companion Server</strong>
+            </div>
+          </label>
+        </div>
+
+        <div class="form-group" id="local-server-settings">
+          <label for="local-verso-url">Local Server Endpoint</label>
+          <div class="input-action-row">
+            <input type="text" id="local-verso-url" value="http://127.0.0.1:8000" placeholder="http://127.0.0.1:8000">
+            <button id="test-server-btn" class="btn btn-secondary">Test Connection</button>
+          </div>
+          <span id="server-test-result" class="help-text"></span>
+        </div>
+      </div>
+
+      <!-- Section 4: Cache & Performance -->
+      <div class="card">
+        <h2 class="card-title">Performance &amp; Cache</h2>
+        <div class="stats-row">
+          <div class="stat-box">
+            <span class="stat-number" id="stat-total">0</span>
+            <span class="stat-label">Total Lookups</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-number" id="stat-cache">0</span>
+            <span class="stat-label">Cache Hits</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-number" id="stat-loogle">0</span>
+            <span class="stat-label">Loogle Hits</span>
+          </div>
+        </div>
+        <div class="action-footer">
+          <button id="clear-cache-btn" class="btn btn-danger">Clear Local Cache</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>
