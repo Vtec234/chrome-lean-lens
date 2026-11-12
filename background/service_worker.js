@@ -647,8 +647,8 @@ function signatureBinders(sig) {
     }
     const group = sig.slice(i + 1, j);
     const colon = group.indexOf(' : ');
-    if (colon !== -1) groups.push({ names: group.slice(0, colon).trim().split(/\s+/), type: group.slice(colon + 3).trim() });
-    else groups.push({ names: [], type: group.trim() }); // anonymous instance `[Fact p]`
+    if (colon !== -1) groups.push({ names: group.slice(0, colon).trim().split(/\s+/), type: group.slice(colon + 3).trim(), explicit: open === '(' });
+    else groups.push({ names: [], type: group.trim(), explicit: false }); // anonymous instance `[Fact p]`
     i = j + 1;
   }
   return groups;
@@ -682,11 +682,15 @@ async function resultType(constName, receiverType) {
     const binder = binders.find(b => bc.typeHead(b.type, null) === recvHead);
     if (binder) {
       const params = bc.splitApp(strip(binder.type)).slice(1);
+      // Simultaneous substitution via placeholders (parameters may name each other's arguments).
+      const subst = [];
       params.forEach((p, k) => {
         if (recvArgs[k] === undefined || !/^[\w'Ͱ-Ͽ₀-₉]+$/.test(p)) return;
         const arg = recvArgs[k];
-        conclusion = replaceWord(conclusion, p, /\s/.test(arg) && !/^\(.*\)$/.test(arg) ? `(${arg})` : arg);
+        subst.push([p, /\s/.test(arg) && !/^\(.*\)$/.test(arg) ? `(${arg})` : arg]);
       });
+      subst.forEach(([p], k) => { conclusion = replaceWord(conclusion, p, `\u0000${k}\u0000`); });
+      subst.forEach(([, v], k) => { conclusion = conclusion.split(`\u0000${k}\u0000`).join(v); });
     }
   }
   // Dot notation in the conclusion (`l.SortedLE`) is typed via the signature's own binders.
@@ -795,6 +799,58 @@ async function lookupNamespace(token, fullChain) {
     docstring: `A namespace, not a declaration. Some of its members:\n\n${sample}`,
     sourceUrl: `https://leanprover-community.github.io/mathlib4_docs/find/?pattern=${encodeURIComponent(token)}#doc`
   };
+}
+
+/**
+ * Conclusion of constant application `term` (`le_or_gt b 1`), with its explicit and named
+ * arguments substituted: `b ≤ 1 ∨ 1 < b`.
+ */
+async function applicationType(term, fileRef) {
+  const bc = self.VersoBinderContext;
+  const head = bc && bc.applicationHead(term);
+  if (!head) return null;
+  const hit = await loogleExact(await qualifyConstant(head, fileRef));
+  if (!hit || !hit.type) return null;
+  let conclusion = bc.conclusionOf(hit.type);
+  if (!conclusion) return null;
+  const explicitNames = signatureBinders(hit.type).filter(b => b.explicit).flatMap(b => b.names);
+  const named = {};
+  const positional = [];
+  for (const a of bc.splitApp(term).slice(1)) {
+    const nm = a.match(/^\(\s*([\w'\u0370-\u03FF\u2080-\u209C]+)\s*:=\s*([\s\S]+)\)$/);
+    if (nm) named[nm[1]] = nm[2].trim();
+    else positional.push(a);
+  }
+  const wrap = (a) => (/\s/.test(a) && !/^[(⟨]/.test(a) ? `(${a})` : a);
+  // Simultaneous substitution (`a ↦ b, b ↦ 1` must not turn `a` into `1`): placeholders first.
+  const subst = [];
+  explicitNames.forEach((n, k) => {
+    if (positional[k] !== undefined && positional[k] !== '_') subst.push([n, wrap(positional[k])]);
+  });
+  for (const [n, v] of Object.entries(named)) subst.push([n, wrap(v)]);
+  subst.forEach(([n], k) => { conclusion = replaceWord(conclusion, n, `\u0000${k}\u0000`); });
+  subst.forEach(([, v], k) => { conclusion = conclusion.split(`\u0000${k}\u0000`).join(v); });
+  // More arguments than explicit binders: the conclusion is a function; apply it.
+  for (let extra = positional.length - explicitNames.length; extra > 0; extra--) {
+    const cut = conclusion.indexOf(' → ');
+    if (cut === -1) break;
+    conclusion = conclusion.slice(cut + 3);
+  }
+  return { type: conclusion, name: hit.name };
+}
+
+/** Types for `obtain PAT := TERM` / `rcases TERM with PAT` when TERM is a constant application. */
+async function inferPattern(request) {
+  const bc = self.VersoBinderContext;
+  if (!bc || !request || !request.term || !request.pattern) return null;
+  const app = await applicationType(request.term, request.fileRef);
+  if (!app) return null;
+  const out = new Map();
+  bc.destructure(bc.parsePattern(request.pattern), app.type, out);
+  const types = (out.get(request.name) || []).filter(t => t.type);
+  if (!types.length) return null;
+  const f = bc.formatInferred(request.name, { types, caseIdx: request.caseIdx || 0 });
+  return { typeSignature: f.typeSignature, note: f.note, from: app.name, conclusion: app.type };
 }
 
 /** `fn (arg := …)`: the type of fn's parameter `arg`, from its signature. */
@@ -957,6 +1013,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       sendResponse({ success: Boolean(result), data: result });
     });
     return true; // Keep message channel open for async response
+  }
+
+  if (action === "INFER_PATTERN") {
+    inferPattern(request).then((r) => sendResponse(r));
+    return true;
   }
 
   if (action === "STRUCTURE_FIELD") {

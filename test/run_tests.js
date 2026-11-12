@@ -566,6 +566,58 @@ const orig = JSON.parse(JSON.stringify(context.scopeAt("namespace Finset\nopen M
 assert.deepStrictEqual(orig.map(o => `${o.ns}:${o.origin}`), ["List:namespace", "Finset:namespace", "Multiset:open", "Nat:open"]);
 console.log("   ✓ Sweep regressions verified.\n");
 
+// 13. Inferring types of locals without a written type
+console.log("13. Testing local type inference...");
+const lt = (name, text) => { const r = bc.localVariableInfo(name, text); return r && r.typeSignature; };
+const hvert = [
+  "theorem foo {s : ℝ} : True := by",
+  "  have hvert : ∀ y ∈ Set.uIcc (0 : ℝ) s,",
+  "      g ((T : ℂ) + (y : ℂ) * Complex.I) = g ((y : ℂ) * Complex.I) := by",
+  "    intro y hy"
+].join("\n");
+assert.strictEqual(lt("y", hvert), "y : ℝ", "element type of an interval with a typed endpoint");
+assert.strictEqual(lt("hy", hvert), "hy : y ∈ Set.uIcc (0 : ℝ) s");
+const hsub = "theorem foo : True := by\n  have hsub : Set.uIcc (0 : ℝ) T ×ℂ Set.uIcc (0 : ℝ) s ⊆ {z : ℂ | |z.im| < a} := by\n    intro z hz";
+assert.strictEqual(lt("z", hsub), "z : ℂ", "`⊆` goals: element type");
+assert.strictEqual(lt("hz", hsub), "hz : z ∈ Set.uIcc (0 : ℝ) T ×ℂ Set.uIcc (0 : ℝ) s");
+const hbound = "theorem foo : True := by\n  have hbound : ∀ s : ℝ, |s| < a → ‖c‖ ≤ M * Real.exp (e * s) := by\n    intro t hsb";
+assert.strictEqual(lt("t", hbound), "t : ℝ");
+assert.strictEqual(lt("hsb", hbound), "hsb : |t| < a", "renamed binders are substituted");
+const stmt = "theorem bar (f : ℕ → ℕ) : ∀ n : ℕ, ∀ m, n ≤ m → f n ≤ f m := by\n  intro a\n  intro b hab";
+assert.strictEqual(lt("a", stmt), "a : ℕ", "intro on the declaration statement");
+assert.strictEqual(lt("hab", stmt), "hab : a ≤ b", "consecutive intro lines");
+assert.strictEqual(lt("b", stmt), "b : _", "untyped ∀ binders stay unknown");
+const termFun = "theorem baz : ∀ x : ℝ, 0 ≤ x → 0 ≤ x ^ 2 :=\n  fun x hx => by positivity";
+assert.strictEqual(lt("hx", termFun), "hx : 0 ≤ x", "term-mode `fun`");
+const notGoal = "theorem q : ¬ P := by\n  intro hp";
+assert.strictEqual(lt("hp", notGoal), "hp : P");
+const afterRw = "theorem r : ∀ x, P x := by\n  rw [foo]\n  intro x hx";
+assert.strictEqual(lt("hx", afterRw), "hx : _", "goals changed by earlier tactics are not guessed");
+
+// Destructuring local terms
+const obt = [
+  "theorem t (h : ∃ x : ℝ, 0 < x ∧ x < 1) (h' : A ↔ B) : True := by",
+  "  obtain ⟨x, hx0, hx1⟩ := h",
+  "  rcases h' with ⟨mp, mpr⟩",
+  "  set y := x + 1 with hy"
+].join("\n");
+assert.strictEqual(lt("x", obt), "x : ℝ");
+assert.strictEqual(lt("hx0", obt), "hx0 : 0 < x");
+assert.strictEqual(lt("hx1", obt), "hx1 : x < 1");
+assert.strictEqual(lt("mpr", obt), "mpr : B → A");
+assert.strictEqual(lt("hy", obt), "hy : y = x + 1");
+const alt = "theorem u (h : a < b ∨ b < a) : True := by\n  rcases h with h1 | h2\n  · exact h1\n  · exact h2";
+assert.strictEqual(lt("h2", alt), "h2 : b < a");
+const ev = "theorem v (hf : ∀ᶠ x in l, 0 < f x) : True := by\n  filter_upwards [hf] with y hy";
+assert.strictEqual(lt("hy", ev), "hy : 0 < f y");
+// Constant terms are deferred to the worker, with the bullet they're used in.
+const cst = "theorem w {b : Ordinal} : True := by\n  obtain hb | hb := le_or_gt b 1\n  · simp\n  · have := hb";
+const pend = bc.localVariableInfo("hb", cst).inferNeeded;
+assert(pend && pend.term === "le_or_gt b 1" && pend.caseIdx === 2, JSON.stringify(pend));
+// Receivers use inferred types.
+assert.strictEqual(bc.inferReceiverNamespace("hx0", obt), "LT.lt");
+console.log("   ✓ Local type inference verified.\n");
+
 console.log("==================================================");
 console.log("  ALL TESTS PASSED SUCCESSFULLY (100% OK)");
 console.log("==================================================");

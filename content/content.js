@@ -331,6 +331,19 @@
     // 0. Local variables shadow everything else: show their type.
     if (lookup.local) {
       window.VersoTooltipView.show(lookup.local, boundingRect);
+      if (lookup.local.inferNeeded) {
+        // `obtain h | h := le_or_gt b 1`: the worker instantiates the lemma and destructures it.
+        const shown = lookup.local;
+        const fileRef = window.VersoBinderContext && window.VersoBinderContext.fileRefFromDom(tokenInfo.textNode);
+        chrome.runtime.sendMessage(Object.assign({ action: "INFER_PATTERN", fileRef }, shown.inferNeeded), (res) => {
+          if (lastHoveredToken !== token || !res || !res.typeSignature) return;
+          window.VersoTooltipView.show(Object.assign({}, shown, {
+            typeSignature: res.typeSignature,
+            docstring: `Local variable from \`${shown.inferNeeded.term}\`; type inferred from \`${res.from} : … → ${res.conclusion}\`` +
+              (res.note ? ` (${res.note})` : '') + '.'
+          }), boundingRect);
+        });
+      }
       if (lookup.local.structureNeeded) {
         // Structure projection: the worker reads the n-th field from the constructor.
         const shown = lookup.local;
