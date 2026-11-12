@@ -298,6 +298,21 @@
         };
         return out;
       }
+      // Option names (`set_option backward.isDefEq.respectTransparency false in`) aren't constants.
+      if (/^\s*set_option\s+[\w.]*$/.test(linePrefix)) { out.skip = true; return out; }
+      // `:= .ofLinearMap …`: a leading dot means the namespace of the expected type, here the
+      // declaration's own type (`… ≃ₛₗ[σ] …` is `LinearEquiv`).
+      if (!chain.includes('.') && /(^|[\s(])\.$/.test(linePrefix)) {
+        const lastNl = out.contextText.lastIndexOf('\n');
+        const before = (lastNl === -1 ? '' : out.contextText.slice(0, lastNl + 1)) + linePrefix.slice(0, -1);
+        const declared = ctx.declaredTypeBefore && ctx.declaredTypeBefore(before);
+        const ns = declared && ctx.typeHead(declared, null);
+        if (ns) {
+          out.queryToken = `${ns}.${chain}`;
+          out.fileRef = ctx.fileRefFromDom(tokenInfo.textNode);
+          return out;
+        }
+      }
       // `section Foo` / `end Foo` labels and universe names (`Type u`, `Sort (max u v)`).
       if (/^\s*(?:(?:noncomputable|public|private)\s+)*(?:section|end)\s+$/.test(linePrefix) ||
           /\b(?:Type|Sort)\s*\(?(?:max\s+|imax\s+)?(?:[\w\u0370-\u03FF]+\s+)*$/.test(linePrefix) ||
@@ -381,6 +396,10 @@
     const strip = declSig;
     const exact = pr && pr.declarations.get(name);
     if (exact && (exact.name === name || exact.name === `_root_.${name}`)) return strip(exact);
+    // In its own file, a name means the file's declaration in the current namespace first
+    // (`tprod` in `namespace PiTensorProduct` is `PiTensorProduct.tprod`, not the root
+    // `tprod`), unless that one is `protected`, as Lean resolves names.
+    if (exact && !exact.protected && !name.includes('.') && fileRef && exact.filePath === fileRef.path && exact.declaredAs === name) return strip(exact);
     const res = await sendMessageP({ action: 'CONSTANT_SIGNATURE', name, fileRef });
     if (res && res.type) return res.type;
     const loose = pr && pr.find(name);
@@ -395,10 +414,37 @@
   async function refineLocal(shown, contextText, fileRef) {
     const ctx = window.VersoBinderContext;
     let info = Object.assign({}, shown);
+    const result = await refineLocalType(info, contextText, fileRef, ctx);
+    // A file-level variable's `Type*` as Lean names it (`ι₂ : Type u_2`).
+    const prefix = result ? `${result.name} : ` : '';
+    if (result && fileRef && /\b(?:Type|Sort)\*/.test(result.typeSignature || '') && result.typeSignature.startsWith(prefix)) {
+      const r = await sendMessageP({ action: 'FILE_VARIABLE', name: result.name, fileRef });
+      const written = result.typeSignature.slice(prefix.length).replace(/\s+/g, ' ');
+      if (r && r.type && r.type.replace(/\b(Type|Sort) u_\d+\b/g, '$1*').replace(/\s+/g, ' ') === written) result.typeSignature = prefix + r.type;
+    }
+    // The type as Lean prints it: `f : (i : ι) → s i` for `(f : Π i, s i)`.
+    if (result && ctx && ctx.annotateTextAsync && result.typeSignature && result.typeSignature.startsWith(`${result.name} : `)) {
+      const variableOf = fileRef ? async (n) => { const r = await sendMessageP({ action: 'FILE_VARIABLE', name: n, fileRef }); return r && r.type; } : null;
+      const typeOfName = async (n) => ctx.localType(n, contextText) || (variableOf ? await variableOf(n) : null);
+      try {
+        const t = await ctx.annotateTextAsync(result.typeSignature.slice(result.name.length + 3), typeOfName);
+        if (t) result.typeSignature = `${result.name} : ${t}`;
+      } catch (err) { /* keep the written type */ }
+    }
+    return result;
+  }
+
+  async function refineLocalType(info, contextText, fileRef, ctx) {
     if (info.inferNeeded && ctx) {
       // Instantiate the term's head (a PR declaration or a Loogle constant) with its arguments.
-      const res = await ctx.inferPending(info.inferNeeded, contextText, (name) => constantSignature(name, fileRef));
-      if (res && res.typeSignature) {
+      const variableOf = fileRef
+        ? async (name) => { const r = await sendMessageP({ action: 'FILE_VARIABLE', name, fileRef }); return r && r.type; }
+        : null;
+      const res = await ctx.inferPending(info.inferNeeded, contextText, (name) => constantSignature(name, fileRef), variableOf);
+      if (res && res.typeSignature && res.use) {
+        info.typeSignature = res.typeSignature;
+        info.docstring = info.docstring.replace(/; its type isn't written[\s\S]*$/, '') + `; type inferred from its use as an argument of \`${res.from}\`.`;
+      } else if (res && res.typeSignature) {
         info.typeSignature = res.typeSignature;
         info.docstring = `Local variable from \`${info.inferNeeded.term.length > 80 ? info.inferNeeded.term.slice(0, 77) + '…' : info.inferNeeded.term}\`; ` +
           `type inferred from the statement of \`${res.from}\`` + (res.note ? ` (${res.note})` : '') +
@@ -460,6 +506,8 @@
     const docName = ctx.notationDocName ? ctx.notationDocName({ node: tokenInfo.termNode, onParens: tokenInfo.termOnParens }) : null;
     const docRequest = docName ? sendMessageP({ action: 'NOTATION_DOC', name: docName }) : Promise.resolve(null);
     let type = null;
+    const coerced = new Map(); // applications Lean prints as `(f x) y` (a coerced bundled map)
+    const binders = new Map(); // binders whose types were worked out (`(i : ι) → …`)
     try {
       const contextText = ctx.contextFromDom(tokenInfo.textNode) || '';
       const fileRef = ctx.fileRefFromDom(tokenInfo.textNode);
@@ -467,7 +515,8 @@
         ? async (name) => { const r = await sendMessageP({ action: 'FILE_VARIABLE', name, fileRef }); return r && r.type; }
         : null;
       type = await ctx.termTypeOf(tokenInfo.termNode, tokenInfo.termSource, contextText,
-        (name) => constantSignature(name, fileRef), { parent: tokenInfo.termParent, path: tokenInfo.termPath, expected: tokenInfo.termExpected, variableOf });
+        (name) => constantSignature(name, fileRef), { parent: tokenInfo.termParent, path: tokenInfo.termPath, expected: tokenInfo.termExpected, variableOf, coerced, binders,
+          instances: fileRef ? async () => { const r = await sendMessageP({ action: 'FILE_INSTANCES', fileRef }); return r && r.instances; } : null });
     } catch (err) {
       type = null;
     }
@@ -475,7 +524,7 @@
     if (lastHoveredToken !== token) return;
     if (!type) { window.VersoTooltipView.hide(false); return; }
     let shown = tokenInfo.termText;
-    try { shown = ctx.termDisplay(tokenInfo.termNode, ctx.contextFromDom(tokenInfo.textNode) || '') || shown; } catch (err) { /* source text */ }
+    try { shown = ctx.termDisplay(tokenInfo.termNode, ctx.contextFromDom(tokenInfo.textNode) || '', coerced, binders) || shown; } catch (err) { /* source text */ }
     const docRes = await docRequest;
     if (lastHoveredToken !== token) return;
     const clip = (t, n) => (t.length > n ? t.slice(0, n - 1) + '…' : t);
@@ -498,7 +547,9 @@
     // 0. Local variables shadow everything else: show their type.
     if (lookup.local) {
       window.VersoTooltipView.show(lookup.local, boundingRect, shade);
-      const needsMore = lookup.local.inferNeeded || lookup.local.structureNeeded || lookup.local.replay;
+      // (A written type with `Π i, …`, `∀ i, …` or `⨂[R] i, …` is printed with its binders' types.)
+      const needsMore = lookup.local.inferNeeded || lookup.local.structureNeeded || lookup.local.replay ||
+        /[∀Π⨂⨁]|\b(?:fun|λ)\b|\b(?:Type|Sort)\*/.test(lookup.local.typeSignature || '');
       if (needsMore) {
         const fileRef = window.VersoBinderContext && window.VersoBinderContext.fileRefFromDom(tokenInfo.textNode);
         refineLocal(lookup.local, lookup.contextText, fileRef).then((info) => {

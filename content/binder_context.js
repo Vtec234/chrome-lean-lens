@@ -79,7 +79,7 @@
 
   const NAME_CHARS = "[^\\s:()\\[\\]{}⦃⦄⟨⟩,]+";
   const BINDER_NAMES = new RegExp(`^\\s*(${NAME_CHARS}(?:\\s+${NAME_CHARS})*)\\s*:(?!=)`);
-  const BINDER_KW = new RegExp(`(?:\\bfun|λ|∀|∃!?|Π|∑'?|∏'?|⋃|⋂|⨆|⨅|∫|∮)\\s+(${NAME_CHARS}(?:\\s+${NAME_CHARS})*)\\s*:(?!=)`, 'g');
+  const BINDER_KW = new RegExp(`(?:\\bfun|λ|∀|∃!?|Π|∑'?|∏'?|⋃|⋂|⨆|⨅|∫|∮|⨂\\[[^\\]\\n]*\\]|⨁)\\s+(${NAME_CHARS}(?:\\s+${NAME_CHARS})*)\\s*:(?!=)`, 'g');
   // `have h : T`, `have h (x) : T`, `by_cases h : P`, `generalize h : e = x`, …
   const LOCAL_DECL = new RegExp(`\\b(?:have|haveI|replace|let|suffices|obtain|by_cases!?|generalize|if)\\s+(${NAME_CHARS})((?:\\s*[({\\[⦃][^(){}\\[\\]⦃⦄]*[)}\\]⦄])*)\\s*:(?!=)`, 'g');
 
@@ -159,6 +159,19 @@
     return text.length;
   }
 
+  /**
+   * The declared type when `text` ends at the start of a declaration's value
+   * (`def congr … : A ≃ₛₗ[σ] B :=` then `.ofLinearMap`), or null.
+   */
+  function declaredTypeBefore(text) {
+    const m = (text || '').match(/:=\s*$/);
+    if (!m) return null;
+    const hdr = headerEnd(text);
+    if (hdr <= 0 || text[hdr] !== ':') return null;
+    const type = text.slice(hdr + 1, m.index).trim();
+    return type && topLevelIndexOf(type, ':=') === -1 ? type : null;
+  }
+
   /** Is the `(` at `i` (after the header) a binder, i.e. preceded by `fun`/`∀`/… possibly through other binder groups? */
   function binderKeywordBefore(text, i) {
     let k = i - 1;
@@ -175,7 +188,7 @@
         k--;
         continue;
       }
-      return /(?:\bfun|λ|∀|∃!?|Π|∑'?|∏'?|⋃|⋂|⨆|⨅|∫|∮|\bhave\s+[^\s:()]+|\blet\s+[^\s:()]+)$/.test(text.slice(Math.max(0, k - 20), k + 1));
+      return /(?:\bfun|λ|∀|∃!?|Π|∑'?|∏'?|⋃|⋂|⨆|⨅|∫|∮|⨂|⨁|\bhave\s+[^\s:()]+|\blet\s+[^\s:()]+)$/.test(text.slice(Math.max(0, k - 20), k + 1));
     }
   }
 
@@ -644,6 +657,116 @@
   const IDENT_SPLIT = /[^A-Za-z0-9_'!?\u2080-\u2089\u0370-\u03FF\u1F00-\u1FFF]+/;
   const namesIn = (s) => s.split(IDENT_SPLIT).filter(Boolean);
 
+  /** Index of the first `:` at bracket depth 0 (not `:=`), or -1. */
+  function topColon(s) {
+    let depth = 0;
+    for (let k = 0; k < s.length; k++) {
+      const ch = s[k];
+      if (OPENERS[ch]) depth++;
+      else if (CLOSERS.has(ch)) depth = Math.max(0, depth - 1);
+      else if (ch === ':' && depth === 0 && s[k + 1] !== '=') return k;
+    }
+    return -1;
+  }
+
+  /**
+   * The names a binder list binds (`fun \u2026`, `\u2200 \u2026`): `x y`, `(x y : T)`, `{x}`, `\u27E8x, hx\u27E9`,
+   * `x : T`, not the names inside the types.
+   */
+  function binderListNames(s) {
+    const out = [];
+    const c = topColon(s);
+    if (c !== -1) s = s.slice(0, c); // `fun p : R \u00D7 \u03A0 i, s i \u21A6`
+    for (let k = 0; k < s.length;) {
+      const ch = s[k];
+      if (/\s/.test(ch)) { k++; continue; }
+      if (OPENERS[ch]) {
+        const close = matchClose(s, k);
+        const inner = s.slice(k + 1, close === -1 ? s.length : close);
+        if (ch === '\u27E8') out.push(...binderListNames(inner.replace(/,/g, ' ')));
+        else if (ch !== '[') { const ic = topColon(inner); out.push(...binderListNames(ic === -1 ? inner : inner.slice(0, ic))); }
+        k = close === -1 ? s.length : close + 1;
+        continue;
+      }
+      const m = s.slice(k).match(/^[^\s({\u2983[\u27E8\u27E9)}\u2984\]]+/);
+      if (!m) { k++; continue; }
+      out.push(...namesIn(m[0]).filter(n => n !== '_'));
+      k += m[0].length;
+    }
+    return out;
+  }
+
+  /** `ext` / `rintro` names: patterns only (`x`, `\u27E8x, y\u27E9`, `(x | y)`), not a term after the lemma `ext`. */
+  const PATTERN_TEXT = /^[\s\w'\u27E8\u27E9,|()\u0370-\u03FF\u1F00-\u1FFF\u2080-\u209C!?]*$/;
+  const patternNames = (s) => (PATTERN_TEXT.test(s) ? namesIn(s) : []);
+
+  /**
+   * The names `text` uses free: not bound in it by `fun`, `\u2200`/`\u2203`/`\u2211`/\u2026 , a set-builder, a
+   * tactic (`intro x`, `obtain \u27E8x, hx\u27E9`, `have h`), a match case, a structure field's
+   * arguments (`toFun x := \u2026`); not a named argument `(x := \u2026)` or a field `e.symm`.
+   * Scopes are approximate: a binder reaches the end of its bracket group and of the lines
+   * indented under it (a tactic's names: the rest of its tactic block).
+   */
+  function freeNamesInText(text) {
+    text = (text || '').replace(/--[^\n]*/g, (c) => ' '.repeat(c.length));
+    const starts = [0];
+    for (let k = 0; k < text.length; k++) if (text[k] === '\n') starts.push(k + 1);
+    const lineOf = (pos) => { let lo = 0, hi = starts.length - 1; while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (starts[mid] <= pos) lo = mid; else hi = mid - 1; } return lo; };
+    const lineText = (j) => text.slice(starts[j], j + 1 < starts.length ? starts[j + 1] - 1 : text.length);
+    // Indentation of a line's content (`\u00B7 tac` counts from `tac`).
+    const indentOf = (j) => { const m = lineText(j).match(/^(\s*)(\u00B7\s+)?/); return m[1].length + (m[2] ? m[2].length : 0); };
+    const blank = (j) => !lineText(j).trim();
+    // End of the lines under line j: indented more (strict) or at least as much.
+    const blockEnd = (j, strict) => {
+      const ind = strict ? lineText(j).match(/^\s*/)[0].length : indentOf(j);
+      let k = j + 1;
+      while (k < starts.length && (blank(k) || (strict ? lineText(k).match(/^\s*/)[0].length > ind : lineText(k).match(/^\s*/)[0].length >= ind))) k++;
+      return k < starts.length ? starts[k] : text.length;
+    };
+    const groupEnd = (pos) => {
+      for (let k = pos, d = 0; k < text.length; k++) {
+        if (OPENERS[text[k]]) d++;
+        else if (CLOSERS.has(text[k])) { if (d === 0) return k; d--; }
+      }
+      return text.length;
+    };
+    const bound = [];
+    const bind = (re, namesFn, scope) => {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        const names = namesFn(m[1]);
+        if (!names.length) continue;
+        const to = scope(m.index, lineOf(m.index), m);
+        names.forEach(n => bound.push({ n, from: m.index, to }));
+        if (m[0].length === 0) re.lastIndex++;
+      }
+    };
+    const termScope = (pos, j) => Math.min(groupEnd(pos), blockEnd(j, true));
+    const tacticScope = (pos, j) => blockEnd(j, false);
+    const lineScope = (pos, j) => blockEnd(j, true);
+    bind(/\bfun\b([^\n]*?)(?:=>|\u21A6)/g, binderListNames, termScope);
+    bind(/(?:\u2200|\u2203!?|\u03A0|\u03BB|\u2211'?|\u220F'?|\u22C3|\u22C2|\u2A06|\u2A05|\u222B|\u222E|\u2A02\[[^\]\n]*\]|\u2A01)\s*([^,\n]*?)\s*(?:,|\bin\b|\u2208)/g, binderListNames, termScope);
+    bind(/\{\s*([^:{}|]+?)\s*(?::[^|{}]*)?\|(?!\|)/g, namesIn, termScope);
+    bind(/(?<![\w'.])(?:intro|intros|introv|rintro)\b([^\n]*)/g, patternNames, tacticScope);
+    bind(/(?<![\w'.])(?:obtain|rcases\b[^\n]*?\bwith|cases\b[^\n]*?\bwith|induction\b[^\n]*?\bwith|filter_upwards\b[^\n]*?\bwith|choose)[ \t]+([^\n]*?)(?::=|\s:\s|\busing\b|$)/gm, patternNames, tacticScope);
+    bind(/(?<![\w'.])(?:ext1?|funext)[ \t]+([^:\n;]*?)[ \t]*(?=$|:|;|<;>)/gm, patternNames, tacticScope);
+    bind(/(?<![\w'.])(?:have|haveI|let|set|replace|by_contra!?|by_cases!?|generalize[^\n]*?=|rename_i)[ \t]+([^\s:=()\u27E8,]+(?:[ \t]+[^\s:=()\u27E8,]+)*?)(?=[ \t]*(?::|$|\(|\{|\[))/gm, namesIn, tacticScope);
+    bind(/^\s*\|\s*[\w.'@]+([^\n]*?)=>/gm, namesIn, lineScope);
+    bind(/^[ \t]*[\w'\u2080-\u2089]+((?:[ \t]+[\w'\u0370-\u03FF\u2080-\u2089]+)+)[ \t]*:=/gm, namesIn, lineScope);
+    bind(/(?:\{|,)\s*[\w']+((?:[ \t]+[\w'\u0370-\u03FF\u2080-\u2089]+)+)[ \t]*:=/g, (s) => (/\bwith\b/.test(s) ? [] : namesIn(s)), (pos) => groupEnd(pos + 1));
+    // Named arguments `(x := v)`: the name is a parameter, not a use.
+    bind(/\(\s*([\w'\u0370-\u03FF\u2080-\u2089]+)\s*:=/g, (s) => [s], (pos, j, m) => pos + m[0].length);
+    const out = new Set();
+    const re = /(?<![.\w'\u0370-\u03FF\u1F00-\u1FFF\u2080-\u209C])[A-Za-z_\u0370-\u03FF\u1F00-\u1FFF\u2100-\u214F][\w'!?\u0370-\u03FF\u1F00-\u1FFF\u2080-\u209C\u2100-\u214F]*/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const n = m[0], p = m.index;
+      if (!bound.some(b => b.n === n && b.from <= p && p < b.to)) out.add(n);
+    }
+    return out;
+  }
+
   /**
    * How `name` is bound when the source gives no type: `intro x`, `fun x =>`,
    * `obtain ⟨x, hx⟩ := …`, `rcases h with ⟨x, hx⟩`, `| succ n ih =>`, `∀ x,`,
@@ -653,38 +776,48 @@
     if (!name || !text) return null;
     let best = null;
     const consider = (pos, how, value) => { if (!best || pos >= best.pos) best = { pos, how, value }; };
-    const scan = (re, how, group = 1) => {
+    const scan = (re, how, names = namesIn) => {
       re.lastIndex = 0;
       let m;
       while ((m = re.exec(text)) !== null) {
-        if (namesIn(m[group]).includes(name)) consider(m.index, how);
+        if (names(m[1]).includes(name)) consider(m.index, how);
       }
     };
-    scan(/\b(?:intro|intros|introv|rintro)\b([^\n]*)/g, 'introduced by a tactic');
-    scan(/\bfun\b([^\n]*?)(?:=>|↦)/g, 'bound by `fun`');
-    scan(/\bobtain\s+([^\n]*?)(?::=|\s:\s|$)/gm, 'destructured by `obtain`');
-    scan(/\brcases\b[^\n]*\bwith\b([^\n]*)/g, 'destructured by `rcases`');
-    scan(/\bfilter_upwards\b[^\n]*\bwith\b([^\n]*)/g, 'introduced by `filter_upwards`');
-    scan(/(?:\]|^)\s*with\b([^\n|]*)$/gm, 'introduced by a tactic `with` clause');
-    scan(/\b(?:induction|cases|ext|funext|choose|peel)\b[^\n]*\bwith\b([^\n|]*)$/gm, 'introduced by a tactic');
+    // Tactics are words of their own: not `Exists.intro` / `MultilinearMap.ext`, and their
+    // names are on the same line (`ext` alone doesn't bind the next line's words).
+    scan(/(?<![\w'.])(?:intro|intros|introv|rintro)\b([^\n]*)/g, 'introduced by a tactic', patternNames);
+    scan(/\bfun\b([^\n]*?)(?:=>|↦)/g, 'bound by `fun`', binderListNames);
+    scan(/(?<![\w'.])obtain[ \t]+([^\n]*?)(?::=|\s:\s|$)/gm, 'destructured by `obtain`');
+    scan(/(?<![\w'.])rcases\b[^\n]*\bwith\b([^\n]*)/g, 'destructured by `rcases`');
+    scan(/(?<![\w'.])filter_upwards\b[^\n]*\bwith\b([^\n]*)/g, 'introduced by `filter_upwards`');
+    scan(/(?:\]|^)[ \t]*with\b([^\n|]*)$/gm, 'introduced by a tactic `with` clause');
+    scan(/(?<![\w'.])(?:induction|cases|ext|funext|choose|peel)\b[^\n]*\bwith\b([^\n|]*)$/gm, 'introduced by a tactic');
     scan(/^\s*\|\s*[\w.']+([^\n]*?)=>/gm, 'bound in a match / induction case');
-    scan(/(?:∀|∃|Π|λ)\s+([^:,\n]*?),/g, 'bound by a quantifier');
-    scan(/(?:∑'?|∏'?|⋃|⋂|⨆|⨅|∫|∮)\s+([^:,\n]*?)\s*(?:\bin\b|∈|,)/g, 'bound by a big operator / integral');
-    scan(/\b(?:by_contra!?|by_contra'|contrapose!?|by_cases!?)\s+([^\s:]+)\s*$/gm, 'introduced by `by_contra` / `by_cases`');
+    scan(/(?:∀|∃|Π|λ)\s+([^:,\n]*?),/g, 'bound by a quantifier', binderListNames);
+    scan(/(?:∑'?|∏'?|⋃|⋂|⨆|⨅|∫|∮|⨂\[[^\]\n]*\]|⨁)\s*([^:,\n]*?)\s*(?:\bin\b|∈|,)/g, 'bound by a big operator / integral', binderListNames);
+    scan(/(?<![\w'.])(?:by_contra!?|by_contra'|contrapose!?|by_cases!?)[ \t]+([^\s:]+)[ \t]*$/gm, 'introduced by `by_contra` / `by_cases`');
     scan(/\{\s*([^:{}|]+?)\s*\|(?!\|)/g, 'bound in a set-builder');
-    scan(/\bset\s+[^\n]*?\bwith\s+←?\s*([^\s]+)/g, 'introduced by `set … with`');
-    scan(/\b(?:ext|funext|ext1)\s+([^:\n]*?)\s*(?:$|:)/gm, 'introduced by `ext`');
-    scan(/^\s*[\w'\u2080-\u2089]+((?:\s+[\w'\u0370-\u03FF\u2080-\u2089]+)+)\s*:=/gm, 'an argument of a structure field definition');
-    // Untyped binder groups in a declaration header: `theorem coe_mk (f : …) (h₁ h₂) : …`.
+    scan(/(?<![\w'.])set\s+[^\n]*?\bwith\s+←?\s*([^\s]+)/g, 'introduced by `set … with`');
+    scan(/(?<![\w'.])(?:ext1?|funext)[ \t]+([^:\n;]*?)[ \t]*(?=$|:|;|<;>)/gm, 'introduced by `ext`', patternNames);
+    scan(/^[ \t]*[\w'\u2080-\u2089]+((?:[ \t]+[\w'\u0370-\u03FF\u2080-\u2089]+)+)[ \t]*:=/gm, 'an argument of a structure field definition');
+    // Untyped binder groups in a declaration header: `theorem coe_mk (f : …) (h₁ h₂) : …`;
+    // only the binder list's own groups, not parenthesised terms inside a binder's type.
     const hdr = headerEnd(text);
     if (hdr > 0) {
       const header = text.slice(0, hdr);
-      const groupRe = /[({⦃]\s*([^(){}⦃⦄:\[\]]+?)\s*[)}⦄]/g;
-      let gm;
-      while ((gm = groupRe.exec(header)) !== null) {
-        if (namesIn(gm[1]).includes(name) && !/[^\s\w'\u0370-\u03FF\u2080-\u2089]/.test(gm[1])) {
-          consider(gm.index, 'a binder of this declaration without a written type');
-        }
+      let depth = 0;
+      for (let k = 0; k < header.length; k++) {
+        const ch = header[k];
+        if (OPENERS[ch]) {
+          if (depth === 0 && '({⦃'.includes(ch)) {
+            const close = matchClose(header, k);
+            const inner = close === -1 ? '' : header.slice(k + 1, close);
+            if (inner && namesIn(inner).includes(name) && !/[^\s\w'\u0370-\u03FF\u2080-\u2089]/.test(inner)) {
+              consider(k, 'a binder of this declaration without a written type');
+            }
+          }
+          depth++;
+        } else if (CLOSERS.has(ch)) depth = Math.max(0, depth - 1);
       }
     }
     const defRe = /\b(?:let|set|have)\s+([^\s:=()]+)(?:\s*[({⦃[](?:[^(){}⦃⦄[\]]|[({[][^(){}[\]]*[)}\]])*[)}⦄\]])*\s*:=\s*([^\n]*?)(?:\bwith\b|$)/gm;
@@ -1093,6 +1226,169 @@
     return null;
   }
 
+  // --- A binder's type from its use: `∀ i, AddCommMonoid (s i)` with `s : ι → Type*` gives `i : ι` ---
+
+  const USE_NOT_FN = new Set(['fun', 'λ', 'Π', 'Σ', 'by', 'at', 'with', 'from', 'using', 'then', 'else', 'in', 'do', 'have', 'show', 'let', 'if', 'match', 'Type', 'Sort']);
+
+  /** The first `f a₁ … name` after `from`: { fn, k } (name is f's k-th explicit argument), or null. */
+  function useOf(name, text, from = 0) {
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(?<![\\w'.\\u0370-\\u03FF\\u2080-\\u209C])([A-Za-z_\\u0370-\\u03FF\\u1F00-\\u1FFF][\\w'.\\u0370-\\u03FF\\u1F00-\\u1FFF\\u2080-\\u209C]*)((?:[ \\t]+(?:[\\w'\\u0370-\\u03FF\\u2080-\\u209C]+|\\([^()\\n]*\\)))*?)[ \\t]+${esc}(?![\\w'\\u2080-\\u209C])`, 'g');
+    re.lastIndex = from;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      if (USE_NOT_FN.has(m[1]) || m[1] === name) { re.lastIndex = m.index + 1; continue; }
+      const args = (m[2].match(/[\w'\u0370-\u03FF\u2080-\u209C]+|\([^()\n]*\)/g) || []);
+      if (args.some(a => USE_NOT_FN.has(a))) { re.lastIndex = m.index + 1; continue; }
+      return { fn: m[1], k: args.length };
+    }
+    return null;
+  }
+
+  /**
+   * The type of the k-th explicit argument of a function of type `fnType`: `A → B`,
+   * `(x : A) → B`, `∀ (x : A), B`, a bundled map `A →ₗ[R] B` (its points); an untyped
+   * `Π i, …` binder is found from its own use (`s i`) through `typeOfName`. Promise of text or null.
+   */
+  async function domainOf(fnType, k, typeOfName, depth = 0) {
+    let t = tCore(parseTerm(fnType || ''));
+    for (let j = 0; t && j <= k; j++) {
+      let dom = null;
+      if (t.k === 'bin' && (t.op === '→' || isBundledType(t))) { dom = t.l; t = t.op === '→' ? t.r : null; }
+      else if (t.k === 'bind' && (t.head === 'Π' || t.head === '∀')) {
+        const typed = t.binders.match(/^[({⦃]?\s*[^\s:(){}]+\s*:\s*([\s\S]+?)\s*[)}⦄]?$/);
+        if (typed) dom = parseTerm(typed[1]);
+        else if (depth < 2 && binderParts(t.binders).names.length === 1) {
+          const x = binderParts(t.binders).names[0];
+          const use = useOf(x, showTerm(t.body));
+          const ft = use && (await typeOfName(use.fn));
+          const d = ft ? await domainOf(ft, use.k, typeOfName, depth + 1) : null;
+          dom = d ? parseTerm(d) : null;
+        }
+        t = t.body;
+      } else return null;
+      if (j === k) return dom ? showTerm(dom) : null;
+      if (!t) return null;
+    }
+    return null;
+  }
+
+  /** `domainOf` with a synchronous `typeOfName`. */
+  function domainSync(fnType, k, typeOfName, depth = 0) {
+    let t = tCore(parseTerm(fnType || ''));
+    for (let j = 0; t && j <= k; j++) {
+      let dom = null;
+      if (t.k === 'bin' && (t.op === '→' || isBundledType(t))) { dom = t.l; t = t.op === '→' ? t.r : null; }
+      else if (t.k === 'bind' && (t.head === 'Π' || t.head === '∀')) {
+        const typed = t.binders.match(/^[({⦃]?\s*[^\s:(){}]+\s*:\s*([\s\S]+?)\s*[)}⦄]?$/);
+        if (typed) dom = parseTerm(typed[1]);
+        else if (depth < 2 && binderParts(t.binders).names.length === 1) {
+          const use = useOf(binderParts(t.binders).names[0], showTerm(t.body));
+          const ft = use && typeOfName(use.fn);
+          const d = ft ? domainSync(ft, use.k, typeOfName, depth + 1) : null;
+          dom = d ? parseTerm(d) : null;
+        }
+        t = t.body;
+      } else return null;
+      if (j === k) return dom ? showTerm(annotateBinders(dom, typeOfName)) : null;
+      if (!t) return null;
+    }
+    return null;
+  }
+
+  // Classes whose instances are proofs: `[∀ i, Nonempty (α i)]` stays a `∀`.
+  const PROP_CLASSES = new Set(['Nonempty', 'IsEmpty', 'Fact', 'Subsingleton', 'Nontrivial', 'Finite', 'Infinite', 'Countable',
+    'Uncountable', 'IsScalarTower', 'SMulCommClass', 'IsCentralScalar', 'IsDomain', 'CharZero', 'CharP', 'NoZeroDivisors',
+    'NoZeroSMulDivisors', 'FiniteDimensional', 'IsNoetherian', 'IsArtinian', 'Free', 'Flat', 'Projective', 'T0Space', 'T1Space',
+    'T2Space', 'T3Space', 'RegularSpace', 'NormalSpace', 'CompactSpace', 'LocallyCompactSpace', 'SecondCountableTopology',
+    'FirstCountableTopology', 'SeparableSpace', 'CompleteSpace', 'ProperSpace', 'IsTopologicalGroup', 'IsTopologicalRing',
+    'IsTopologicalAddGroup', 'ContinuousSMul', 'ContinuousAdd', 'ContinuousMul', 'BorelSpace', 'OpensMeasurableSpace',
+    'MeasurableSingletonClass', 'IsFiniteMeasure', 'IsProbabilityMeasure', 'SigmaFinite', 'IsOrderedRing', 'IsStrictOrderedRing',
+    'IsOrderedAddMonoid', 'IsOrderedCancelAddMonoid', 'IsLocalRing', 'IsPrincipalIdealRing', 'IsDedekindDomain', 'IsIntegrallyClosed']);
+
+  /**
+   * Binders as Lean prints them, their types worked out from their use (`typeOfName` gives the
+   * types of the names around): `Π i, s i` is `(i : ι) → s i`, `⨂[R] i, s i` is
+   * `⨂[R] (i : ι), s i`, `∀ f, P f` is `∀ (f : T), P f`. `instance`: `n` is an instance
+   * argument's type (a class, so data unless a `Prop` class: `[(i : ι) → AddCommMonoid (s i)]`).
+   */
+  function annotateBinders(n, typeOfName, instance = false) {
+    if (!n || typeof n !== 'object') return n;
+    const m = tWithChildren(n, tChildren(n).map(c => annotateBinders(c, typeOfName)));
+    if (m.k !== 'bind' || m.arrow || !['∀', 'Π', '⨂[_]', '⨂ₜ[_]', '⨁'].includes(m.head)) return m;
+    const b = m.binders.trim();
+    // `⨂[R] i : ι, s i` / `∀ x : T, P`: Lean prints the binder in parentheses.
+    const typedBare = b.match(/^([^\s:(){}⦃⦄[\]]+(?:\s+[^\s:(){}⦃⦄[\]]+)*)\s*:\s*([^,]+)$/);
+    if (typedBare && !binderParts(b).op) {
+      const binders = `(${typedBare[1]} : ${annotateText(typedBare[2].trim(), typeOfName)})`;
+      if ((m.head === 'Π') || (m.head === '∀' && isDataType(m.body))) return { k: 'bind', head: 'Π', arrow: true, binders, sep: '→', body: m.body };
+      return Object.assign({}, m, { binders });
+    }
+    if (!b || /[:(){}⦃⦄[\]]/.test(b) || binderParts(b).op) return m;
+    const names = b.split(/\s+/);
+    const body = showTerm(m.body);
+    const types = names.map(x => { const use = useOf(x, body); const ft = use && typeOfName(use.fn); return ft ? domainSync(ft, use.k, typeOfName) : null; });
+    if (types.some(t => !t) || types.some(t => t !== types[0])) return m;
+    const binders = `(${names.join(' ')} : ${types[0]})`;
+    if (m.head === '∀' || m.head === 'Π') {
+      const cls = tCore(m.body) && (tCore(m.body).k === 'app' ? tCore(tCore(m.body).f) : tCore(m.body));
+      const data = m.head === 'Π' || isDataType(m.body) ||
+        (instance && cls && cls.k === 'id' && !PROP_CLASSES.has(cls.v.split('.').pop()));
+      return data ? { k: 'bind', head: 'Π', arrow: true, binders, sep: '→', body: m.body } : Object.assign({}, m, { binders });
+    }
+    return Object.assign({}, m, { binders });
+  }
+
+  /** `annotateBinders` on a type's text (unchanged when it doesn't parse). */
+  function annotateText(text, typeOfName, instance = false) {
+    const n = parseTerm(text || '');
+    return n ? showTerm(plainFunBinders(coerceApps(annotateBinders(n, typeOfName, instance), typeOfName))) : text;
+  }
+
+  /** Inside a type Lean prints `fun` binders without their types: `fun (i : ι) ↦ b` is `fun i ↦ b`. */
+  function plainFunBinders(n) {
+    if (!n || typeof n !== 'object') return n;
+    const m = tWithChildren(n, tChildren(n).map(plainFunBinders));
+    if (m.k !== 'bind' || (m.head !== 'fun' && m.head !== 'λ')) return m;
+    const groups = [...m.binders.matchAll(/\(\s*([^():]+?)\s*:[^()]*(?:\([^()]*\)[^()]*)*\)|([^\s()]+)/g)];
+    if (!groups.length || groups.map(g => g[0]).join('').replace(/\s+/g, '') !== m.binders.replace(/\s+/g, '')) return m;
+    return Object.assign({}, m, { binders: groups.map(g => g[1] || g[2]).join(' ') });
+  }
+
+  /**
+   * `f i (x i)` with `f : (i : ι) → s i →ₗ[R] t i`: after `i`, `f i` is a bundled map applied
+   * through a coercion, which Lean prints `(f i) (x i)`.
+   */
+  function coerceApps(n, typeOfName) {
+    if (!n || typeof n !== 'object') return n;
+    let m = tWithChildren(n, tChildren(n).map(c => coerceApps(c, typeOfName)));
+    if (m.k !== 'app' || tCore(m.f).k !== 'id' || m.f.coeFn) return m;
+    // The head's type: a local's, or a declaration's signature (its explicit parameters).
+    let known = typeOfName(tCore(m.f).v) || '';
+    let explicit = 0;
+    if (isSignature(known)) {
+      const peeled = peelSignature(known);
+      explicit = peeled.binders.filter(x => x.explicit).reduce((acc, x) => acc + Math.max(1, x.names.length), 0);
+      known = peeled.concl;
+    }
+    let t = tCore(parseTerm(known));
+    const args = m.args.filter(a => a.k !== 'named');
+    const named = m.args.length - args.length;
+    for (let k = explicit; t && k < args.length; k++) {
+      if (isBundledType(t)) {
+        // From here the map is applied through the coercion: `(f a) b`, or `f b` for a name.
+        if (k > 0) return Object.assign({}, m, { f: { k: 'app', f: m.f, args: m.args.slice(0, k + named), coeFn: true }, args: m.args.slice(k + named) });
+        const cod = t.k === 'bin' ? t.r : funLikeCodomain(t);
+        t = cod ? tCore(cod) : null;
+        continue;
+      }
+      if (t.k === 'bin' && t.op === '→') t = tCore(t.r);
+      else if (t.k === 'bind' && (t.head === 'Π' || t.head === '∀')) t = tCore(t.body);
+      else return m;
+    }
+    return m;
+  }
+
   /** Format inferred types for a tooltip: { typeSignature, note }. */
   function formatInferred(name, inferred) {
     const { types, caseIdx } = inferred;
@@ -1151,12 +1447,16 @@
           docstring: `Local variable ${untyped.how}; type inferred from ${inferred.source}${f.note ? ' (' + f.note + ')' : ''}.`
         }, f.typeSignature.slice(name.length + 3), changes);
       }
+      // `∀ i, AddCommMonoid (s i)`, `fun i ↦ f i (x i)`: the type of the argument it is.
+      const use = !untyped.value && !(inferred && inferred.pending) && /quantifier|big operator|`fun`/.test(untyped.how) ? useOf(name, contextText, untyped.pos) : null;
+      const pending = inferred && inferred.pending ? Object.assign({ caseIdx: inferred.caseIdx || 0 }, inferred.pending)
+        : use ? { use, name, term: `${use.fn} … ${name}` } : null;
       const info = {
         name, kind: 'variable', source: 'local_var',
         typeSignature: untyped.value ? `${name} := ${untyped.value}` : `${name} : _`,
         docstring: `Local variable ${untyped.how}; its type isn't written in the source` +
-          (inferred && inferred.pending ? ', so it is being worked out from the signature…' : ', so it would need Lean to elaborate.'),
-        inferNeeded: inferred && inferred.pending ? Object.assign({ caseIdx: inferred.caseIdx || 0 }, inferred.pending) : null
+          (pending ? ', so it is being worked out…' : ', so it would need Lean to elaborate.'),
+        inferNeeded: pending
       };
       // A pending inference gets its base type from the worker; replay changes after that.
       return info.inferNeeded ? withReplay(info, null, changes) : info;
@@ -1423,14 +1723,27 @@
     '∀', '∃', '⋃', '⋂', '⨆', '⨅', 'λ', 'Π', '·', ':', '∞', '⊤', '⊥', '∅'];
   // [precedence, associativity] as in Lean / Mathlib.
   const T_BIN = {
-    '<|': [10, 'r'], '|>': [10, 'l'], '↔': [20, 'n'], '→': [25, 'r'], '≃': [25, 'r'], '↪': [25, 'r'], '∨': [30, 'r'], '∧': [35, 'r'], '×': [35, 'r'],
+    '<|': [10, 'r'], '|>': [10, 'l'], '↔': [20, 'n'], '→': [25, 'r'], '≃': [25, 'r'], '↪': [25, 'r'], '∨': [30, 'r'], '⊕': [30, 'r'], '∧': [35, 'r'], '×': [35, 'r'],
     '=': [50, 'n'], '≠': [50, 'n'], '<': [50, 'n'], '>': [50, 'n'], '≤': [50, 'n'], '≥': [50, 'n'],
     '∈': [50, 'n'], '∉': [50, 'n'], '⊆': [50, 'n'], '⊂': [50, 'n'], '⊇': [50, 'n'], '⊃': [50, 'n'], '∣': [50, 'n'],
     '∪': [65, 'l'], '+': [65, 'l'], '-': [65, 'l'], '⊔': [68, 'l'], '⊓': [69, 'l'],
     '∩': [70, 'l'], '*': [70, 'l'], '/': [70, 'l'], '%': [70, 'l'], '\\': [70, 'l'], '×ℂ': [72, 'l'],
     '•': [73, 'r'], '^': [75, 'r'], '▸': [75, 'r'], "''": [80, 'l'], "⁻¹'": [80, 'l'], '×ˢ': [82, 'r'], '∘': [90, 'r']
   };
-  const T_BINDER_HEADS = new Set(['∀', '∃', '∃!', '∑', '∏', "∑'", "∏'", '⋃', '⋂', '⨆', '⨅', '∫', 'λ', 'Π']);
+  // Bundled-map arrows (`→ₗ[R]`, `≃+*`), compositions (`∘ₛₗ`) and tensor products (`⊗[R]`) as
+  // one operator token; a bracket index is the token's `idx` (`_` in the spelling).
+  const T_MAP_OPS = Object.keys(ARROW_HEADS).filter(k => k.length > 1 && k !== '->')
+    .concat(['∘ₗ', '∘ₛₗ', '∘L', '≪≫ₗ', '⊗[_]', '⊗ₜ[_]', '⊗ₜ', '⊗', '⨂[_]', '⨂ₜ[_]'])
+    .sort((x, y) => y.length - x.length);
+  for (const k of T_MAP_OPS) {
+    if (/^(∘|≪≫)/.test(k)) T_BIN[k] = [80, k.startsWith('≪≫') ? 'l' : 'r'];
+    else if (k.startsWith('⊗')) T_BIN[k] = [100, 'l'];
+    else if (!k.startsWith('⨂')) T_BIN[k] = [25, 'r'];
+  }
+  // Linear notations are their semilinear ones at `RingHom.id R`; Lean prints them that way.
+  const SEMI_OF = { '→ₗ[_]': '→ₛₗ[_]', '≃ₗ[_]': '≃ₛₗ[_]', '→ₘₗ[_]': '→ₘₛₗ[_]', '→L[_]': '→SL[_]', '≃L[_]': '≃SL[_]', '∘ₗ': '∘ₛₗ' };
+  const LINEAR_OF = Object.fromEntries(Object.entries(SEMI_OF).map(([k, v]) => [v, k]));
+  const T_BINDER_HEADS = new Set(['∀', '∃', '∃!', '∑', '∏', "∑'", "∏'", '⋃', '⋂', '⨆', '⨅', '∫', 'λ', 'Π', '⨂[_]', '⨂ₜ[_]', '⨁']);
   // Precedence of a binder notation's body (Mathlib: `∑ x ∈ s, f x` takes `term:67`, `∫ … , r:60`).
   const T_BODY_PREC = { '∑': 67, '∏': 67, "∑'": 67, "∏'": 67, '∫': 60, '⋃': 60, '⋂': 60, '⨆': 60, '⨅': 60 };
   const T_STOP_WORDS = new Set(['at', 'with', 'from', 'by', 'using', 'then', 'else', 'in', 'do']);
@@ -1460,6 +1773,7 @@
           if (chars[j] === '.' && j + 1 < chars.length && (T_START.test(chars[j + 1]) || /[0-9]/.test(chars[j + 1]))) { j += 2; continue; }
           break;
         }
+        if (chars[j] === '*' && /^(Type|Sort)$/.test(chars.slice(i, j).join(''))) j++; // `Type*`
         toks.push({ k: 'id', v: chars.slice(i, j).join(''), s: offs[i], e: offs[j] });
       } else if (c === '?' && i + 1 < chars.length && T_START.test(chars[i + 1])) {
         // A hole / metavariable `?_`, `?x`.
@@ -1470,6 +1784,8 @@
         j = i + 1;
         while (j < chars.length && T_CONT.test(chars[j])) j++;
         toks.push({ k: 'field', v: chars.slice(i + 1, j).join(''), s: offs[i], e: offs[j] });
+      } else if (T_MAP_START.test(c) && (j = tMapOp(chars, i, toks, offs)) > i) {
+        // a bundled-map operator (pushed by tMapOp)
       } else {
         const ahead = chars.slice(i, i + 3).join('');
         const op = T_OPS.find(o => ahead.startsWith(o)) || c;
@@ -1479,6 +1795,35 @@
       i = j;
     }
     return toks;
+  }
+
+  const T_MAP_START = /[→≃↪∘≪⊗⨂]/;
+  /** A bundled-map operator at `chars[i]`: push its token and return the index after it, or i. */
+  function tMapOp(chars, i, toks, offs) {
+    for (const sp of T_MAP_OPS) {
+      const hole = sp.indexOf('_');
+      const pre = Array.from(hole === -1 ? sp : sp.slice(0, hole));
+      if (pre.some((ch, k) => chars[i + k] !== ch)) continue;
+      let j = i + pre.length;
+      let idx = null;
+      if (hole !== -1) {
+        const close = Array.from(sp.slice(hole + 1))[0];
+        const open = pre[pre.length - 1];
+        let depth = 0, k = j;
+        for (; k < chars.length; k++) {
+          if (chars[k] === open) depth++;
+          else if (chars[k] === close) { if (depth === 0) break; depth--; }
+        }
+        if (k >= chars.length) continue;
+        idx = chars.slice(j, k).join('').trim();
+        j = k + 1;
+      } else if (T_CONT.test(chars[j] || '') && !/[0-9]/.test(chars[j])) {
+        continue; // `→ₗ` is a prefix of a longer spelling we don't know: not this operator
+      }
+      toks.push({ k: 'op', v: sp, idx, s: offs[i], e: offs[j] });
+      return j;
+    }
+    return i;
   }
 
   const tPeek = (st) => st.toks[st.i];
@@ -1520,12 +1865,14 @@
     return t.k === 'op' && ['(', '⟨', '{', '[[', '↑', '⇑', '·', '∞', '⊤', '⊥', '∅'].includes(t.v);
   }
 
-  function tBinder(st, head) {
+  function tBinder(st, head, idx = null) {
     const stops = head === 'fun' || head === 'λ' ? ['=>', '↦'] : [','];
     const binders = tRawUntil(st, stops);
     const sep = tNext(st);
     if (!sep || sep.k !== 'op' || !stops.includes(sep.v)) throw new Error('binder');
-    return { k: 'bind', head, binders, sep: sep.v, body: tExpr(st, T_BODY_PREC[head] || 0) };
+    const node = { k: 'bind', head, binders, sep: sep.v, body: tExpr(st, T_BODY_PREC[head] || 0) };
+    if (idx !== null) node.idx = parseTerm(idx) || { k: 'raw', v: idx };
+    return node;
   }
 
   // Source spans: `span` is [start, end) of a node in the parsed text; a parenthesised term
@@ -1591,7 +1938,7 @@
       }
       case '·': case '∞': case '⊤': case '⊥': case '∅': return { k: 'id', v: t.v };
       default:
-        if (T_BINDER_HEADS.has(t.v)) return tBinder(st, t.v);
+        if (T_BINDER_HEADS.has(t.v)) return tBinder(st, t.v, t.idx === undefined ? null : t.idx);
         throw new Error(`unexpected ${t.v}`);
     }
   }
@@ -1617,7 +1964,11 @@
         if (p < minPrec) break;
         tNext(st);
         const right = tExpr(st, assoc === 'r' ? p : p + 1);
-        left = { k: 'bin', op: t.v, l: left, r: right, span: [tSpan(left)[0], tSpan(right)[1]] };
+        const span = [tSpan(left)[0], tSpan(right)[1]];
+        const binder = t.v === '→' ? arrowBinder(left) : null;
+        if (binder) { left = { k: 'bind', head: 'Π', arrow: true, binders: binder, sep: '→', body: right, span }; continue; }
+        left = { k: 'bin', op: t.v, l: left, r: right, span };
+        if (t.idx) left.idx = parseTerm(t.idx) || { k: 'raw', v: t.idx };
         continue;
       }
       const applicable = ['id', 'app', 'proj'].includes(left.k) || left.paren || (left.k === 'pre' && (left.op === '↑' || left.op === '⇑'));
@@ -1634,20 +1985,38 @@
     return left;
   }
 
+  /** `(x y : A)` / `{x : A}` / `[C x]` before `→`: the binder of a dependent arrow, or null. */
+  function arrowBinder(n) {
+    if (n.k === 'asc') {
+      const names = n.e.k === 'id' ? [n.e] : n.e.k === 'app' && !n.e.paren ? [n.e.f, ...n.e.args] : null;
+      if (names && names.every(x => x.k === 'id' && /^[^.?]+$/.test(x.v))) return `(${names.map(x => x.v).join(' ')} : ${showTerm(n.ty)})`;
+      return null;
+    }
+    if (n.k === 'raw' && (/^\{[^{}:]+:[\s\S]+\}$/.test(n.v) || /^\[[\s\S]+\]$/.test(n.v))) return n.v;
+    return null;
+  }
+
   function tPrec(n) {
     switch (n.k) {
       case 'bin': return T_BIN[n.op][0];
       case 'pre': return n.op === '¬' ? 40 : n.op === '-' ? 75 : 2000;
       case 'post': return 1100;
       case 'app': return 1024;
-      case 'bind': return T_BODY_PREC[n.head] || 0; // `∑ i ∈ s, f i ≤ c`: the body stops at `≤`
+      case 'bind': return n.arrow ? 25 : T_BODY_PREC[n.head] || 0; // `∑ i ∈ s, f i ≤ c`: the body stops at `≤`
       case 'raw': return n.loose ? 0 : 2000; // text we couldn't parse: parenthesise when nested
       default: return 2000;
     }
   }
 
-  /** Print an AST back to Lean text, adding parentheses only where precedence needs them. */
-  function showTerm(n, minPrec = 0) {
+  /**
+   * Print an AST back to Lean text, adding parentheses only where precedence needs them.
+   * `trailing`: nothing follows the term, so a binder notation at the end needs none
+   * (`a = ∑ i ∈ s, f i`, `M →ₗ[R] ⨂[R] i, s i`, `tprod R fun i ↦ f i`), as Lean prints it.
+   */
+  function showTerm(n, minPrec = 0, trailing = true) {
+    const openEnded = n.k === 'bind' && (minPrec <= 1024 || n.head === 'fun' || n.head === 'λ');
+    const paren = tPrec(n) < minPrec && !(trailing && openEnded);
+    const tr = paren || trailing;
     let s;
     switch (n.k) {
       case 'id': case 'num': case 'raw': s = n.v; break;
@@ -1656,25 +2025,35 @@
       case 'norm': s = `‖${showTerm(n.e)}‖`; break;
       case 'tuple': s = `⟨${n.es.map(e => showTerm(e)).join(', ')}⟩`; break;
       case 'named': s = `(${n.name} := ${showTerm(n.value)})`; break;
-      case 'proj': s = `${showTerm(n.e, 1025)}.${n.f}`; break;
-      case 'post': s = `${showTerm(n.e, 1025)}${n.op}`; break;
+      case 'proj': s = `${showTerm(n.e, 1025, false)}.${n.f}`; break;
+      case 'post': s = `${showTerm(n.e, 1025, false)}${n.op}`; break;
       case 'pre':
-        s = n.op === '¬' ? `¬${showTerm(n.e, 40)}` : n.op === '-' ? `-${showTerm(n.e, 75)}` : `${n.op}${showTerm(n.e, 1025)}`;
+        s = n.op === '¬' ? `¬${showTerm(n.e, 40, tr)}` : n.op === '-' ? `-${showTerm(n.e, 75, tr)}` : `${n.op}${showTerm(n.e, 1025, tr)}`;
         break;
-      case 'app': s = [showTerm(n.f, 1024), ...n.args.map(a => showTerm(a, 1025))].join(' '); break;
+      case 'app': {
+        const so = n.f.k === 'id' && (n.f.v === 'Type' || n.f.v === 'Sort') && n.args.length === 1 ? sortText(n.f.v, n.args[0]) : null;
+        if (so) { s = so; break; }
+        // `(liftAux φ) x`: a coerced map (or one written in parentheses) keeps them.
+        s = [showTerm(n.f, n.f.coeFn || (n.f.paren && n.f.k === 'app') ? 1025 : 1024, false), ...n.args.map((a, i) => showTerm(a, 1025, i === n.args.length - 1 ? tr : false))].join(' ');
+        break;
+      }
       case 'bin': {
         const [p, assoc] = T_BIN[n.op];
-        s = `${showTerm(n.l, assoc === 'l' ? p : p + 1)} ${n.op} ${showTerm(n.r, assoc === 'r' ? p : p + 1)}`;
+        const id = n.idx && LINEAR_OF[n.op] && tCore(n.idx).k === 'app' && tCore(n.idx).f.k === 'id' && tCore(n.idx).f.v === 'RingHom.id' &&
+          tCore(n.idx).args.length === 1 ? tCore(n.idx).args[0] : null;
+        const op = id ? LINEAR_OF[n.op].replace('_', showTerm(id)) : n.idx ? n.op.replace('_', showTerm(n.idx)) : n.op;
+        s = `${showTerm(n.l, assoc === 'l' ? p : p + 1, false)} ${op} ${showTerm(n.r, assoc === 'r' ? p : p + 1, tr)}`;
         break;
       }
       case 'bind':
+        if (n.arrow) { s = `${n.binders} → ${showTerm(n.body, 25, tr)}`; break; }
         s = n.head === 'fun' || n.head === 'λ'
-          ? `fun ${n.binders} ${n.sep} ${showTerm(n.body)}`
-          : `${n.head} ${n.binders}, ${showTerm(n.body, T_BODY_PREC[n.head] || 0)}`;
+          ? `fun ${n.binders} ${n.sep} ${showTerm(n.body, 0, tr)}`
+          : `${n.idx ? n.head.replace('_', showTerm(n.idx)) : n.head} ${n.binders}, ${showTerm(n.body, T_BODY_PREC[n.head] || 0, tr)}`;
         break;
       default: s = '?';
     }
-    return tPrec(n) < minPrec ? `(${s})` : s;
+    return paren ? `(${s})` : s;
   }
 
   // Ascriptions `(0 : ℝ)` and coercion arrows don't change which term is meant.
@@ -1688,10 +2067,10 @@
   function tChildren(n) {
     switch (n.k) {
       case 'app': return [n.f, ...n.args];
-      case 'bin': return [n.l, n.r];
+      case 'bin': return n.idx ? [n.l, n.r, n.idx] : [n.l, n.r];
       case 'pre': case 'post': case 'abs': case 'norm': case 'proj': case 'asc': return [n.e];
       case 'tuple': return n.es;
-      case 'bind': return [n.body];
+      case 'bind': return n.idx ? [n.body, n.idx] : [n.body];
       case 'named': return [n.value];
       default: return [];
     }
@@ -1699,10 +2078,10 @@
   function tWithChildren(n, kids) {
     switch (n.k) {
       case 'app': return Object.assign({}, n, { f: kids[0], args: kids.slice(1) });
-      case 'bin': return Object.assign({}, n, { l: kids[0], r: kids[1] });
+      case 'bin': return Object.assign({}, n, { l: kids[0], r: kids[1] }, n.idx ? { idx: kids[2] } : {});
       case 'pre': case 'post': case 'abs': case 'norm': case 'proj': case 'asc': return Object.assign({}, n, { e: kids[0] });
       case 'tuple': return Object.assign({}, n, { es: kids });
-      case 'bind': return Object.assign({}, n, { body: kids[0] });
+      case 'bind': return Object.assign({}, n, { body: kids[0] }, n.idx ? { idx: kids[1] } : {});
       case 'named': return Object.assign({}, n, { value: kids[0] });
       default: return n;
     }
@@ -1712,9 +2091,28 @@
    * Match pattern `p` (variables in `vars`) against term `t`, extending `sub` (Map name → node).
    * `x.field` with `x` a variable matches `t.field` (dot notation in lemma statements).
    */
-  function matchTerm(p, t, vars, sub) {
+  function matchTerm(p, t, vars, sub, bound = null) {
     const tp = tCore(p), tt = tCore(t);
     if (!tp || !tt) return false;
+    // `?β a` with `a` bound by an enclosing binder, against any term: `β := fun a ↦ term`
+    // (Lean's higher-order pattern unification), when matching it first-order fails.
+    if (bound && tp.k === 'app' && tp.f.k === 'id' && vars.has(tp.f.v) && !sub.has(tp.f.v) &&
+        tp.args.every(a => tCore(a).k === 'id' && bound.has(tCore(a).v)) && new Set(tp.args.map(a => tCore(a).v)).size === tp.args.length) {
+      const trial = new Map(sub);
+      if (!(tt.k === 'app' && tt.args.length === tp.args.length && matchTerm(tp.f, tt.f, vars, trial, bound) &&
+            tp.args.every((e, i) => matchTerm(e, tt.args[i], vars, trial, bound)))) {
+        const names = tp.args.map(a => tCore(a).v);
+        const tb = tCore(t);
+        const fa = tb && tb.k === 'app' ? flatApp(tb) : null;
+        // `fun e' ↦ f e'` is just `f` (when `f` doesn't mention the bound names).
+        const eta = fa && fa.args.length >= names.length &&
+          fa.args.slice(-names.length).every((a, i) => tCore(a).k === 'id' && tCore(a).v === names[i]) &&
+          ![fa.f, ...fa.args.slice(0, -names.length)].some(x => names.some(nm => freeNames(x).has(nm)));
+        const head = eta && (fa.args.length === names.length ? fa.f : { k: 'app', f: fa.f, args: fa.args.slice(0, -names.length) });
+        sub.set(tp.f.v, head || { k: 'bind', head: 'fun', binders: names.join(' '), sep: '↦', body: t });
+        return true;
+      }
+    }
     if (tp.k === 'id') {
       if (vars.has(tp.v)) {
         if (sub.has(tp.v)) return sameTerm(sub.get(tp.v), t);
@@ -1727,32 +2125,60 @@
         let recv = null;
         if (tt.k === 'id' && tt.v.endsWith('.' + rest) && tt.v.length > rest.length + 1) recv = { k: 'id', v: tt.v.slice(0, tt.v.length - rest.length - 1) };
         else if (tt.k === 'proj' && tt.f === rest) recv = tt.e;
-        return Boolean(recv) && matchTerm({ k: 'id', v: tp.v.slice(0, dot) }, recv, vars, sub);
+        return Boolean(recv) && matchTerm({ k: 'id', v: tp.v.slice(0, dot) }, recv, vars, sub, bound);
       }
     }
     // `n.succ` written as one identifier vs. a projection node of `n`.
     if (tp.k === 'proj' && tt.k === 'id' && tt.v.endsWith('.' + tp.f) && tt.v.length > tp.f.length + 1) {
-      return matchTerm(tp.e, { k: 'id', v: tt.v.slice(0, tt.v.length - tp.f.length - 1) }, vars, sub);
+      return matchTerm(tp.e, { k: 'id', v: tt.v.slice(0, tt.v.length - tp.f.length - 1) }, vars, sub, bound);
     }
     if (tp.k === 'id' && tt.k === 'proj' && tp.v.endsWith('.' + tt.f) && tp.v.length > tt.f.length + 1) {
-      return matchTerm({ k: 'id', v: tp.v.slice(0, tp.v.length - tt.f.length - 1) }, tt.e, vars, sub);
+      return matchTerm({ k: 'id', v: tp.v.slice(0, tp.v.length - tt.f.length - 1) }, tt.e, vars, sub, bound);
+    }
+    // Universes: `Type u` against `Type u_4` fixes `u`; levels we can't compare don't block a match.
+    const sp = sortOf(tp), st = sortOf(tt);
+    if (sp || st) {
+      if (!sp || !st) return false;
+      const bind = (level, target) => {
+        const v = level && tCore(level);
+        if (v && v.k === 'id' && vars.has(v.v) && !sub.has(v.v) && target) sub.set(v.v, target);
+        return true;
+      };
+      if (sp.kind === 'Prop' || st.kind === 'Prop') return sp.kind === st.kind || (sp.kind === 'Sort' && bind(sp.level, { k: 'num', v: '0' }));
+      if (!sp.level || !st.level) return true;
+      return bind(sp.level, sp.kind === st.kind ? st.level : sp.kind === 'Sort' ? levelSucc(st.level) : levelPred(st.level));
     }
     if (tp.k !== tt.k) return false;
     switch (tp.k) {
       case 'id': return tIdEq(tp.v, tt.v);
       case 'num': return tp.v === tt.v;
       case 'raw': return tRawEq(tp.v, tt.v);
-      case 'abs': case 'norm': return matchTerm(tp.e, tt.e, vars, sub);
-      case 'pre': case 'post': return tp.op === tt.op && matchTerm(tp.e, tt.e, vars, sub);
-      case 'proj': return tp.f === tt.f && matchTerm(tp.e, tt.e, vars, sub);
-      case 'tuple': return tp.es.length === tt.es.length && tp.es.every((e, i) => matchTerm(e, tt.es[i], vars, sub));
-      case 'app':
-        return tp.args.length === tt.args.length && matchTerm(tp.f, tt.f, vars, sub) &&
-          tp.args.every((e, i) => matchTerm(e, tt.args[i], vars, sub));
-      case 'bin': return tp.op === tt.op && matchTerm(tp.l, tt.l, vars, sub) && matchTerm(tp.r, tt.r, vars, sub);
-      case 'named': return tp.name === tt.name && matchTerm(tp.value, tt.value, vars, sub);
+      case 'abs': case 'norm': return matchTerm(tp.e, tt.e, vars, sub, bound);
+      case 'pre': case 'post': return tp.op === tt.op && matchTerm(tp.e, tt.e, vars, sub, bound);
+      case 'proj': return tp.f === tt.f && matchTerm(tp.e, tt.e, vars, sub, bound);
+      case 'tuple': return tp.es.length === tt.es.length && tp.es.every((e, i) => matchTerm(e, tt.es[i], vars, sub, bound));
+      case 'app': {
+        // `(f a) b` is `f a b` (the parentheses Lean prints around a coerced map don't matter).
+        const fp = flatApp(tp), ft = flatApp(tt);
+        return fp.args.length === ft.args.length && matchTerm(fp.f, ft.f, vars, sub, bound) &&
+          fp.args.every((e, i) => matchTerm(e, ft.args[i], vars, sub, bound));
+      }
+      case 'bin': {
+        let pi = tp.idx, ti = tt.idx;
+        if (tp.op !== tt.op) {
+          // `M →ₗ[R] N` is `M →ₛₗ[RingHom.id R] N` (and `∘ₗ` is `∘ₛₗ`).
+          if (SEMI_OF[tt.op] === tp.op) ti = ti && { k: 'app', f: { k: 'id', v: 'RingHom.id' }, args: [ti] };
+          else if (SEMI_OF[tp.op] === tt.op) pi = pi && { k: 'app', f: { k: 'id', v: 'RingHom.id' }, args: [pi] };
+          else return false;
+        }
+        return Boolean(pi) === Boolean(ti) && (!pi || matchTerm(pi, ti, vars, sub, bound)) &&
+          matchTerm(tp.l, tt.l, vars, sub, bound) && matchTerm(tp.r, tt.r, vars, sub, bound);
+      }
+      case 'named': return tp.name === tt.name && matchTerm(tp.value, tt.value, vars, sub, bound);
       case 'bind': {
-        if (tp.head !== tt.head) return false;
+        const piHead = (h) => (h === '∀' ? 'Π' : h);
+        if (piHead(tp.head) !== piHead(tt.head)) return false;
+        if (Boolean(tp.idx) !== Boolean(tt.idx) || (tp.idx && !matchTerm(tp.idx, tt.idx, vars, sub, bound))) return false;
         const bp = binderParts(tp.binders), bt = binderParts(tt.binders);
         if (bp.names.length !== bt.names.length || bp.op !== bt.op || (bp.range === null) !== (bt.range === null)) return false;
         if (bp.range !== null) {
@@ -1760,17 +2186,173 @@
           if (rp.length !== rt.length) return false;
           for (let i = 0; i < rp.length; i++) {
             const a = parseTerm(rp[i]), b = parseTerm(rt[i]);
-            if (a && b ? !matchTerm(a, b, vars, sub) : !tRawEq(rp[i], rt[i])) return false;
+            if (a && b ? !matchTerm(a, b, vars, sub, bound) : !tRawEq(rp[i], rt[i])) return false;
           }
         }
         // Alpha-equivalence: rename the pattern's bound variables to the target's.
         const ren = new Map(bp.names.map((nm, i) => [nm, { k: 'id', v: bt.names[i] }]));
-        return matchTerm(substTerm(tp.body, ren), tt.body, vars, sub);
+        return matchTerm(substTerm(tp.body, ren), tt.body, vars, sub, new Set([...(bound || []), ...bt.names]));
       }
       default: return false;
     }
   }
   const sameTerm = (a, b) => matchTerm(a, b, new Set(), new Map());
+  /** `(f a) b` as one application `f a b`. */
+  function flatApp(n) {
+    let f = n.f, args = n.args;
+    while (f && f.k === 'app') { args = [...f.args, ...args]; f = f.f; }
+    return { f, args };
+  }
+
+  // --- Universe levels ---
+
+  /**
+   * A constant's signature with its universe parameters written `?u` (as Lean shows universe
+   * metavariables), so that they are solved by matching, not taken for the caller's universes.
+   */
+  function universeParams(sig) {
+    if (!sig) return sig;
+    const names = new Set();
+    // Universe names (`u`, `u_1`, `u\u03b9`).
+    for (const m of sig.matchAll(/(?<![\w'.])(?:Type|Sort)\s+(\((?:[^()]|\([^()]*\))*\)|[A-Za-z_\u0370-\u03ff][\w'\u0370-\u03ff\u2080-\u2089]*)/g)) {
+      m[1].replace(/(?<![\w'?\u0370-\u03ff])[A-Za-z_\u0370-\u03ff][\w'\u0370-\u03ff\u2080-\u2089]*/g, (u) => { if (u !== 'max' && u !== 'imax') names.add(u); return u; });
+    }
+    let out = sig;
+    names.forEach(u => {
+      out = out.replace(/((?:Type|Sort)\s+(?:\((?:[^()]|\([^()]*\))*\)|[A-Za-z_\u0370-\u03ff][\w'\u0370-\u03ff\u2080-\u2089]*))/g,
+        (lv) => lv.replace(new RegExp(`(?<![\\w'?\\u0370-\\u03FF])${u}(?![\\w'\\u0370-\\u03FF\\u2080-\\u2089])`, 'g'), `?${u}`));
+    });
+    return out;
+  }
+
+  /** `Type u` / `Sort l` / `Prop` / `Type*`: { kind, level } (level null when unknown), or null. */
+  function sortOf(n) {
+    n = tCore(n);
+    if (!n) return null;
+    if (n.k === 'id') {
+      if (n.v === 'Prop') return { kind: 'Prop', level: null };
+      if (n.v === 'Type') return { kind: 'Type', level: { k: 'num', v: '0' } };
+      if (n.v === 'Type*' || n.v === 'Sort*') return { kind: n.v.slice(0, 4), level: null };
+      return null;
+    }
+    if (n.k === 'app' && n.f.k === 'id' && (n.f.v === 'Type' || n.f.v === 'Sort') && n.args.length === 1) return { kind: n.f.v, level: tCore(n.args[0]) };
+    return null;
+  }
+  const levelSucc = (l) => ({ k: 'bin', op: '+', l, r: { k: 'num', v: '1' } });
+  const levelPred = (l) => {
+    l = tCore(l);
+    if (l.k === 'bin' && l.op === '+' && l.r.k === 'num') return Number(l.r.v) === 1 ? l.l : { k: 'bin', op: '+', l: l.l, r: { k: 'num', v: String(Number(l.r.v) - 1) } };
+    if (l.k === 'num' && Number(l.v) > 0) return { k: 'num', v: String(Number(l.v) - 1) };
+    return null;
+  };
+
+  // Levels are ASTs (`u`, `2`, `u + 1`, `max a b`, `imax a b`). Lean keeps a level's shape when
+  // it instantiates a constant, with cheap simplifications (`max 1 (u + 1)` is `u + 1`), and
+  // prints `Sort (l + 1)` as `Type l`: `Type (max (max u_1 u_4) u_8)`, `Type u_1`.
+  const lvlNum = (k) => ({ k: 'num', v: String(k) });
+  /** `{ base, k }` for `base + k` (base null for a constant), or null if it isn't a level. */
+  function lvlOffset(l) {
+    l = tCore(l);
+    if (!l) return null;
+    if (l.k === 'num') return { base: null, k: Number(l.v) };
+    if (l.k === 'bin' && l.op === '+' && tCore(l.r).k === 'num') {
+      const o = lvlOffset(l.l);
+      return o && { base: o.base, k: o.k + Number(tCore(l.r).v) };
+    }
+    return { base: l, k: 0 };
+  }
+  const lvlAdd = (base, k) => (base ? (k ? { k: 'bin', op: '+', l: base, r: lvlNum(k) } : base) : lvlNum(k));
+  const lvlArgs = (l) => { l = tCore(l); return l && l.k === 'app' && l.f.k === 'id' && (l.f.v === 'max' || l.f.v === 'imax') ? l.args : null; };
+  const lvlKind = (l) => { l = tCore(l); return l && l.k === 'app' && l.f.k === 'id' ? l.f.v : null; };
+  /** Is `a ≤ b` for every assignment, by the obvious reasons Lean's simplifier sees? */
+  function lvlLeq(a, b) {
+    const oa = lvlOffset(a), ob = lvlOffset(b);
+    if (!oa || !ob) return false;
+    if (!oa.base) return oa.k <= ob.k || (lvlKind(ob.base) === 'max' && lvlArgs(ob.base).some(x => lvlLeq(lvlNum(oa.k - ob.k), x)));
+    if (ob.base && oa.k <= ob.k && sameTerm(oa.base, ob.base)) return true;
+    const bm = lvlKind(ob.base) === 'max' ? lvlArgs(ob.base) : null;
+    return Boolean(bm) && ob.k === 0 && bm.some(x => lvlLeq(a, x));
+  }
+  /** Simplify a level, keeping its shape (max of two where one is smaller drops it). */
+  function lvlSimp(l) {
+    l = tCore(l);
+    if (!l) return l;
+    const args = lvlArgs(l);
+    if (args) {
+      const parts = args.map(lvlSimp);
+      if (lvlKind(l) === 'imax' && parts.length === 2) {
+        const o = lvlOffset(parts[1]);
+        if (o && !o.base && o.k === 0) return lvlNum(0);
+        if (!o || (o.k < 1 && !lvlArgs(parts[1]))) return { k: 'app', f: { k: 'id', v: 'imax' }, args: parts };
+      }
+      return parts.reduceRight((acc, x) => {
+        if (acc === null) return x;
+        if (lvlLeq(x, acc)) return acc;
+        if (lvlLeq(acc, x)) return x;
+        return { k: 'app', f: { k: 'id', v: 'max' }, args: [x, acc] };
+      }, null);
+    }
+    const o = lvlOffset(l);
+    if (o && o.base && o.k) return lvlAdd(lvlSimp(o.base), o.k);
+    return l;
+  }
+  /** `l - 1` when every part of `l` is at least 1, else null. */
+  function lvlDec(l) {
+    const o = lvlOffset(l);
+    if (!o) return null;
+    if (o.k >= 1) return lvlAdd(o.base, o.k - 1);
+    const args = lvlKind(o.base) === 'max' ? lvlArgs(o.base) : null;
+    if (!args) return null;
+    const dec = args.map(lvlDec);
+    return dec.every(Boolean) ? { k: 'app', f: { k: 'id', v: 'max' }, args: dec } : null;
+  }
+  /** Lean's printing: right-nested `max` flattens (`max a b c`), left-nested keeps parentheses. */
+  function lvlShow(l) {
+    l = tCore(l);
+    const args = lvlArgs(l);
+    if (args) {
+      const flat = [];
+      let cur = l;
+      while (lvlKind(cur) === lvlKind(l) && lvlArgs(cur) && lvlArgs(cur).length === 2) { flat.push(lvlArgs(cur)[0]); cur = lvlArgs(cur)[1]; }
+      if (lvlArgs(cur) && lvlKind(cur) === lvlKind(l)) flat.push(...lvlArgs(cur)); else flat.push(cur);
+      return `${lvlKind(l)} ${flat.map(x => { const t = lvlShow(x); return /\s/.test(t) ? `(${t})` : t; }).join(' ')}`;
+    }
+    const o = lvlOffset(l);
+    if (o && o.base && o.k) return `${lvlShow(o.base)} + ${o.k}`;
+    return showTerm(l);
+  }
+  const isLevel = (l) => {
+    l = tCore(l);
+    if (!l) return false;
+    if (l.k === 'num') return true;
+    if (l.k === 'id') return /^\??[A-Za-z_Ͱ-Ͽ][\w'Ͱ-Ͽ₀-₉]*$/.test(l.v) && l.v !== 'max' && l.v !== 'imax';
+    if (l.k === 'bin') return l.op === '+' && isLevel(l.l) && tCore(l.r).k === 'num';
+    return Boolean(lvlArgs(l)) && lvlArgs(l).every(isLevel);
+  };
+
+  /** `Sort (max 1 (u + 1))` as Lean prints it: `Type u`; `Sort 0` is `Prop`. Text, or null. */
+  function sortText(kind, level) {
+    if (!isLevel(level)) return null;
+    const l = lvlSimp(kind === 'Type' ? lvlAdd(level, 1) : level);
+    const o = lvlOffset(l);
+    if (o && !o.base && o.k === 0) return 'Prop';
+    const d = lvlDec(l);
+    if (d) { const t = lvlShow(lvlSimp(d)); return t === '0' ? 'Type' : `Type ${/\s/.test(t) ? `(${t})` : t}`; }
+    const t = lvlShow(l);
+    return `Sort ${/\s/.test(t) ? `(${t})` : t}`;
+  }
+
+  /** The level of a pi type with this binder sort and body sort (`imax`), as text, or null. */
+  function piSort(binderSort, bodySort) {
+    const b = sortOf(parseTerm(binderSort || '')), r = sortOf(parseTerm(bodySort || ''));
+    if (!b || !r) return null;
+    if (r.kind === 'Prop') return 'Prop';
+    if (!b.level || !r.level) return null;
+    const lift = (x) => (x.kind === 'Type' ? levelSucc(x.level) : x.level);
+    return sortText('Sort', { k: 'app', f: { k: 'id', v: 'max' }, args: [lift(b), lift(r)] });
+  }
+
+
 
   /**
    * Bound names, binder relation and range of a binder list, ignoring type annotations:
@@ -1819,7 +2401,7 @@
       let text = n.k === 'raw' ? n.v : n.binders;
       sub.forEach((v, name) => { text = replaceWord(text, name, showTerm(v, 1025)); });
       const m = n.k === 'raw' ? Object.assign({}, n, { v: text }) : Object.assign({}, n, { binders: text });
-      return n.k === 'bind' ? Object.assign(m, { body: substTerm(n.body, sub) }) : m;
+      return n.k === 'bind' ? Object.assign(m, { body: substTerm(n.body, sub) }, n.idx ? { idx: substTerm(n.idx, sub) } : {}) : m;
     }
     const m = tWithChildren(n, tChildren(n).map(c => substTerm(c, sub)));
     return n.k === 'asc' ? Object.assign(m, { ty: substTerm(n.ty, sub) }) : m;
@@ -1894,7 +2476,9 @@
       const close = matchClose(t, i);
       if (close === -1) break;
       const g = t.slice(i + 1, close);
-      const c = g.indexOf(' : ');
+      // The binder's own ` : ` (not one inside `[(i : ι) → AddCommMonoid (s i)]`).
+      const tc = topColon(g);
+      const c = tc !== -1 && g[tc - 1] === ' ' && g[tc + 1] === ' ' ? tc - 1 : -1;
       // A default value (`(hq : P := by simp)`) isn't part of the type.
       const dflt = c === -1 ? -1 : g.indexOf(' := ', c);
       if (c !== -1) binders.push({ names: g.slice(0, c).trim().split(/\s+/), type: g.slice(c + 3, dflt === -1 ? g.length : dflt).trim(), explicit: t[i] === '(', bi: t[i] });
@@ -1938,6 +2522,23 @@
         t = t.slice(comma + 1).trim();
         continue;
       }
+      // A dependent arrow `(a : α) → β a` / `{a : α} → …` / `[C] → …`: a binder.
+      if ('({[⦃'.includes(t[0])) {
+        const close = matchClose(t, 0);
+        if (close !== -1 && /^\s*→\s/.test(t.slice(close + 1))) {
+          const g = t.slice(1, close);
+          const c = g.indexOf(' : ');
+          // Only names before ` : ` (not `(⨂[R] i : ι, s i) → …`, a type in parentheses).
+          const names = c === -1 ? [] : g.slice(0, c).trim().split(/\s+/);
+          const binderNames = names.length && names.every(x => T_START.test(Array.from(x)[0]) && Array.from(x).every(ch => T_CONT.test(ch)));
+          if ((c !== -1 && binderNames && t[0] !== '[') || t[0] === '[') {
+            binders.push(c === -1 ? { names: [], type: g.trim(), explicit: false, bi: '[' }
+              : { names: g.slice(0, c).trim().split(/\s+/), type: g.slice(c + 3).trim(), explicit: t[0] === '(', bi: t[0] });
+            t = t.slice(close + 1).replace(/^\s*→\s*/, '');
+            continue;
+          }
+        }
+      }
       // A premise `A → B` (plain arrow at top level).
       let depth = 0, cut = -1;
       for (let k = 0; k < t.length; k++) {
@@ -1971,11 +2572,17 @@
    */
   function instantiateSignature(sig, positional, named, text, opts = {}) {
     const peeled = peelSignature(sig);
+    // A constant's universe parameters (written `?u` by `universeParams`) are solved like
+    // its other variables: `Type ?u` against `Type u_4` fixes `?u`.
+    const univs = new Set();
+    [peeled.concl, ...peeled.binders.map(b => b.type)].forEach(t => {
+      for (const m of (t || '').matchAll(/\?[A-Za-z_\u0370-\u03FF][\w'\u0370-\u03FF\u2080-\u2089]*/g)) univs.add(m[0]);
+    });
     const own = [...new Set(peeled.binders.flatMap(b => b.names))];
     const fresh = (n) => `__pv_${n}`;
     const ren = (str) => own.reduce((acc, n) => replaceWord(acc, n, fresh(n)), str || '');
     const binders = peeled.binders.map(b => ({ names: b.names.map(fresh), type: ren(b.type), explicit: b.explicit, bi: b.bi }));
-    const vars = new Set(binders.flatMap(b => b.names));
+    const vars = new Set([...binders.flatMap(b => b.names), ...[...univs].filter(u => !own.includes(u.slice(1)))]);
     const allSlots = binders.filter(b => b.explicit).flatMap(b => (b.names.length ? b.names : [null]).map(n => ({ name: n, type: b.type, binder: b })));
     // A named argument `(h := …)` fills its own parameter; positional ones fill the others.
     const namedKeys = new Set(Object.keys(named || {}).map(fresh));
@@ -2028,6 +2635,61 @@
     for (const [n, v] of Object.entries(named || {})) {
       const node = parseTerm(v);
       if (node && own.includes(n)) sub.set(fresh(n), node);
+    }
+    // Out-params Mathlib's instances fix when a ring hom is the identity:
+    // `RingHomInvPair (RingHom.id R) ?σ'` (σ' = id) and `RingHomCompTriple` with an id factor.
+    const valueOf = (a) => (a.k === 'id' && vars.has(a.v) ? sub.get(a.v) : a);
+    const isIdHom = (v) => { const c = v && tCore(v); return Boolean(c) && c.k === 'app' && c.f.k === 'id' && c.f.v === 'RingHom.id' && c.args.length === 1; };
+    const outParam = (o, v) => { if (o.k === 'id' && vars.has(o.v) && !sub.has(o.v) && v) sub.set(o.v, v); };
+    for (const b of binders) {
+      const c = b.type && b.type.includes('RingHom') ? tCore(parseTerm(b.type)) : null;
+      if (!c || c.k !== 'app' || c.f.k !== 'id') continue;
+      const cls = c.f.v.split('.').pop();
+      if (cls === 'RingHomInvPair' && c.args.length === 2 && isIdHom(valueOf(c.args[0]))) outParam(c.args[1], valueOf(c.args[0]));
+      if (cls === 'RingHomCompTriple' && c.args.length === 3) {
+        const [x, y] = [valueOf(c.args[0]), valueOf(c.args[1])];
+        if (isIdHom(x)) outParam(c.args[2], y); else if (isIdHom(y)) outParam(c.args[2], x);
+      }
+    }
+    // …and from the instances in scope (`[RingHomCompTriple σ₁₂ σ₂₃ σ₁₃]` fixes `?σ₁₃`), as
+    // instance search finds them.
+    if (opts.instances && opts.instances.length) {
+      for (const b of binders) {
+        const c = b.type && /RingHom(?:InvPair|CompTriple)/.test(b.type) ? tCore(parseTerm(b.type)) : null;
+        if (!c || c.k !== 'app' || c.f.k !== 'id') continue;
+        const cls = c.f.v.split('.').pop();
+        const ins = cls === 'RingHomInvPair' ? 1 : cls === 'RingHomCompTriple' ? 2 : 0;
+        const out = c.args[ins];
+        if (!ins || c.args.length !== ins + 1 || !out || out.k !== 'id' || !vars.has(out.v) || sub.has(out.v)) continue;
+        const given = c.args.slice(0, ins).map(valueOf);
+        if (given.some(g => !g)) continue;
+        for (const local of opts.instances) {
+          const l = tCore(parseTerm(local));
+          if (l && l.k === 'app' && l.f.k === 'id' && l.f.v.split('.').pop() === cls && l.args.length === ins + 1 &&
+              given.every((g, k) => sameTerm(g, l.args[k]))) { sub.set(out.v, l.args[ins]); break; }
+        }
+      }
+    }
+    // `RingHom.id R : R →+* R`.
+    const idTypes = new Map();
+    for (const v of sub.values()) { const c = tCore(v); if (isIdHom(c)) idTypes.set(showTerm(c), `${showTerm(c.args[0], 26)} →+* ${showTerm(c.args[0], 26)}`); }
+    if (idTypes.size) {
+      for (const b of binders) for (const n of b.names) { const v = sub.get(n); if (v && idTypes.has(showTerm(tCore(v))) && b.type) unify(b.type, idTypes.get(showTerm(tCore(v)))); }
+    }
+    // A variable solved by a local: the local's type fixes the variables in the binder's
+    // type (`σ₁₂ := σ₁₂` with `σ₁₂ : R →+* R₂` gives `R`, `R₂`), as Lean unifies types.
+    if (opts.valueTypes) {
+      for (let pass = 0; pass < 3; pass++) {
+        const before = sub.size;
+        for (const b of binders) {
+          for (const n of b.names) {
+            const v = sub.get(n);
+            const vt = v && tCore(v).k === 'id' ? opts.valueTypes.get(tCore(v).v) : null;
+            if (vt && b.type) unify(b.type, vt);
+          }
+        }
+        if (sub.size === before) break;
+      }
     }
     return {
       concl: ren(peeled.concl), vars, sub, own, fresh, binders, slots: allSlots, remaining: slots.slice(positional.length),
@@ -2101,19 +2763,32 @@
    */
   function residualParts(sig, positional, named, text, opts = {}) {
     const inst = instantiateSignature(sig, positional, named, text, opts);
-    // A type with its variables substituted; notation we can't parse is kept as text.
+    // A type with its variables substituted; notation we can't parse is kept as text. Binders
+    // print as Lean prints them (`⨂[R] (i : ι), s i`), their types from the signature's.
+    const sigTypes = new Map();
+    inst.binders.forEach(b => b.names.forEach(nm => sigTypes.set(nm, b.type)));
+    const typeOfName = (nm) => sigTypes.get(nm) || null;
     const subst = (s) => {
       if (!s || s === '_') return null;
       const n = parseTerm(s);
-      return substTerm(n || { k: 'raw', v: s, loose: true }, inst.sub);
+      return substTerm(n ? coerceApps(annotateBinders(n, typeOfName), typeOfName) : { k: 'raw', v: s, loose: true }, inst.sub);
     };
+    // A bundled map (`f : M →+ N`) applied to a point is coerced to a function: Lean prints
+    // `(liftAux φ) (a + b)` when the map is itself an application.
+    inst.binders.forEach(b => {
+      if (!isBundledType(parseTerm(b.type || ''))) return;
+      b.names.forEach(nm => {
+        const v = inst.sub.get(nm);
+        if (v && tCore(v).k === 'app') inst.sub.set(nm, Object.assign({}, v, { coeFn: true }));
+      });
+    });
     let concl = subst(inst.concl);
     if (!concl) return null;
-    if (inst.extra.length) {
-      // More arguments than parameters: only a few types are functions in disguise.
-      if (inst.extra.length !== 1) return null;
+    // More arguments than parameters: only a few types are functions in disguise, applied one
+    // argument at a time (`lift φ x`: `lift` is an equivalence, `lift φ` a linear map).
+    for (const extra of inst.extra) {
       const c = tCore(concl);
-      const argT = typeof inst.extra[0].type === 'string' ? tCore(parseTerm(inst.extra[0].type)) : null;
+      const argT = typeof extra.type === 'string' ? tCore(parseTerm(extra.type)) : null;
       if (c && c.k === 'bin' && (c.op === '⊆' || c.op === '⊂')) {
         // `hs : s ⊆ t` applied to `hx : x ∈ s` is `x ∈ t`.
         if (!argT || argT.k !== 'bin' || argT.op !== '∈' || !sameTerm(argT.r, c.l)) return null;
@@ -2122,12 +2797,36 @@
         // A bundled map (`e : A ≃ B`, `f : M →+* N`, `‖·‖ : AlgebraNorm K L`) applied to a point
         // lands in its codomain, through the coercion to a function.
         const fun = funLikeCodomain(c);
-        const cod = fun ? null : codomainOf(showTerm(concl));
-        const codT = fun || (cod && parseTerm(cod));
+        // `tprod R : (Π i, s i) →ₘₗ[R] ⨂[R] i, s i` applied to `f`: `f`'s type fixes `s`.
+        let mapped = null;
+        const dc = !fun && c ? bundledDomCod(c) : null;
+        if (dc) {
+          const extended = new Map();
+          if (argT && matchTerm(dc.dom, argT, inst.vars, extended)) extended.forEach((v, key) => { if (!inst.sub.has(key)) inst.sub.set(key, v); });
+          // What the point fixed can fix more, through the locals' types (`s : ι → Type*` gives `ι`).
+          if (opts.valueTypes) {
+            for (const b of inst.binders) {
+              for (const nm of b.names) {
+                const v = inst.sub.get(nm);
+                const vt = v && tCore(v).k === 'id' ? opts.valueTypes.get(tCore(v).v) : null;
+                const more = new Map(inst.sub);
+                if (vt && b.type && matchTerm(parseTerm(b.type), parseTerm(vt), inst.vars, more)) {
+                  more.forEach((x, key) => { if (!inst.sub.has(key)) { inst.sub.set(key, x); extended.set(key, x); } });
+                }
+              }
+            }
+          }
+          mapped = substTerm(dc.cod, extended);
+        }
+        const cod = fun || mapped ? null : codomainOf(showTerm(concl));
+        const codT = fun || mapped || (cod && parseTerm(cod));
         if (!codT) return null;
         concl = codT;
       }
     }
+    // The last argument goes through the coercion to a function: `(tprod R) f`.
+    const applied = inst.extra.length ? tCore(subst(inst.concl)) : null;
+    if (applied && !['⊆', '⊂'].includes(applied.op) && opts.onCoerce) opts.onCoerce(positional.length - 1);
     const lead = [];
     const rest = [];
     const recv = (opts.receiver && opts.receiver.binders) || [];
@@ -2177,6 +2876,24 @@
   const BINDER_PRED_OPS = new Set(['∈', '∉', '<', '≤', '>', '≥', '≠', '⊆', '⊂']);
 
   /** `rest` and `concl` of `residualParts` as a type: `(x : T) → …` / `T → …` / `∀ {x : T}, …`. */
+  // Type constructors: a function type into one of these is data, printed `(a : α) → β a`.
+  const DATA_HEADS = new Set(['Set', 'Finset', 'List', 'Multiset', 'Option', 'Fin', 'Matrix', 'Polynomial', 'MvPolynomial',
+    'PiTensorProduct', 'TensorProduct', 'MultilinearMap', 'LinearMap', 'LinearEquiv', 'Submodule', 'Subgroup', 'AddSubgroup',
+    'Subring', 'Subalgebra', 'Ideal', 'Equiv', 'Prod', 'Sum', 'Sigma', 'Subtype', 'Quotient', 'Module.End', 'Finsupp',
+    'ℕ', 'ℤ', 'ℚ', 'ℝ', 'ℂ', 'Nat', 'Int', 'Rat', 'Real', 'Complex', 'Type', 'Sort', 'Bool', 'Unit', 'ENNReal', 'NNReal', 'EReal']);
+  /** Is `n` a type whose values are data (not proofs)? Unknown shapes count as propositions. */
+  function isDataType(n) {
+    n = tCore(n);
+    if (!n) return false;
+    if (n.k === 'bin') return T_MAP_OPS.includes(n.op) || ['×', '≃', '↪'].includes(n.op) || (n.op === '→' && isDataType(n.r));
+    if (n.k === 'bind') return ['⨂[_]', '⨁'].includes(n.head) || (n.arrow && isDataType(n.body));
+    const head = n.k === 'app' ? tCore(n.f) : n;
+    if (!head || head.k !== 'id') return false;
+    if (DATA_HEADS.has(head.v)) return true;
+    // A type family `s a`, `β i`, `M i`, `?β a` (predicates are `p x`, `P x`, `q x`, `r a b`).
+    return n.k === 'app' && /^\??[A-Za-zα-ωΑ-Ω][\d'\u2080-\u2089]*$/.test(head.v) && !/^[pqrPQ]/.test(head.v.replace(/^\?/, ''));
+  }
+
   function piOf(rest, concl) {
     let body = concl;
     for (let i = rest.length - 1; i >= 0; i--) {
@@ -2187,12 +2904,54 @@
       // `∀ x, x ∈ s → p x` is written `∀ x ∈ s, p x` (Mathlib's binder predicates).
       const pred = body && body.k === 'bin' && body.op === '→' && body.l.k === 'bin' && BINDER_PRED_OPS.has(body.l.op) &&
         body.l.l.k === 'id' && body.l.l.v === x.name;
-      if (x.bi === '{') body = { k: 'bind', head: '∀', binders: ty ? `{${x.name} : ${ty}}` : `{${x.name}}`, sep: ',', body };
-      else if (pred && !x.type) body = { k: 'bind', head: '∀', binders: `${x.name} ${body.l.op} ${showTerm(body.l.r, 51)}`, sep: ',', body: body.r };
-      else if (dependent || !x.type) body = { k: 'bind', head: '∀', binders: ty ? `(${x.name} : ${ty})` : (x.name || '_'), sep: ',', body };
+      // A function type whose values are data prints as `(a : α) → β a`, a proposition as `∀ (a : α), …`.
+      const data = ty && isDataType(body);
+      if (x.bi === '{') {
+        body = data ? { k: 'bind', head: 'Π', arrow: true, binders: `{${x.name} : ${ty}}`, sep: '→', body }
+          : { k: 'bind', head: '∀', binders: ty ? `{${x.name} : ${ty}}` : `{${x.name}}`, sep: ',', body };
+      } else if (pred && !x.type) body = { k: 'bind', head: '∀', binders: `${x.name} ${body.l.op} ${showTerm(body.l.r, 51)}`, sep: ',', body: body.r };
+      else if (dependent && data) body = group({ k: 'bind', head: 'Π', arrow: true, binders: `(${x.name} : ${ty})`, sep: '→', body });
+      else if (dependent || !x.type) body = group({ k: 'bind', head: '∀', binders: ty ? `(${x.name} : ${ty})` : (x.name || '_'), sep: ',', body });
       else body = { k: 'bin', op: '→', l: x.type, r: body };
     }
     return body;
+  }
+
+  const BUNDLED_HEADS = new Set(Object.values(ARROW_HEADS).filter(Boolean).map(h => h.split('.').pop()));
+  /** Is `t` the type of a bundled map, which applies to points through a coercion? */
+  function isBundledType(t) {
+    t = tCore(t);
+    if (!t) return false;
+    if (t.k === 'bin') return (T_MAP_OPS.includes(t.op) && !/^[⊗∘≪⨂]/.test(t.op)) || t.op === '≃' || t.op === '↪';
+    const head = t.k === 'app' ? tCore(t.f) : t;
+    return Boolean(head) && head.k === 'id' && (BUNDLED_HEADS.has(head.v.split('.').pop()) || Object.prototype.hasOwnProperty.call(FUN_LIKE, head.v.split('.').pop()));
+  }
+
+  /**
+   * Domain and codomain of a bundled map type: `A →ₗ[R] B`, and the structures written as
+   * applications (`LinearMap σ M M₂`, `MultilinearMap R M N` on `(i : ι) → M i`); or null.
+   */
+  function bundledDomCod(t) {
+    t = tCore(t);
+    if (!t) return null;
+    if (t.k === 'bin') return isBundledType(t) ? { dom: t.l, cod: t.r } : null;
+    if (t.k !== 'app' || t.f.k !== 'id' || !isBundledType(t) || t.args.length < 2) return null;
+    const head = t.f.v.split('.').pop();
+    const [dom, cod] = t.args.slice(-2);
+    if (head === 'MultilinearMap') {
+      return { dom: { k: 'bind', head: 'Π', binders: 'i', sep: ',', body: { k: 'app', f: dom, args: [{ k: 'id', v: 'i' }] } }, cod };
+    }
+    return { dom, cod };
+  }
+
+  /** `∀ (a : M), ∀ (b : M), P` prints as `∀ (a b : M), P` (Lean groups binders of one type). */
+  function group(n) {
+    const inner = n.body;
+    const m = n.binders.match(/^\(([^():]+) : ([\s\S]+)\)$/);
+    if (!m || !inner || inner.k !== 'bind' || inner.head !== n.head || Boolean(inner.arrow) !== Boolean(n.arrow)) return n;
+    const im = inner.binders.match(/^\(([^():]+) : ([\s\S]+)\)$/);
+    if (!im || im[2] !== m[2] || m[1].trim().split(/\s+/).some(x => namesIn(im[2]).includes(x))) return n;
+    return Object.assign({}, inner, { binders: `(${m[1].trim()} ${im[1].trim()} : ${m[2]})` });
   }
 
   const leadBinderText = (lead) => lead.map(x => `{${x.name} : ${x.type ? showTerm(x.type) : '_'}}`).join(' ');
@@ -2238,12 +2997,13 @@
    * declaration keyword, no auto-generated instance names (`[inst : Ring R]` → `[Ring R]`),
    * the universe parameters named in the statement after the name.
    */
-  function leanSignature(name, sig) {
+  function leanSignature(name, sig, known = null) {
     let t = (sig || '').replace(/\s+/g, ' ').trim();
     if (!t) return name;
     t = t.replace(/\[inst(?:_\d+|✝\d*)? : /g, '[');
+    t = leanBinders(t, known);
     const univs = [];
-    const add = (u) => { if (/^[a-zA-Z_][\w'\u2080-\u2089]*$/.test(u) && !['max', 'imax'].includes(u) && !univs.includes(u)) univs.push(u); };
+    const add = (u) => { if (/^[a-zA-Z_][\w'\u2080-\u2089]*$/.test(u) && !['max', 'imax', '_'].includes(u) && !univs.includes(u)) univs.push(u); };
     for (const m of t.matchAll(/(?<![\w'.])(?:Type|Sort)\s+(\([^()]*\)|[a-zA-Z_][\w'\u2080-\u2089]*)/g)) {
       (m[1].startsWith('(') ? m[1].slice(1, -1).split(/[\s+]+/) : [m[1]]).forEach(add);
     }
@@ -2257,6 +3017,39 @@
       while (t[i] === ' ') i++;
     }
     return isSignature(t) || (i > 0 && i >= t.length) ? `${head} ${t}` : `${head} : ${t}`;
+  }
+
+  /**
+   * A signature's binders and type with Lean's binder printing (`annotateBinders`), the types
+   * of names read from its own binders: `[∀ i, AddCommMonoid (s i)]` is
+   * `[(i : ι) → AddCommMonoid (s i)]` given `{s : ι → Type u_8}`.
+   */
+  function leanBinders(sig, known = null) {
+    const out = [];
+    const types = new Map();
+    const typeOfName = (nm) => types.get(nm) || (known && known(nm)) || null;
+    let t = sig.trim();
+    let i = 0;
+    while (i < t.length && '({[⦃'.includes(t[i])) {
+      const close = matchClose(t, i);
+      if (close === -1) return sig;
+      const g = t.slice(i + 1, close);
+      const c = topColon(g);
+      if (c === -1) {
+        out.push(t[i] === '[' ? `[${annotateText(g.trim(), typeOfName, true)}]` : t.slice(i, close + 1));
+      } else {
+        const names = g.slice(0, c).trim();
+        const ty = annotateText(g.slice(c + 1).trim(), typeOfName, t[i] === '[');
+        names.split(/\s+/).forEach(nm => types.set(nm, g.slice(c + 1).trim()));
+        out.push(`${t[i]}${names} : ${ty}${OPENERS[t[i]]}`);
+      }
+      i = close + 1;
+      while (t[i] === ' ') i++;
+    }
+    const rest = t.slice(i);
+    const colon = rest.match(/^:(?!=)\s*/);
+    const concl = colon ? `: ${annotateText(rest.slice(colon[0].length), typeOfName)}` : rest;
+    return [...out, concl].filter(Boolean).join(' ');
   }
 
   /** A signature or type as Lean prints the type of a term: `?x` for unsolved variables. */
@@ -2338,7 +3131,22 @@
    * `have hb := foo hx (c := M)` — given `sigOf(name)` for constants (PR declarations, Loogle).
    * Resolves to { typeSignature, note, from, conclusion, unresolved } or null.
    */
-  async function inferPending(pending, text, sigOf) {
+  async function inferPending(pending, text, sigOf, variableOf) {
+    if (pending.use) {
+      // An untyped binder: the domain of the function it is first applied to.
+      const typeOfName = async (n) => {
+        const segs = n.split('.');
+        const t = localType(segs[0], text) || (variableOf ? await variableOf(segs[0]) : null);
+        if (segs.length === 1 || !t) return t;
+        // `e.symm` for an equivalence `e : A ≃ B` is a function on `B`.
+        const e = tCore(parseTerm(t));
+        if (segs.length === 2 && segs[1] === 'symm' && e && e.k === 'bin' && /^≃/.test(e.op)) return showTerm(Object.assign({}, e, { l: e.r, r: e.l }));
+        return null;
+      };
+      const ft = await typeOfName(pending.use.fn);
+      const dom = ft ? await domainOf(ft, pending.use.k, typeOfName) : null;
+      return dom ? { typeSignature: `${pending.name} : ${dom}`, from: pending.use.fn, use: true } : null;
+    }
     const parts = appParts(pending.term);
     if (!parts) return null;
     let sig = /^[\w'\u0370-\u03FF\u2080-\u209C]+$/.test(parts.head) ? localType(parts.head, text) : null;
@@ -2629,7 +3437,10 @@
     const ends = [hi, ...seps.filter(x => x.s > offset).map(x => x.s).reverse()];
     for (const st of starts) {
       if (GAP_NAMES_AFTER.has(st.after)) return null;
-      if (GAP_NOT_TERM.test(text.slice(st.at, hi))) continue;
+      // A command or tactic (`lift x to ℕ`, `congr 1`) only where one can start; after ` : `
+      // or `:=`, `lift φ x` / `congr f x` are terms.
+      const tacticPos = (st.at === 0 && lo === 0) || [';', '<;>', 'by'].includes(st.after);
+      if (tacticPos && GAP_NOT_TERM.test(text.slice(st.at, hi))) continue;
       for (const en of ends) {
         let a = st.at, b = en;
         const lead = text.slice(a, b).match(GAP_LEAD);
@@ -2638,6 +3449,10 @@
         while (b > a && /\s/.test(text[b - 1])) b--;
         if (offset < a || offset >= b) continue;
         const src = text.slice(a, b);
+        // A structure field defined with arguments (`left_inv φ := …`, `{ toFun x := … }`):
+        // its name and binders, not a term.
+        const next = seps.find(x => x.s === en);
+        if (next && next.v === ':=' && (st.after === null || st.after === ',' || st.after === ';') && /^[\w'.\u0370-\u03FF\u2080-\u209C]+(?:\s+(?:[\w'\u0370-\u03FF\u2080-\u209C]+|[({⦃][^(){}⦃⦄]*[)}⦄]))+$/.test(src)) return null;
         const tree = parseTerm(src);
         if (!tree) continue;
         const path = pathTo(tree, offset - a);
@@ -2714,7 +3529,10 @@
     let lastCode = '';
     const starts = [];
     for (let j = s0; j <= e; j++) {
-      if (j > s0) text += /(^|[^\w'])by(?![\w'])/.test(lastCode) && !/[([{⟨]\s*by\b/.test(lastCode) ? ';' : ' ';
+      // A tactic block ends at the line break; so does a structure field (`map_add' x y := …`
+      // on its own line, in `{ … }` or after `where`).
+      const field = /^\s*[\w'.\u0370-\u03FF\u2080-\u209C]+(?:\s+[\w'\u0370-\u03FF\u2080-\u209C]+)*\s*:=/.test(clean[j]) && !/(?::=|[({[⟨,])\s*$/.test(lastCode);
+      if (j > s0) text += field || (/(^|[^\w'])by(?![\w'])/.test(lastCode) && !/[([{⟨]\s*by\b/.test(lastCode)) ? ';' : ' ';
       if (j === idx) lineStart = text.length;
       starts.push(text.length);
       text += clean[j];
@@ -2732,7 +3550,9 @@
     '≥': '«term_≥_»', '∧': '«term_∧_»', '∨': '«term_∨_»', '↔': '«term_↔_»', '∈': '«term_∈_»', '∉': '«term_∉_»',
     '⊆': '«term_⊆_»', '⊂': '«term_⊂_»', '∩': '«term_∩_»', '∪': '«term_∪_»', '\\': '«term_\\_»', '∣': '«term_∣_»',
     '∘': '«term_∘_»', '⊔': '«term_⊔_»', '⊓': '«term_⊓_»', '×': '«term_×_»', '×ˢ': '«term_×ˢ_»',
-    '×ℂ': 'Complex.«term_×ℂ_»', "⁻¹'": "Set.«term_⁻¹'_»", "''": 'Set.image', '<|': '«term_<|_»', '|>': '«term_|>_»'
+    '×ℂ': 'Complex.«term_×ℂ_»', "⁻¹'": "Set.«term_⁻¹'_»", "''": 'Set.image', '<|': '«term_<|_»', '|>': '«term_|>_»',
+    '∘ₛₗ': 'LinearMap.«term_∘ₛₗ_»', '∘ₗ': 'LinearMap.comp', '≪≫ₗ': 'LinearEquiv.trans',
+    '⊗[_]': 'TensorProduct.«term_⊗[_]_»', '⊗ₜ[_]': 'TensorProduct.«term_⊗ₜ[_]_»'
   };
   const PREFIX_DOCS = { '¬': '«term¬_»', '-': '«term-_»' };
   const POSTFIX_DOCS = { '⁻¹': '«term_⁻¹»', 'ᶜ': '«term_ᶜ»' };
@@ -2753,6 +3573,8 @@
       case 'bind':
         if (n.head === '∑') return 'BigOperators.bigsum';
         if (n.head === '∏') return 'BigOperators.bigprod';
+        if (n.head === '⨂[_]') return 'TensorProduct.«term⨂[_]_,_»';
+        if (n.head === '⨂ₜ[_]') return 'PiTensorProduct.«term⨂ₜ[_]_,_»';
         // `∀ x ∈ s, …` / `∃ ε > 0, …`: binder predicates have their own notation.
         if ((n.head === '∀' || n.head === '∃') && binderParts(n.binders).op && !/^[({[⦃]/.test(n.binders.trim())) {
           return n.head === '∀' ? 'Lean.«term∀__,_»' : 'Lean.«term∃__,_»';
@@ -2777,8 +3599,35 @@
    * A term as Lean prints it after elaboration: ascriptions are gone, and a local ascribed a
    * different type is coerced (`(n : ℝ)` with `n : ℕ` prints as `↑n`).
    */
-  function termDisplay(node, text) {
-    return showTerm(stripAscriptions(node, text || ''));
+  function termDisplay(node, text, coerced = null, binders = null) {
+    let n = coerced && coerced.size ? withCoercions(node, coerced) : node;
+    if (binders && binders.size) n = withBinderTypes(n, binders, node);
+    return showTerm(stripAscriptions(n, text || ''));
+  }
+
+  /** Binders whose types `termTypeOf` worked out, printed with them (`(i : ι) → …`). */
+  function withBinderTypes(n, binders, orig) {
+    if (!n || typeof n !== 'object') return n;
+    const info = binders.get(orig);
+    const kids = tChildren(n), origKids = tChildren(orig || {});
+    let m = tWithChildren(n, kids.map((c, i) => withBinderTypes(c, binders, origKids[i])));
+    if (info && m.k === 'bind') m = info.arrow ? { k: 'bind', head: 'Π', arrow: true, binders: info.binders, sep: '→', body: m.body } : Object.assign({}, m, { binders: info.binders });
+    return m;
+  }
+
+  /** `tprod R f` where `tprod R` is a bundled map: `(tprod R) f`, as Lean prints the coercion. */
+  function withCoercions(n, coerced) {
+    if (!n || typeof n !== 'object') return n;
+    let m = tWithChildren(n, tChildren(n).map(c => withCoercions(c, coerced)));
+    if (n.k === 'app' && coerced.has(n)) {
+      const k = coerced.get(n);
+      const named = m.args.filter(a => a.k === 'named').length;
+      const at = k + named;
+      if (at > 0 && at < m.args.length) {
+        m = Object.assign({}, m, { f: Object.assign({ k: 'app', f: m.f, args: m.args.slice(0, at) }, { coeFn: true }), args: m.args.slice(at) });
+      } else if (at === 0 && m.f.k === 'app') m = Object.assign({}, m, { f: Object.assign({}, m.f, { coeFn: true }) });
+    }
+    return m;
   }
 
   const NUMBER_TOWER = ['ℕ', 'ℤ', 'ℚ', 'ℝ', 'ℂ'];
@@ -2812,13 +3661,22 @@
     const srcOf = (n) => { const sp = tSpan(n); return sp ? src.slice(sp[0], sp[1]) : showTerm(n); };
     const lookup = async (name) => {
       if (!sigOf || --budget < 0) return null;
-      try { return (await sigOf(name)) || null; } catch (err) { return null; }
+      try { return universeParams((await sigOf(name)) || null); } catch (err) { return null; }
     };
 
+    // Is the hovered line (the end of `text`) in a `variable` command?
+    const commandStart = (text.match(/(?:^|\n)(\S[^\n]*)(?:\n(?:[ \t][^\n]*)?)*$/) || [])[1] || '';
+    const inVariableCommand = /^variable\b/.test(commandStart);
     // A local's current type; `undefined` when `name` isn't a local, null when it is one whose
     // type can't be told (untyped, or changed by a tactic we can't replay).
     const localSig = async (name) => {
       if (!LOCAL_NAME.test(name)) return undefined;
+      if (hint.variableOf && inVariableCommand && --budget >= 0) {
+        // Hovering in a `variable` command: Lean's view of the variables there (`Type u_8`).
+        let v = null;
+        try { v = await hint.variableOf(name); } catch (err) { v = null; }
+        if (v) return v;
+      }
       const info = localVariableInfo(name, text);
       if (!info) {
         // A file-level `variable` (`[hT : Fact (0 < T)]`), when the caller can read the file.
@@ -2830,10 +3688,16 @@
       let type = info.typeSignature && info.typeSignature.startsWith(prefix) ? info.typeSignature.slice(prefix.length) : null;
       if (info.inferNeeded) {
         let r = null;
-        try { r = await inferPending(info.inferNeeded, text, sigOf); } catch (err) { r = null; }
+        try { r = await inferPending(info.inferNeeded, text, sigOf, hint.variableOf); } catch (err) { r = null; }
         type = r && r.typeSignature.startsWith(prefix) ? r.typeSignature.slice(prefix.length) : null;
       }
       if (!type || type === '_') return null;
+      if (/\b(?:Type|Sort)\*/.test(type) && hint.variableOf && --budget >= 0) {
+        // A section variable read from the text (`{s : ι → Type*}`): Lean's universe names.
+        let v = null;
+        try { v = await hint.variableOf(name); } catch (err) { v = null; }
+        if (v && v.replace(/\b(Type|Sort) u_\d+\b/g, '$1*').replace(/\s+/g, ' ') === type.replace(/\s+/g, ' ')) type = v;
+      }
       if (info.replay) {
         let res = null;
         try { res = await replayChanges(info.replay.baseType || type, info.replay.changes, text, sigOf); } catch (err) { res = null; }
@@ -2861,7 +3725,8 @@
       const ns = r.rest.length ? 'Function' : typeHead(recvType, resolveVar);
       if (!ns) return null;
       const fsig = await lookup(`${ns}.${field}`);
-      return fsig ? residualSignature(fsig, [], {}, text, { receiver: { term: recvText, type: recvType, binders: r.lead } }) : null;
+      const instances = fsig && /RingHom(?:InvPair|CompTriple)/.test(fsig) ? await instancesIn() : null;
+      return fsig ? residualSignature(fsig, [], {}, text, { receiver: { term: recvText, type: recvType, binders: r.lead }, instances }) : null;
     };
     const fieldChain = async (sig, recvText, fields) => {
       for (const f of fields) {
@@ -2905,7 +3770,9 @@
           const fSig = await sigOfTerm(n.f);
           if (!fSig) return null;
           const { positional, named, argTypes } = await argsOf(n);
-          return residualSignature(fSig, positional, named, text, { argTypes });
+          const onCoerce = hint.coerced ? (k) => hint.coerced.set(n, k) : null;
+          const instances = /RingHom(?:InvPair|CompTriple)/.test(fSig) ? await instancesIn() : null;
+          return residualSignature(fSig, positional, named, text, { argTypes, valueTypes: await valueTypesOf(argTypes), onCoerce, instances });
         }
         case 'bin': {
           if (n.op === '<|' || n.op === '|>') {
@@ -2916,13 +3783,16 @@
           }
           if (PROP_OPS.has(n.op)) return 'Prop';
           if (n.op === '→') {
-            // The sort of a function type is its codomain's (`A → P : Prop` for a proposition `P`).
+            // A function type: `A → P : Prop` for a proposition `P`; else `Sort (imax u v)`.
             const r = await typeOf(n.r);
-            return r === 'Prop' || /^(Type|Sort)\b/.test(r || '') ? r : null;
+            if (r === 'Prop') return r;
+            return sortOf(parseTerm(r || '')) ? piSort(await typeOf(n.l), r) : null;
           }
-          if (n.op === '×') {
-            const l = await typeOf(n.l);
-            return /^(Type|Sort)\b/.test(l || '') ? l : null;
+          if (n.op === '×' || n.op === '⊕') {
+            // `α × β : Type (max u v)`, `α ⊕ β` too.
+            const [l, r] = [sortOf(parseTerm((await typeOf(n.l)) || '')), sortOf(parseTerm((await typeOf(n.r)) || ''))];
+            if (!l || !r || l.kind !== 'Type' || r.kind !== 'Type' || !l.level || !r.level) return null;
+            return sortText('Type', { k: 'app', f: { k: 'id', v: 'max' }, args: [l.level, r.level] });
           }
           if (n.op === "⁻¹'" || n.op === "''") {
             // Preimage `f ⁻¹' s : Set α`, image `f '' s : Set β`, for `f : α → β`.
@@ -2938,6 +3808,14 @@
           }
           if (n.op === '∘') {
             return residualSignature(COMP_SIG, [srcOf(n.l), srcOf(n.r)], {}, text, { argTypes: [await typeOf(n.l), await typeOf(n.r)] });
+          }
+          if (n.op === '∘ₛₗ' || n.op === '∘ₗ' || n.op === '≪≫ₗ') {
+            // `g ∘ₛₗ f` is `LinearMap.comp g f`, `e ≪≫ₗ e'` is `LinearEquiv.trans e e'`.
+            const fSig = await lookup(n.op === '≪≫ₗ' ? 'LinearEquiv.trans' : 'LinearMap.comp');
+            if (!fSig) return null;
+            const argTypes = [await typeOf(n.l), await typeOf(n.r)];
+            return residualSignature(fSig, [srcOf(n.l), srcOf(n.r)], {}, text,
+              { argTypes, valueTypes: await valueTypesOf(argTypes), instances: await instancesIn() });
           }
           if (n.op === '^' || n.op === '•') {
             const t = await typeOf(n.op === '•' ? n.r : n.l);
@@ -2964,7 +3842,19 @@
         case 'post': case 'abs': return typeOf(n.e);
         case 'norm': return 'ℝ';
         case 'bind': {
-          if (['∀', '∃', '∃!'].includes(n.head)) return 'Prop';
+          if (n.head === '∀' || n.head === 'Π') {
+            // A pi type: a proposition when its body is one (`∀ x, p x`), else a type
+            // (`∀ i, AddCommMonoid (s i) : Type (max u_1 u_8)`).
+            const body = await typeOf(n.body);
+            if (body === 'Prop') return 'Prop';
+            if (!sortOf(parseTerm(body || ''))) return body || n.arrow || n.head === 'Π' || !isPropType(showTerm(n.body)) ? null : 'Prop';
+            const bt = await binderTypeIn(n);
+            const sort = bt ? piSort(await typeOf(parseTerm(bt) || { k: 'raw', v: bt }), body) : null;
+            // Shown as Lean prints it: `(i : ι) → AddCommMonoid (s i)` (a type, so an arrow).
+            if (sort && hint.binders && !/[:(){}]/.test(n.binders)) hint.binders.set(n, { binders: `(${n.binders.trim()} : ${bt})`, arrow: sort !== 'Prop' });
+            return sort;
+          }
+          if (['∃', '∃!'].includes(n.head)) return 'Prop';
           if (n.head === 'fun' || n.head === 'λ') {
             // `fun (x : ℝ) (n : ℕ) => b : ℝ → ℕ → B`; untyped binders need the expected type.
             const groups = [...n.binders.matchAll(/\(\s*([^():]+?)\s*:\s*([^()]*(?:\([^()]*\)[^()]*)*)\)/g)];
@@ -2981,9 +3871,72 @@
         default: return null;
       }
     };
+    // The type of a binder's (single) variable: written (`(i : ι)`, `x : T`), or from its
+    // first use as an argument of a local function (`s i` with `s : ι → Type u_8`).
+    const binderTypeIn = async (n) => {
+      const b = n.binders.trim();
+      const typed = b.match(/^[({⦃]?\s*[^\s:(){}]+(?:\s+[^\s:(){}]+)*\s*:\s*([\s\S]+?)\s*[)}⦄]?$/);
+      if (typed) return typed[1];
+      const names = binderParts(b).names;
+      if (names.length !== 1) return null;
+      const x = names[0];
+      let found = null;
+      const visit = (m) => {
+        if (found || !m) return;
+        if (m.k === 'app' && tCore(m.f).k === 'id') {
+          const k = m.args.findIndex(a => tCore(a).k === 'id' && tCore(a).v === x);
+          if (k !== -1) { found = { f: tCore(m.f).v, k }; return; }
+        }
+        tChildren(m).forEach(visit);
+      };
+      visit(n.body);
+      if (!found || !LOCAL_NAME.test(found.f)) return null;
+      const ft = await localSig(found.f);
+      if (typeof ft !== 'string') return null;
+      let t = tCore(parseTerm(ft));
+      for (let k = 0; t && k <= found.k; k++) {
+        let dom = null;
+        if (t.k === 'bin' && t.op === '→') { dom = t.l; t = t.r; }
+        else if (t.k === 'bind' && (t.head === 'Π' || t.head === '∀')) {
+          const m = t.binders.match(/^\(\s*\S+\s*:\s*([\s\S]+)\)$/);
+          dom = m ? parseTerm(m[1]) : null;
+          t = t.body;
+        } else return null;
+        if (k === found.k) return dom ? showTerm(dom) : null;
+      }
+      return null;
+    };
     // Types of subterms keep their ascriptions (matching sees through them); only what is
     // shown at the end is printed the way Lean prints it.
     const typeOf = async (n) => displayType(await sigOfTerm(n), text, true);
+    // Instance arguments in scope (the declaration's own and the file's `variable`s), for
+    // out-params instance search would find.
+    let instancesP = null;
+    const instancesIn = () => (instancesP = instancesP || (async () => {
+      const own = [...(text.slice(0, Math.max(0, headerEnd(text))).matchAll(/\[(?:[^\[\]:]+:\s*)?([^\[\]]+)\]/g))].map(m => m[1].trim());
+      let file = [];
+      if (hint.instances) { try { file = (await hint.instances()) || []; } catch (err) { file = []; } }
+      return [...own, ...file];
+    })());
+    // Types of the locals named in arguments' types (`σ₁₂`, `s` in `f : Π i, s i →ₛₗ[σ₁₂] t i`),
+    // for the variables solved by them.
+    const valueTypes = new Map();
+    const valueTypesOf = async (argTypes) => {
+      const names = new Set();
+      for (const t of argTypes) {
+        (typeof t === 'string' ? t : '').replace(/(?<![\w'.])[^\s()[\]{}⟨⟩,:.→↦∀∃=<>≤≥+*•∘|]+/g, (m) => {
+          if (Object.prototype.hasOwnProperty.call(TYPE_SORTS, m)) valueTypes.set(m, TYPE_SORTS[m]); // `ℝ : Type`
+          else if (LOCAL_NAME.test(m)) names.add(m);
+          return m;
+        });
+      }
+      for (const nm of [...names].slice(0, 8)) {
+        if (valueTypes.has(nm)) continue;
+        const t = await localSig(nm);
+        valueTypes.set(nm, typeof t === 'string' && !isSignature(t) ? t : null);
+      }
+      return valueTypes;
+    };
     // Positional / named arguments of an application and the types used to solve variables.
     const argsOf = async (n) => {
       const positional = [];
@@ -3059,7 +4012,31 @@
     }
     const sig = await sigOfTerm(node);
     const shown = (await solvedByUse(node, sig)) || displayType(sig, text);
-    return (shown && shown.includes('?') && hint.expected && solvedByExpected(sig, hint.expected)) || shown;
+    const out = (shown && shown.includes('?') && hint.expected && solvedByExpected(sig, hint.expected)) || shown;
+    // Binders as Lean prints them, with the types of the locals around (`(i : ι) → s i`).
+    return out ? annotateTextAsync(out, async (n) => { const t = await localSig(n); return typeof t === 'string' ? t : null; }) : out;
+  }
+
+  /**
+   * `annotateText` with an asynchronous `typeOfName`: the names used in the text (and in
+   * their types) are looked up first.
+   */
+  async function annotateTextAsync(text, typeOfName) {
+    if (!/[∀Π⨂⨁]|\b(?:fun|λ)\b/.test(text || '')) return text;
+    const types = new Map();
+    let pending = new Set((text.match(/(?<![\w'.])[A-Za-z_\u0370-\u03FF\u1F00-\u1FFF][\w'\u0370-\u03FF\u1F00-\u1FFF\u2080-\u209C]*/g) || []));
+    for (let round = 0; round < 2 && pending.size; round++) {
+      const next = new Set();
+      for (const n of [...pending].slice(0, 16)) {
+        if (types.has(n) || USE_NOT_FN.has(n)) continue;
+        let t = null;
+        try { t = await typeOfName(n); } catch (err) { t = null; }
+        types.set(n, t);
+        if (t) (t.match(/(?<![\w'.])[A-Za-z_\u0370-\u03FF][\w'\u0370-\u03FF\u2080-\u209C]*/g) || []).forEach(x => { if (!types.has(x)) next.add(x); });
+      }
+      pending = next;
+    }
+    return annotateText(text, (n) => types.get(n) || null);
   }
 
   /** Apply anonymous projections `[1, 2, …]` to a type; null if a step isn't known. */
@@ -3180,6 +4157,10 @@
     residualSignature,
     displayType,
     leanSignature,
+    annotateText,
+    annotateTextAsync,
+    freeNamesInText,
+    declaredTypeBefore,
     termAtOffset,
     termTypeOf,
     termDisplay,

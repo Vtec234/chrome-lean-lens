@@ -509,6 +509,21 @@ async function lookupFileVariable(token, fileRef) {
   if (!bc || !fileRef || !fileRef.line) return null;
   const text = await getFileText(fileRef);
   if (!text) return null;
+  // As Lean elaborates it there: the latest `variable` of that name, `Type*` named `Type u_8`.
+  const scanner = self.LeanPRScanner;
+  const scoped = scanner && scanner.variablesAt ? scanner.variablesAt(text, fileRef.line) : [];
+  const scopedType = (n) => { for (let j = scoped.length - 1; j >= 0; j--) if (scoped[j].name === n) return scoped[j].type; return null; };
+  for (let k = scoped.length - 1; k >= 0; k--) {
+    if (scoped[k].name !== token) continue;
+    if (!scoped[k].type) return null; // the declaration's own untyped binder (`{ι}`) shadows it
+    const shown = bc.annotateText ? bc.annotateText(scoped[k].type, scopedType) : scoped[k].type;
+    const declaredAt = variablesAt(text, fileRef.line).filter(v => bc.findBinderType(token, v.text)).map(v => v.line).pop();
+    return {
+      name: token, kind: 'variable', source: 'local_var', declaredAt, rawType: scoped[k].type,
+      typeSignature: `${token} : ${shown}`,
+      docstring: declaredAt ? `Declared with \`variable\` at line ${declaredAt} of this file.` : 'Declared with `variable` in this file.'
+    };
+  }
   const vars = variablesAt(text, fileRef.line);
   // Later `variable` commands shadow earlier ones.
   for (let k = vars.length - 1; k >= 0; k--) {
@@ -1159,6 +1174,14 @@ const MESSAGE_HANDLERS = {
   FILE_VARIABLE: async (request) => {
     const v = await lookupFileVariable(request.name, request.fileRef);
     return v ? { type: v.rawType } : null;
+  },
+  // The instance arguments the file's `variable`s have at a line (for out-params Lean finds by
+  // instance search: `[RingHomInvPair σ₁₂ σ₂₁]` gives `(f i).symm : t i ≃ₛₗ[σ₂₁] s i`).
+  FILE_INSTANCES: async (request) => {
+    const text = request.fileRef && request.fileRef.line ? await getFileText(request.fileRef) : null;
+    const scanner = self.LeanPRScanner;
+    if (!text || !scanner || !scanner.variablesAt) return { instances: [] };
+    return { instances: scanner.variablesAt(text, request.fileRef.line).filter(v => v.bi === '[' && v.type).map(v => v.type) };
   },
   STRUCTURE_FIELD: async (request) => {
     const f = await structureField(request.type, request.index, request.rest);

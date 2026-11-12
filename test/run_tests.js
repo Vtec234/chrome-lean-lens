@@ -823,6 +823,7 @@ const sampleRequests = {
   CLEAR_CACHE: {},
   TEST_LOCAL_SERVER: { url: 'http://127.0.0.1:9' },
   FILE_VARIABLE: { name: 'hT', fileRef: null },
+  FILE_INSTANCES: { fileRef: null },
   NOTATION_DOC: { name: '«term_+_»' }
 };
 // Handlers run concurrently; the worker logs failures as "[Lean Lens] message handler failed: ACTION …".
@@ -1056,6 +1057,200 @@ console.log("19. Testing section variables in declaration signatures...");
     async (n) => (n === 'gAux' ? '(K : Type u_1) (L : Type u_2) [NormedField K] [Field L] [Algebra K L] : AlgebraNorm K L' : null)).then(t => assert.strictEqual(t, 'ℝ', 'applying an AlgebraNorm')));
 }
 console.log("   ✓ Section variables verified.\n");
+
+// 20. PR 45819 (semilinear PiTensorProduct): shadowed variables, out-param instances, universes,
+//     semilinear notation, binders printed as Lean prints them. Expected outputs are Lean's own
+//     hovers (lean-lsp) on a probe with the same `variable` layout.
+console.log("20. Testing semilinear maps, universes and Lean's binder printing (PR 45819)...");
+{
+  const src = [
+    'open Function PiTensorProduct TensorProduct',
+    'namespace LeanLensProbe',
+    'section Semiring',
+    'variable {ι ι₂ ι₃ : Type*}',
+    'variable {R S : Type*} [CommSemiring R] [CommSemiring S] {σ : R →+* S}',
+    'variable {R₁ R₂ : Type*}',
+    'variable {s : ι → Type*} [∀ i, AddCommMonoid (s i)] [∀ i, Module R (s i)]',
+    'variable {M : Type*} [AddCommMonoid M] [Module R M]',
+    'variable {E : Type*} [AddCommMonoid E] [Module S E]',
+    'variable {F : Type*} [AddCommMonoid F]',
+    'variable (R) (s)',
+    'variable {s}',
+    'def tp (f : Π i, s i) : ⨂[R] i, s i := tprod R f',
+    'variable {R}',
+    'theorem upd [DecidableEq ι] (f : Π i, s i) (i : ι) (m : s i) : update f i m = update f i m := rfl',
+    'theorem ri_symm (e : ι ≃ ι₂) (x : ⨂[R] i : ι₂, s (e.symm i)) :',
+    '    (reindex R s e).symm x = (reindex R s e).symm x := rfl',
+    'section map',
+    'variable {R₃ : Type*} [CommSemiring R₂] [CommSemiring R₃]',
+    '  {σ₁₂ : R →+* R₂} {σ₂₃ : R₂ →+* R₃} {σ₁₃ : R →+* R₃} [RingHomCompTriple σ₁₂ σ₂₃ σ₁₃]',
+    '  {σ₂₁ : R₂ →+* R} [RingHomInvPair σ₁₂ σ₂₁] [RingHomInvPair σ₂₁ σ₁₂]',
+    '  {s t t\' : ι → Type*} {N₃ : Type*}',
+    '  [∀ i, AddCommMonoid (s i)] [∀ i, Module R (s i)]',
+    '  [∀ i, AddCommMonoid (t i)] [∀ i, Module R₂ (t i)]',
+    '  [∀ i, AddCommMonoid (t\' i)] [∀ i, Module R₃ (t\' i)]',
+    '  [AddCommMonoid N₃] [Module R₃ N₃]',
+    '  (g : Π i, t i →ₛₗ[σ₂₃] t\' i) (f : Π i, s i →ₛₗ[σ₁₂] t i)',
+    'def mp : (Π i, s i) → (Π i, t i) := fun x i ↦ f i (x i)',
+    'theorem mp_apply (x : Π i, s i) (i : ι) : mp f x i = f i (x i) := rfl',
+    'theorem comp_apply\' (i : ι) (x : s i) : (g i ∘ₛₗ f i) x = g i (f i x) := rfl',
+    'def eqv (e : Π i, s i ≃ₛₗ[σ₁₂] t i) : (Π i, s i) → (Π i, t i) := fun x i ↦ e i (x i)',
+    'theorem upd2 [DecidableEq ι] (i : ι) (u : s i →ₛₗ[σ₁₂] t i) : update f i u = update f i u := rfl',
+    'variable (R s t) in',
+    'def mpm : (Π i, s i →ₛₗ[σ₁₂] t i) → (Π i, s i) → (Π i, t i) := fun f x i ↦ f i (x i)',
+    'end map',
+    'variable (R s) in',
+    'def ri (e : ι ≃ ι₂) : (⨂[R] i : ι, s i) ≃ₗ[R] ⨂[R] i : ι₂, s (e.symm i) := reindex R s e',
+    'variable {t : ι → Type*} [∀ i, AddCommMonoid (t i)] [∀ i, Module S (t i)]',
+    'def bb : ℕ → ℕ := fun t ↦ t + 1',
+    'def eq0 : ℕ ≃ ℕ where',
+    '  toFun n := n',
+    '  invFun t := t',
+    '  left_inv t := rfl',
+    '  right_inv t := rfl',
+    'theorem tt (f : Π i, t i) : f = f := rfl',
+    'end Semiring',
+    'end LeanLensProbe'
+  ].join('\n');
+  const sigs = new Map(prScanner.scanSource(src, 'Probe.lean').map(d => [d.name.replace(/^LeanLensProbe\./, ''), d.typeSignature]));
+  const I = (x, R = 'R') => `[(i : ι) → AddCommMonoid (${x} i)] [(i : ι) → Module ${R} (${x} i)]`;
+  const LEAN = {
+    // The redeclared `s` shadows the first: Lean still names the first's universe (`u_8`),
+    // and the first's instances don't come along.
+    tp: `LeanLensProbe.tp.{u_1, u_4, u_8} {ι : Type u_1} (R : Type u_4) [CommSemiring R] {s : ι → Type u_8} ${I('s')} (f : (i : ι) → s i) : ⨂[R] (i : ι), s i`,
+    upd: 'LeanLensProbe.upd.{u_1, u_8} {ι : Type u_1} {s : ι → Type u_8} [(i : ι) → AddCommMonoid (s i)] [DecidableEq ι] (f : (i : ι) → s i) (i : ι) (m : s i) : update f i m = update f i m',
+    ri_symm: `LeanLensProbe.ri_symm.{u_1, u_2, u_4, u_8} {ι : Type u_1} {ι₂ : Type u_2} {R : Type u_4} [CommSemiring R] {s : ι → Type u_8} ${I('s')} (e : ι ≃ ι₂) (x : ⨂[R] (i : ι₂), s (e.symm i)) : (reindex R s e).symm x = (reindex R s e).symm x`,
+    mp: `LeanLensProbe.mp.{u_1, u_4, u_7, u_13, u_14} {ι : Type u_1} {R : Type u_4} [CommSemiring R] {R₂ : Type u_7} [CommSemiring R₂] {σ₁₂ : R →+* R₂} {s : ι → Type u_13} {t : ι → Type u_14} ${I('s')} ${I('t', 'R₂')} (f : (i : ι) → s i →ₛₗ[σ₁₂] t i) : ((i : ι) → s i) → (i : ι) → t i`,
+    // A bundled map applied through the coercion prints `(f i) (x i)`.
+    mp_apply: `LeanLensProbe.mp_apply.{u_1, u_4, u_7, u_13, u_14} {ι : Type u_1} {R : Type u_4} [CommSemiring R] {R₂ : Type u_7} [CommSemiring R₂] {σ₁₂ : R →+* R₂} {s : ι → Type u_13} {t : ι → Type u_14} ${I('s')} ${I('t', 'R₂')} (f : (i : ι) → s i →ₛₗ[σ₁₂] t i) (x : (i : ι) → s i) (i : ι) : mp f x i = (f i) (x i)`,
+    // `∘ₛₗ` needs `RingHomCompTriple σ₁₂ σ₂₃ ?σ₁₃`: instance search takes `σ₁₃` and the instance.
+    "comp_apply'": `LeanLensProbe.comp_apply'.{u_1, u_4, u_7, u_12, u_13, u_14, u_15} {ι : Type u_1} {R : Type u_4} [CommSemiring R] {R₂ : Type u_7} {R₃ : Type u_12} [CommSemiring R₂] [CommSemiring R₃] {σ₁₂ : R →+* R₂} {σ₂₃ : R₂ →+* R₃} {σ₁₃ : R →+* R₃} [RingHomCompTriple σ₁₂ σ₂₃ σ₁₃] {s : ι → Type u_13} {t : ι → Type u_14} {t' : ι → Type u_15} ${I('s')} ${I('t', 'R₂')} ${I("t'", 'R₃')} (g : (i : ι) → t i →ₛₗ[σ₂₃] t' i) (f : (i : ι) → s i →ₛₗ[σ₁₂] t i) (i : ι) (x : s i) : (g i ∘ₛₗ f i) x = (g i) ((f i) x)`,
+    // `≃ₛₗ[σ₁₂]` needs `RingHomInvPair σ₁₂ ?σ₂₁`.
+    eqv: `LeanLensProbe.eqv.{u_1, u_4, u_7, u_13, u_14} {ι : Type u_1} {R : Type u_4} [CommSemiring R] {R₂ : Type u_7} [CommSemiring R₂] {σ₁₂ : R →+* R₂} {σ₂₁ : R₂ →+* R} [RingHomInvPair σ₁₂ σ₂₁] [RingHomInvPair σ₂₁ σ₁₂] {s : ι → Type u_13} {t : ι → Type u_14} ${I('s')} ${I('t', 'R₂')} (e : (i : ι) → s i ≃ₛₗ[σ₁₂] t i) : ((i : ι) → s i) → (i : ι) → t i`,
+    upd2: `LeanLensProbe.upd2.{u_1, u_4, u_7, u_13, u_14} {ι : Type u_1} {R : Type u_4} [CommSemiring R] {R₂ : Type u_7} [CommSemiring R₂] {σ₁₂ : R →+* R₂} {s : ι → Type u_13} {t : ι → Type u_14} ${I('s')} ${I('t', 'R₂')} (f : (i : ι) → s i →ₛₗ[σ₁₂] t i) [DecidableEq ι] (i : ι) (u : s i →ₛₗ[σ₁₂] t i) : update f i u = update f i u`,
+    mpm: `LeanLensProbe.mpm.{u_1, u_4, u_7, u_13, u_14} {ι : Type u_1} (R : Type u_4) [CommSemiring R] {R₂ : Type u_7} [CommSemiring R₂] {σ₁₂ : R →+* R₂} (s : ι → Type u_13) (t : ι → Type u_14) ${I('s')} ${I('t', 'R₂')} : ((i : ι) → s i →ₛₗ[σ₁₂] t i) → ((i : ι) → s i) → (i : ι) → t i`,
+    ri: `LeanLensProbe.ri.{u_1, u_2, u_4, u_8} {ι : Type u_1} {ι₂ : Type u_2} (R : Type u_4) [CommSemiring R] (s : ι → Type u_8) ${I('s')} (e : ι ≃ ι₂) : (⨂[R] (i : ι), s i) ≃ₗ[R] ⨂[R] (i : ι₂), s (e.symm i)`,
+    // Names bound in a body (`fun t ↦`, `invFun t :=`) aren't the section variable `t`.
+    bb: 'LeanLensProbe.bb : ℕ → ℕ',
+    eq0: 'LeanLensProbe.eq0 : ℕ ≃ ℕ',
+    tt: 'LeanLensProbe.tt.{u_1, u_12} {ι : Type u_1} {t : ι → Type u_12} [(i : ι) → AddCommMonoid (t i)] (f : (i : ι) → t i) : f = f'
+  };
+  for (const [name, want] of Object.entries(LEAN)) assert.strictEqual(sigs.get(name), want, `Lean's hover of ${name}`);
+  // Lean's universe names for the variables at a line (`s : ι → Type u_8`), shadowed ones included.
+  const at = (line, name) => prScanner.variablesAt(src, line).filter(v => v.name === name).pop();
+  assert.strictEqual(at(7, 's').type, 'ι → Type u_8');
+  assert.strictEqual(at(30, 's').type, 'ι → Type u_13', 'the redeclared `s` in section map');
+  assert.strictEqual(at(30, 'R₃').type, 'Type u_12');
+
+  // A dotted declaration's last segment doesn't take the key of a declaration with that name.
+  prScanner.reset();
+  const row = (t, n) => ({ textContent: t, classList: { contains: () => false }, getAttribute: () => null, closest: (sel) => (sel === '[data-line-number]' ? { getAttribute: () => String(n) } : null) });
+  prScanner.scanDiffLines({ querySelectorAll: (sel) => (sel === '.diff-text-inner' ? [row('theorem lift.tprod (f : Π i, s i) : lift φ (tprod R f) = φ f := rfl', 445)] : []) }, 'Basic.lean');
+  prScanner.addDeclarations([{ name: 'PiTensorProduct.tprod', declaredAs: 'tprod', shortName: 'tprod', kind: 'def', typeSignature: 'PiTensorProduct.tprod : X', signature: ': X', filePath: 'Basic.lean', source: 'project' }]);
+  assert.strictEqual(prScanner.declarations.get('tprod').name, 'PiTensorProduct.tprod', '`tprod` is the def, not `lift.tprod`');
+  prScanner.reset();
+
+  // Binder misreadings: `ext` alone on a line, the lemma `MultilinearMap.ext`, names inside a
+  // `fun` binder's type, a parenthesised term inside a hypothesis' type.
+  assert.strictEqual(bc.findUntypedBinder('simp', 'theorem foo : x = y := by\n  ext\n  simp [bar]'), null);
+  assert.strictEqual(bc.findUntypedBinder('reindex_tprod', 'theorem foo : x = y :=\n  MultilinearMap.ext <| reindex_tprod e'), null);
+  const funTyped = 'def foo : X :=\n  liftAddHom (fun p : R × Π i, s i ↦ σ p.1 • φ p.2)';
+  assert.strictEqual(bc.findUntypedBinder('R', funTyped), null);
+  assert.strictEqual(bc.findUntypedBinder('s', funTyped), null);
+  assert(bc.findUntypedBinder('p', funTyped), 'the `fun` binder itself');
+  assert.strictEqual(bc.findUntypedBinder('tprod', 'theorem ext {φ₁ φ₂ : M}\n    (H : φ₁.compMultilinearMap (tprod R) = φ₂.compMultilinearMap (tprod R)) : φ₁ = φ₂ := by'), null);
+  assert(bc.findUntypedBinder('i', 'def foo (f : X) : ⨂[R] i, s i := tprod R f'), '`⨂[R] i,` binds `i`');
+  // Names a body uses free (a definition takes the section variables among them).
+  const free = (t) => [...bc.freeNamesInText(t)];
+  assert(!free('fun t ↦ t + 1').includes('t'));
+  assert(!free('  invFun t := t\n  right_inv t := rfl').includes('t'));
+  assert(!free('(subsingletonEquiv (s := fun _ ↦ M) i₀).symm x').includes('s'));
+  assert(free('fun x i ↦ f i (x i)').includes('f') && !free('e.symm i').includes('symm'));
+
+  // Binder types from their use: `i` in `∀ i, AddCommMonoid (s i)` is `i : ι`.
+  const varText = 'variable {s : ι → Type*} [∀ i, AddCommMonoid (s i)]';
+  const iInfo = bc.localVariableInfo('i', varText);
+  assert(iInfo && iInfo.inferNeeded && iInfo.inferNeeded.use, 'an untyped `∀` binder waits on its use');
+  asyncChecks.push(bc.inferPending(iInfo.inferNeeded, varText, null, async (n) => (n === 's' ? 'ι → Type u_8' : null))
+    .then(r => assert.strictEqual(r.typeSignature, 'i : ι')));
+  const fUse = 'theorem foo (x : Π i, s i) : tprod R fun i ↦ f i (x i) = 0 := by';
+  asyncChecks.push(bc.inferPending(bc.localVariableInfo('i', fUse).inferNeeded, fUse, null,
+    async (n) => ({ f: 'Π i, s i →ₛₗ[σ₁₂] t i', s: 'ι → Type u_13' })[n] || null).then(r => assert.strictEqual(r.typeSignature, 'i : ι', '`f i` with `f : Π i, …`')));
+  const eUse = 'theorem foo (e : ι ≃ ι₂) : tprod R fun i ↦ f (e.symm i) = 0 := by';
+  asyncChecks.push(bc.inferPending(bc.localVariableInfo('i', eUse).inferNeeded, eUse, null, async () => null)
+    .then(r => assert.strictEqual(r.typeSignature, 'i : ι₂', '`e.symm i` with `e : ι ≃ ι₂`')));
+
+  // `:= .ofLinearMap …`: the declared type's namespace.
+  const before = 'noncomputable def congr (f : Π i, s i ≃ₛₗ[σ₁₂] t i) :\n    (⨂[R] i, s i) ≃ₛₗ[σ₁₂] ⨂[R₂] i, t i :=\n  ';
+  assert.strictEqual(bc.typeHead(bc.declaredTypeBefore(before), null), 'LinearEquiv');
+  // A structure field's name and arguments aren't a term.
+  const fieldLine = bc.joinStatement(['def lift : A ≃ₗ[S] B where', '  left_inv φ := by', '    simp'], 1);
+  assert.strictEqual(bc.termAtOffset(fieldLine.text, fieldLine.lineStart + 10), null, '`left_inv φ :=`');
+
+  // Gap hovers with Mathlib's signatures (universe parameters solved like other variables).
+  const SIGS = {
+    CommSemiring: '(R : Type u) : Type u',
+    DecidableEq: '(α : Sort u) : Sort (max 1 u)',
+    Module: '(R : Type u) (M : Type v) [Semiring R] [AddCommMonoid M] : Type (max u v)',
+    AddCommMonoid: '(M : Type u) : Type u',
+    PiTensorProduct: '{ι : Type u_1} (R : Type u_2) [CommSemiring R] (s : ι → Type u_3) [(i : ι) → AddCommMonoid (s i)] [(i : ι) → Module R (s i)] : Type (max (max u_1 u_2) u_3)',
+    'Function.update': '{α : Sort u} {β : α → Sort v} [DecidableEq α] (f : (a : α) → β a) (a\' : α) (v : β a\') (a : α) : β a',
+    'PiTensorProduct.tprod': '{ι : Type u_1} (R : Type u_2) [CommSemiring R] {s : ι → Type u_3} [(i : ι) → AddCommMonoid (s i)] [(i : ι) → Module R (s i)] : MultilinearMap R s (⨂[R] (i : ι), s i)',
+    'LinearEquiv.symm': '{R : Type u_1} {S : Type u_6} {M : Type u_8} {M₂ : Type u_10} [Semiring R] [Semiring S] [AddCommMonoid M] [AddCommMonoid M₂] {module_M : Module R M} {module_S_M₂ : Module S M₂} {σ : R →+* S} {σ\' : S →+* R} {re₁ : RingHomInvPair σ σ\'} {re₂ : RingHomInvPair σ\' σ} (e : M ≃ₛₗ[σ] M₂) : M₂ ≃ₛₗ[σ\'] M',
+    map: '{ι : Type u_1} {R : Type u_4} [CommSemiring R] {R₂ : Type u_7} [CommSemiring R₂] {σ₁₂ : R →+* R₂} {s : ι → Type u_13} {t : ι → Type u_14} [∀ i, AddCommMonoid (s i)] [∀ i, Module R (s i)] [∀ i, AddCommMonoid (t i)] [∀ i, Module R₂ (t i)] (f : Π i, s i →ₛₗ[σ₁₂] t i) : (⨂[R] i, s i) →ₛₗ[σ₁₂] ⨂[R₂] i, t i',
+    reindex: '{ι : Type u_1} {ι₂ : Type u_2} (R : Type u_4) [CommSemiring R] (s : ι → Type u_8) [∀ i, AddCommMonoid (s i)] [∀ i, Module R (s i)] (e : ι ≃ ι₂) : (⨂[R] i : ι, s i) ≃ₗ[R] ⨂[R] i : ι₂, s (e.symm i)'
+  };
+  SIGS.update = SIGS['Function.update']; // `open Function`
+  SIGS.tprod = SIGS['PiTensorProduct.tprod'];
+  const VARS = { 'ι': 'Type u_1', 'ι₂': 'Type u_2', R: 'Type u_4', 'R₂': 'Type u_7', s: 'ι → Type u_8', M: 'Type u_9', 'σ₁₂': 'R →+* R₂', t: 'ι → Type u_14',
+    f: 'Π i, s i →ₛₗ[σ₁₂] t i', e: 'ι ≃ ι₂' };
+  const gap2 = async (code, marker, vars = VARS) => {
+    const lines = code.split('\n');
+    const line = lines[lines.length - 1];
+    const off = line.indexOf(marker.replace('|', '')) + marker.indexOf('|');
+    const j = bc.joinStatement(lines, lines.length - 1);
+    const hit = bc.termAtOffset(j.text, j.lineStart + off);
+    if (!hit) return null;
+    const coerced = new Map(), binders = new Map();
+    const type = await bc.termTypeOf(hit.node, hit.src, code, async (n) => SIGS[n] || null,
+      { parent: hit.parent, path: hit.path, expected: hit.expected, variableOf: async (n) => vars[n] || null, coerced, binders });
+    return type ? `${bc.termDisplay(hit.node, code, coerced, binders)} : ${type}` : null;
+  };
+  const T = (body) => `theorem probe : True := by\n  have := ${body}`;
+  const gapCases = [
+    // Lean: `CommSemiring R : Type u_4`, `DecidableEq ι : Type u_1`, `Module R M : Type (max u_4 u_9)`.
+    ['variable {R S : Type*} [CommSemiring R] [CommSemiring S]', 'CommSemiring| R', 'CommSemiring R : Type u_4'],
+    [T('DecidableEq ι'), 'DecidableEq| ι', 'DecidableEq ι : Type u_1'],
+    [T('Module R M'), 'Module| R', 'Module R M : Type (max u_4 u_9)'],
+    // Lean keeps the shape of a constant's level: `Type (max (max u_1 u_4) u_8)`.
+    [T('PiTensorProduct R s'), 'PiTensorProduct| R', 'PiTensorProduct R s : Type (max (max u_1 u_4) u_8)'],
+    // A pi type into types is a type: `Type (max u_1 u_8)`, printed `(i : ι) → …`.
+    ['variable {s : ι → Type*} [∀ i, AddCommMonoid (s i)]', '|∀ i', '(i : ι) → AddCommMonoid (s i) : Type (max u_1 u_8)'],
+    [T('update x i m'), 'update| x', 'update x i m : (a : ι) → s a', Object.assign({}, VARS, { x: 'Π i, s i', i: 'ι', m: 's i' })],
+    // `?β a` against `s a →ₛₗ[σ₁₂] t a` (a higher-order pattern).
+    [T('update f i u'), 'update| f', 'update f i u : (a : ι) → s a →ₛₗ[σ₁₂] t a', Object.assign({}, VARS, { i: 'ι', u: 's i →ₛₗ[σ₁₂] t i' })],
+    // Semilinear notation unifies (`σ₁₂ : R →+* R₂` fixes `R`, `R₂`); `⨂` binders get their types.
+    [T('map f'), 'map| f', 'map f : (⨂[R] (i : ι), s i) →ₛₗ[σ₁₂] ⨂[R₂] (i : ι), t i'],
+    // `≃ₗ[R]` is `≃ₛₗ[RingHom.id R]`, whose inverse pair is the identity again.
+    [T('(reindex R s e).symm'), 's e)|.symm', '(reindex R s e).symm : (⨂[R] (i : ι₂), s (e.symm i)) ≃ₗ[R] ⨂[R] (i : ι), s i'],
+    // A bundled map applied to a point: `(tprod R) x`, typed from the point.
+    [T('tprod R x'), 'tprod| R', '(tprod R) x : ⨂[R] (i : ι), s i', Object.assign({}, VARS, { x: 'Π i, s i' })]
+  ];
+  for (const [code, marker, want, vars] of gapCases) {
+    asyncChecks.push(gap2(code, marker, vars).then(got => assert.strictEqual(got, want, `gap hover at ${marker}`)));
+  }
+  // Out-params found by instance search, from the instances in scope.
+  const symm = bc.residualSignature(SIGS['LinearEquiv.symm'], [], {}, '', { receiver: { term: '(e i)', type: 's i ≃ₛₗ[σ₁₂] t i', binders: [] },
+    instances: ['RingHomInvPair σ₁₂ σ₂₁', 'RingHomInvPair σ₂₁ σ₁₂'] });
+  assert.strictEqual(bc.displayType(symm, ''), 't i ≃ₛₗ[σ₂₁] s i', '`(e i).symm` finds `σ₂₁` from `[RingHomInvPair σ₁₂ σ₂₁]`');
+  // Levels as Lean prints them.
+  const sort = (t) => bc.displayType(t, '');
+  assert.strictEqual(sort('Sort (max 1 (u_1 + 1))'), 'Type u_1');
+  assert.strictEqual(sort('Type (max u_4 (max u_1 u_8))'), 'Type (max u_4 u_1 u_8)', 'right-nested `max` prints flat');
+  assert.strictEqual(sort('Type (max (max u_1 u_4) u_8)'), 'Type (max (max u_1 u_4) u_8)', 'left-nested stays');
+  assert.strictEqual(sort('Sort 0'), 'Prop');
+}
+console.log("   ✓ PR 45819 cases verified.\n");
 
 Promise.all(asyncChecks).then(() => {
   console.log("   ✓ Rewrite replay verified.\n");
