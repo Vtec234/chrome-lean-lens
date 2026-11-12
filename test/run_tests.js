@@ -822,7 +822,8 @@ const sampleRequests = {
   SET_SETTINGS: { settings: { hoverDelay: 300 } },
   CLEAR_CACHE: {},
   TEST_LOCAL_SERVER: { url: 'http://127.0.0.1:9' },
-  FILE_VARIABLE: { name: 'hT', fileRef: null }
+  FILE_VARIABLE: { name: 'hT', fileRef: null },
+  NOTATION_DOC: { name: '«term_+_»' }
 };
 // Handlers run concurrently; the worker logs failures as "[Lean Lens] message handler failed: ACTION …".
 const realWarn = console.warn;
@@ -956,6 +957,31 @@ console.log("18. Testing gap hovers (terms and their types)...");
   assert.strictEqual(fooLe.typeSignature, 'foo_le {x : ℝ} (hx : 0 ≤ x) : x ≤ x + 1', 'PR declaration printed like Lean');
   assert.strictEqual(fooLe.signature, '{x : ℝ} (hx : 0 ≤ x) : x ≤ x + 1');
   prScanner.reset();
+
+  // Under a term, Lean's hover shows its notation's docstring: these names have it (on Loogle).
+  const docOf = (t, o) => { const h = bc.termAtOffset(t, o); return h && bc.notationDocName(h); };
+  assert.strictEqual(docOf('x + 1 = 2', 2), '«term_+_»');
+  assert.strictEqual(docOf('x + 1 = 2', 6), '«term_=_»');
+  assert.strictEqual(docOf('(x + 1) * 2', 0), 'Lean.Parser.Term.paren', 'on the parentheses: their docs');
+  assert.strictEqual(docOf('(x + 1) * 2', 3), '«term_+_»', 'inside them: the operator');
+  assert.strictEqual(docOf('(n : ℝ) + 1', 0), 'Lean.Parser.Term.typeAscription');
+  assert.strictEqual(docOf('(abs_le.mp h).2', 13), 'Lean.Parser.Term.proj');
+  assert.strictEqual(docOf('∀ x ∈ s, 0 ≤ x', 0), 'Lean.«term∀__,_»', 'binder predicates have their own notation');
+  assert.strictEqual(docOf('∀ x, 0 ≤ x', 0), null, 'a plain `∀` has none');
+  assert.strictEqual(docOf('∑ i ∈ s, f i', 0), 'BigOperators.bigsum');
+  assert.strictEqual(docOf("t ⁻¹' s", 2), "Set.«term_⁻¹'_»");
+  assert.strictEqual(docOf('f x y', 1), null, 'applications have no docstring');
+  assert.strictEqual(docOf('¬p', 0), '«term¬_»');
+  // Joined lines know where they start (to shade a term on each of its lines).
+  const multi = bc.joinStatement(['  exact foo a', '    (bar b) c'], 1);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify([multi.from, multi.starts])), [0, [0, 14]], 'line starts in the joined text (one character joins lines)');
+
+  // Docstrings: code spans are kept as code (`a * b` isn't emphasis), indented bullets are lists.
+  const md = tooltipView.renderMarkdown('`a * b` computes the product of `a` and `b`.\n\nConventions for notations in identifiers:\n\n * The recommended spelling of `*` in identifiers is `mul`.');
+  assert(md.includes('<code class="verso-inline-code">a * b</code>') && !md.includes('<em>'), `inline code isn't emphasis: ${md}`);
+  assert(md.includes('<ul><li>The recommended spelling of <code class="verso-inline-code">*</code>'), `indented bullets are a list: ${md}`);
+  const fenced = tooltipView.renderMarkdown('```lean\nexample : a < b := h\n```');
+  assert(fenced.includes('a &lt; b') && !fenced.includes('&amp;lt;'), `code blocks are escaped once: ${fenced}`);
 }
 console.log("   ✓ Gap hovers verified.\n");
 

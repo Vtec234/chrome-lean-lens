@@ -539,7 +539,10 @@
     if (d && d.lines) {
       const lines = d.lines.slice();
       lines[d.idx] = code;
-      result = joinStatement(lines, d.idx);
+      const j = joinStatement(lines, d.idx);
+      // Each joined line: its cell (null for the hovered one), where it starts, its length.
+      const parts = j.starts.map((start, k) => ({ cell: j.from + k === d.idx ? null : d.cells[j.from + k], start, len: lines[j.from + k].length }));
+      result = { text: j.text, lineStart: j.lineStart, parts };
     } else if (d) {
       const from = Math.max(0, d.idx - 15);
       const to = Math.min(d.els.length - 1, d.idx + 15);
@@ -602,13 +605,14 @@
       const out = [];
       for (let r = next(row); r && out.length < span; r = next(r)) {
         const c = cellsOf(r)[col];
-        if (c && rowIsDeletion(r, c) === onDeletion) out.push(cellCodeText(c));
+        if (c && rowIsDeletion(r, c) === onDeletion) out.push(c);
       }
       return out;
     };
     const before = take(r => r.previousElementSibling).reverse();
     const after = take(r => r.nextElementSibling);
-    return { lines: [...before, cellCodeText(cell), ...after], idx: before.length };
+    const cells = [...before, cell, ...after];
+    return { lines: cells.map(cellCodeText), cells, idx: before.length };
   }
 
   function rowLineEls(el) {
@@ -2632,9 +2636,12 @@
         const sepAfter = seps.find(x => x.s === en);
         const ascribed = st.at === lo && sepAfter && sepAfter.v === ':' && lo > 0 && text[lo - 1] === '(' && path.length === 1
           ? text.slice(sepAfter.e, hi).trim() : null;
+        // On the parentheses of `(x + 1)` Lean describes the parentheses (the type is the same).
+        const rel = offset - a;
+        const onParens = Boolean(node.pspan && node.span) && (rel < node.span[0] || rel >= node.span[1]);
         return {
           node, parent: path[1] || (ascribed ? { k: 'asc', e: node, ty: parseTerm(ascribed) || { k: 'raw', v: ascribed } } : null),
-          path, expected, src, start: a + sp[0], end: a + sp[1], text: showTerm(stripAscriptions(node))
+          path, expected, onParens, src, start: a + sp[0], end: a + sp[1], text: showTerm(stripAscriptions(node))
         };
       }
     }
@@ -2675,7 +2682,7 @@
       depthAt.set(i, Math.max(0, (cont ? depthAt.get(prev) : 0) + net(i)));
       prev = i;
     }
-    if (!startOf.has(idx)) return { text: clean[idx] || '', lineStart: 0 };
+    if (!startOf.has(idx)) return { text: clean[idx] || '', lineStart: 0, from: idx, starts: [0] };
     const s0 = startOf.get(idx);
     let e = idx;
     for (let j = idx + 1; j <= to; j++) {
@@ -2686,13 +2693,54 @@
     let text = '';
     let lineStart = 0;
     let lastCode = '';
+    const starts = [];
     for (let j = s0; j <= e; j++) {
       if (j > s0) text += /(^|[^\w'])by(?![\w'])/.test(lastCode) && !/[([{⟨]\s*by\b/.test(lastCode) ? ';' : ' ';
       if (j === idx) lineStart = text.length;
+      starts.push(text.length);
       text += clean[j];
       if (!blank(j)) lastCode = clean[j];
     }
-    return { text, lineStart };
+    // `starts[k]`: where line `from + k` begins in `text` (for marking a term on each line).
+    return { text, lineStart, from: s0, starts };
+  }
+
+  // The declaration whose docstring Lean's hover shows under a term of each notation: the
+  // notation's own syntax (`«term_+_»`), or what it stands for when that has the docs.
+  const INFIX_DOCS = {
+    '+': '«term_+_»', '-': '«term_-_»', '*': '«term_*_»', '/': '«term_/_»', '%': '«term_%_»', '^': '«term_^_»',
+    '•': '«term_•_»', '=': '«term_=_»', '≠': '«term_≠_»', '<': '«term_<_»', '>': '«term_>_»', '≤': '«term_≤_»',
+    '≥': '«term_≥_»', '∧': '«term_∧_»', '∨': '«term_∨_»', '↔': '«term_↔_»', '∈': '«term_∈_»', '∉': '«term_∉_»',
+    '⊆': '«term_⊆_»', '⊂': '«term_⊂_»', '∩': '«term_∩_»', '∪': '«term_∪_»', '\\': '«term_\\_»', '∣': '«term_∣_»',
+    '∘': '«term_∘_»', '⊔': '«term_⊔_»', '⊓': '«term_⊓_»', '×': '«term_×_»', '×ˢ': '«term_×ˢ_»',
+    '×ℂ': 'Complex.«term_×ℂ_»', "⁻¹'": "Set.«term_⁻¹'_»", "''": 'Set.image', '<|': '«term_<|_»', '|>': '«term_|>_»'
+  };
+  const PREFIX_DOCS = { '¬': '«term¬_»', '-': '«term-_»' };
+  const POSTFIX_DOCS = { '⁻¹': '«term_⁻¹»', 'ᶜ': '«term_ᶜ»' };
+
+  /** Name of the declaration whose docstring Lean shows for a hovered term (a `termAtOffset` hit), or null. */
+  function notationDocName(hit) {
+    const n = hit && hit.node;
+    if (!n) return null;
+    if (hit.onParens) return 'Lean.Parser.Term.paren';
+    switch (n.k) {
+      case 'bin': return INFIX_DOCS[n.op] || null;
+      case 'pre': return PREFIX_DOCS[n.op] || null;
+      case 'post': return POSTFIX_DOCS[n.op] || null;
+      case 'abs': return 'abs';
+      case 'norm': return '«term‖_‖»';
+      case 'proj': return 'Lean.Parser.Term.proj';
+      case 'asc': return 'Lean.Parser.Term.typeAscription';
+      case 'bind':
+        if (n.head === '∑') return 'BigOperators.bigsum';
+        if (n.head === '∏') return 'BigOperators.bigprod';
+        // `∀ x ∈ s, …` / `∃ ε > 0, …`: binder predicates have their own notation.
+        if ((n.head === '∀' || n.head === '∃') && binderParts(n.binders).op && !/^[({[⦃]/.test(n.binders.trim())) {
+          return n.head === '∀' ? 'Lean.«term∀__,_»' : 'Lean.«term∃__,_»';
+        }
+        return null;
+      default: return null;
+    }
   }
 
   const PROP_OPS = new Set(['=', '≠', '<', '>', '≤', '≥', '∈', '∉', '⊆', '⊂', '⊇', '⊃', '∣', '↔', '∧', '∨']);
@@ -3116,6 +3164,7 @@
     termAtOffset,
     termTypeOf,
     termDisplay,
+    notationDocName,
     joinStatement,
     statementAround,
     receiverResultType,

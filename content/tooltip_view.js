@@ -135,11 +135,26 @@
     }
 
     /**
-     * Show definition in tooltip anchored at boundingRect.
+     * Shade the code a hover is about, like the editor's hover highlight in Lean's VS Code
+     * extension, with the CSS Custom Highlight API (no extra elements; follows scrolling).
      */
-    show(data, boundingRect) {
+    setShade(ranges) {
+      try {
+        if (typeof CSS === 'undefined' || !CSS.highlights || typeof Highlight === 'undefined') return;
+        if (ranges && ranges.length) CSS.highlights.set('lean-lens-hover', new Highlight(...ranges));
+        else CSS.highlights.delete('lean-lens-hover');
+      } catch (err) {
+        // Not supported here: the tooltip alone still works.
+      }
+    }
+
+    /**
+     * Show definition in tooltip anchored at boundingRect, shading `shade` (ranges) in the code.
+     */
+    show(data, boundingRect, shade) {
       this.clearHideTimer();
       this.currentData = data;
+      this.setShade(shade);
 
       const titleEl = this.container.querySelector('#verso-title');
       const kindEl = this.container.querySelector('#verso-kind');
@@ -238,8 +253,9 @@
     /**
      * Show a lightweight loading indicator at the hovered token.
      */
-    showLoading(token, boundingRect) {
+    showLoading(token, boundingRect, shade) {
       this.clearHideTimer();
+      this.setShade(shade);
       const titleEl = this.container.querySelector('#verso-title');
       const kindEl = this.container.querySelector('#verso-kind');
       const sigEl = this.container.querySelector('#verso-signature');
@@ -342,6 +358,7 @@
     hide(force = false) {
       if (this.isPinned && !force) return;
       this.clearHideTimer();
+      this.setShade(null);
       this.isPinned = false;
       const pinBtn = this.container.querySelector('#verso-pin-btn');
       pinBtn?.classList.remove('verso-btn-active');
@@ -421,43 +438,37 @@
     }
 
     /**
-     * Markdown renderer for docstrings.
+     * Markdown renderer for docstrings. Code (fenced blocks, inline spans) is set aside first,
+     * so `a * b` is not emphasis; lists (also indented, as in Lean's notation docs) come before
+     * emphasis, so `* item` is not either.
      */
     renderMarkdown(text) {
       if (!text) return '';
-      // Escape basic HTML
-      let html = text
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+      const esc = (str) => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const kept = [];
+      const keep = (html) => `\u0000${kept.push(html) - 1}\u0000`;
+      let src = text.replace(/```(?:lean)?[ \t]*\n?([\s\S]*?)```/g,
+        (m, code) => `\n\n${keep(`<pre class="verso-code-block">${this.highlightLean(code.replace(/\s+$/, ''))}</pre>`)}\n\n`);
+      src = src.replace(/`([^`\n]+)`/g, (m, code) => keep(`<code class="verso-inline-code">${esc(code)}</code>`));
+      let html = esc(src);
 
-      // Fenced code blocks ```lean ... ```
-      html = html.replace(/```(?:lean)?\s*([\s\S]*?)```/g, (match, p1) => {
-        return `<pre class="verso-code-block">${this.highlightLean(p1.trim())}</pre>`;
-      });
+      // Bullet lists (`* item`, `- item`, indented or not), each list its own block.
+      html = html.replace(/^[ \t]*[*-][ \t]+(.+)$/gm, '<li>$1</li>');
+      html = html.replace(/(?:<li>.*<\/li>\n?)+/g, (m) => `\n\n<ul>${m.replace(/\n/g, '')}</ul>\n\n`);
 
-      // Inline code `...`
-      html = html.replace(/`([^`]+)`/g, '<code class="verso-inline-code">$1</code>');
-
-      // Bold **...**
-      html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-
-      // Italic *...*
-      html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-
-      // Bullet lists
-      html = html.replace(/^[*-]\s+(.+)$/gm, '<li>$1</li>');
-      html = html.replace(/(<li>[\s\S]*?<\/li>)/g, '<ul>$1</ul>');
+      // Bold **…**, italic *…*
+      html = html.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+      html = html.replace(/(^|[^\w*])\*(?=\S)([^*\n]*?\S)\*(?![\w*])/g, '$1<em>$2</em>');
 
       // Paragraphs
-      html = html.split('\n\n').map(p => {
+      html = html.split(/\n{2,}/).map(p => {
         p = p.trim();
         if (!p) return '';
-        if (p.startsWith('<pre') || p.startsWith('<ul') || p.startsWith('<li')) return p;
-        return `<p>${p.replace(/\n/g, '<br>')}</p>`;
+        const block = /^<ul/.test(p) || (/^\u0000\d+\u0000$/.test(p) && kept[Number(p.slice(1, -1))].startsWith('<pre'));
+        return block ? p : `<p>${p.replace(/\n/g, '<br>')}</p>`;
       }).join('');
 
-      return html;
+      return html.replace(/\u0000(\d+)\u0000/g, (m, i) => kept[Number(i)]);
     }
   }
 

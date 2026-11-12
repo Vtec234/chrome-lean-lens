@@ -403,6 +403,11 @@ body.dark-mode .verso-hover-container,
   animation: verso-pulse-target 2.5s ease-out forwards !important;
 }
 
+/* The code the open hover is about (like the editor's hover highlight). */
+::highlight(lean-lens-hover) {
+  background-color: rgba(56, 139, 253, 0.3);
+}
+
 /* Utilities */
 .verso-hidden {
   display: none !important;

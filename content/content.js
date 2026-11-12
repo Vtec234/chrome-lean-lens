@@ -450,12 +450,15 @@
    */
   async function triggerTermLookup(tokenInfo) {
     const ctx = window.VersoBinderContext;
-    const { token, boundingRect } = tokenInfo;
+    const { token, boundingRect, shade } = tokenInfo;
     if (!ctx || !ctx.termTypeOf) return;
     if (loadingTimer) clearTimeout(loadingTimer);
     loadingTimer = setTimeout(() => {
-      if (lastHoveredToken === token) window.VersoTooltipView.showLoading(tokenInfo.termText, boundingRect);
+      if (lastHoveredToken === token) window.VersoTooltipView.showLoading(tokenInfo.termText, boundingRect, shade);
     }, 180);
+    // Lean shows the notation's docstring under the type (`a + b` computes the sum …).
+    const docName = ctx.notationDocName ? ctx.notationDocName({ node: tokenInfo.termNode, onParens: tokenInfo.termOnParens }) : null;
+    const docRequest = docName ? sendMessageP({ action: 'NOTATION_DOC', name: docName }) : Promise.resolve(null);
     let type = null;
     try {
       const contextText = ctx.contextFromDom(tokenInfo.textNode) || '';
@@ -473,11 +476,14 @@
     if (!type) { window.VersoTooltipView.hide(false); return; }
     let shown = tokenInfo.termText;
     try { shown = ctx.termDisplay(tokenInfo.termNode, ctx.contextFromDom(tokenInfo.textNode) || '') || shown; } catch (err) { /* source text */ }
+    const docRes = await docRequest;
+    if (lastHoveredToken !== token) return;
     const clip = (t, n) => (t.length > n ? t.slice(0, n - 1) + '…' : t);
     window.VersoTooltipView.show({
       name: shown, kind: 'term', source: 'term',
-      typeSignature: `${clip(shown, 300)} : ${clip(type, 600)}`
-    }, boundingRect);
+      typeSignature: `${clip(shown, 300)} : ${clip(type, 600)}`,
+      docstring: (docRes && docRes.doc) || ''
+    }, boundingRect, shade);
   }
 
   /**
@@ -485,18 +491,18 @@
    */
   function triggerHoverLookup(tokenInfo) {
     if (tokenInfo.kind === 'term') { triggerTermLookup(tokenInfo); return; }
-    const { token, subToken, boundingRect } = tokenInfo;
+    const { token, subToken, boundingRect, shade } = tokenInfo;
     const lookup = lookupContext(tokenInfo);
     if (lookup.skip) return;
 
     // 0. Local variables shadow everything else: show their type.
     if (lookup.local) {
-      window.VersoTooltipView.show(lookup.local, boundingRect);
+      window.VersoTooltipView.show(lookup.local, boundingRect, shade);
       const needsMore = lookup.local.inferNeeded || lookup.local.structureNeeded || lookup.local.replay;
       if (needsMore) {
         const fileRef = window.VersoBinderContext && window.VersoBinderContext.fileRefFromDom(tokenInfo.textNode);
         refineLocal(lookup.local, lookup.contextText, fileRef).then((info) => {
-          if (lastHoveredToken === token && info) window.VersoTooltipView.show(info, boundingRect);
+          if (lastHoveredToken === token && info) window.VersoTooltipView.show(info, boundingRect, shade);
         }).catch(() => { /* keep the provisional tooltip */ });
       }
       return;
@@ -509,7 +515,7 @@
       const prDecl = pr.find(lookup.queryToken) ||
         (lookup.queryToken === token || !lookup.queryToken.includes('.') ? pr.find(token) || (subToken ? pr.find(subToken) : null) : null);
       if (prDecl) {
-        window.VersoTooltipView.show(prDecl, boundingRect);
+        window.VersoTooltipView.show(prDecl, boundingRect, shade);
         return;
       }
       // The PR's files are still being read: try again once they are.
@@ -523,7 +529,7 @@
     if (settings.enableBuiltins && window.VersoBuiltins) {
       const builtin = window.VersoBuiltins.get(token) || (subToken ? window.VersoBuiltins.get(subToken) : null);
       if (builtin) {
-        window.VersoTooltipView.show(builtin, boundingRect);
+        window.VersoTooltipView.show(builtin, boundingRect, shade);
         return;
       }
     }
@@ -544,7 +550,7 @@
     if (loadingTimer) clearTimeout(loadingTimer);
     loadingTimer = setTimeout(() => {
       if (lastHoveredToken === token) {
-        window.VersoTooltipView.showLoading(token, boundingRect);
+        window.VersoTooltipView.showLoading(token, boundingRect, shade);
       }
     }, 180);
 
@@ -567,7 +573,7 @@
           if (lastHoveredToken !== token) return;
 
           if (res && res.success && res.data) {
-            window.VersoTooltipView.show(res.data, boundingRect);
+            window.VersoTooltipView.show(res.data, boundingRect, shade);
           } else {
             // Not found; quietly hide tooltip without flashing
             window.VersoTooltipView.hide(false);

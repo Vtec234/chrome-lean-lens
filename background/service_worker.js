@@ -334,6 +334,29 @@ function getTacticDocs() {
   return tacticDocsPromise;
 }
 
+// Docstrings of notations (`«term_+_»`, `Lean.Parser.Term.paren`, `BigOperators.bigsum`, …),
+// shown under a term's type as Lean's hover does. Read from Loogle, kept for a week.
+const NOTATION_DOC_KEY = "notation_docs_v1";
+let notationDocsPromise = null; // Promise<{ [name]: { doc, timestamp } }>
+
+async function notationDoc(name) {
+  if (!name) return null;
+  if (!notationDocsPromise) {
+    notationDocsPromise = new Promise((res) => {
+      try { chrome.storage.local.get([NOTATION_DOC_KEY], (r) => res((r && r[NOTATION_DOC_KEY]) || {})); } catch (err) { res({}); }
+    });
+  }
+  const docs = await notationDocsPromise;
+  const entry = docs[name];
+  if (entry && Date.now() - entry.timestamp < TACTIC_CACHE_MS) return entry.doc;
+  const hits = await queryLoogleRaw(name);
+  if (hits === undefined) return entry ? entry.doc : null; // offline: keep what we had
+  const hit = hits && hits.find(h => h.name === name);
+  docs[name] = { doc: (hit && hit.doc) || '', timestamp: Date.now() };
+  try { chrome.storage.local.set({ [NOTATION_DOC_KEY]: docs }); } catch (err) { /* ignore */ }
+  return docs[name].doc;
+}
+
 async function lookupTactic(token) {
   if (!token || token.includes('.')) return null;
   const docs = await getTacticDocs();
@@ -1131,6 +1154,7 @@ const MESSAGE_HANDLERS = {
     return hit && hit.type ? { name: hit.name, type: hit.type } : null;
   },
   INFER_PATTERN: (request) => inferPattern(request),
+  NOTATION_DOC: async (request) => ({ doc: await notationDoc(request.name) }),
   // A file-level `variable` (`[hT : Fact (0 < T)]`) for typing terms around a hovered gap.
   FILE_VARIABLE: async (request) => {
     const v = await lookupFileVariable(request.name, request.fileRef);
@@ -1149,9 +1173,10 @@ const MESSAGE_HANDLERS = {
     rawQueryCache.clear();
     fileTextCache.clear();
     tacticDocsPromise = null;
+    notationDocsPromise = null;
     // Remove cached lookups only; keep the user's settings.
     chrome.storage.local.get(null, (all) => {
-      const keys = Object.keys(all || {}).filter(k => k.startsWith('cache_') || k === TACTIC_CACHE_KEY);
+      const keys = Object.keys(all || {}).filter(k => k.startsWith('cache_') || k === TACTIC_CACHE_KEY || k === NOTATION_DOC_KEY);
       chrome.storage.local.remove(keys, () => resolve({ success: true }));
     });
   }),

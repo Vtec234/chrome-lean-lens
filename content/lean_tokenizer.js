@@ -116,6 +116,13 @@
         return null;
       }
 
+      // On the `.` of `hy.2` / `h.trans`, the field after it is meant (Lean's `.2` hover).
+      let onDot = false;
+      if (lineText[idx] === '.' && idx + 1 < end && this.isIdentChar(lineText[idx + 1]) && idx > start) {
+        idx += 1;
+        onDot = true;
+      }
+
       // Extract local sub-token around idx
       let subStart = idx;
       while (subStart > start && this.isIdentChar(lineText[subStart - 1])) subStart--;
@@ -156,7 +163,8 @@
         isKeyword: LEAN_KEYWORDS.has(tokenUpToCursor) || LEAN_KEYWORDS.has(subToken),
         start: start,
         end: end,
-        subStart: subStart,
+        // The measured range includes the hovered `.` of a field.
+        subStart: onDot ? subStart - 1 : subStart,
         subEnd: subEnd
       };
     }
@@ -211,7 +219,12 @@
           // and ignore points that aren't over it, e.g. blank space after a line's end.
           const tokenRange = lineRes && this.rangeForOffsets(lineContainer, lineRes.subStart, lineRes.subEnd);
           if (lineRes && tokenRange && this.pointInRange(tokenRange, event.clientX, event.clientY)) {
+            // The code the hover is about: a qualified constant as a whole (`Set.uIcc_of_le`),
+            // otherwise the hovered segment (`pairwise` of `hl.sortedLE.pairwise`).
+            const shadeStart = /^[A-Z]/.test(lineRes.fullChain || '') ? lineRes.start : lineRes.subStart;
+            const shade = (shadeStart < lineRes.subStart && this.rangeForOffsets(lineContainer, shadeStart, lineRes.subEnd)) || tokenRange;
             return {
+              shade: [shade],
               token: lineRes.token,
               subToken: lineRes.subToken,
               chainUpToCursor: lineRes.chainUpToCursor,
@@ -262,13 +275,28 @@
       const stmt = (bc.statementAround && bc.statementAround(textNode, code)) || { text: code, lineStart: 0 };
       const hit = bc.termAtOffset(stmt.text, stmt.lineStart + at);
       if (!hit) return null;
-      // The term's part on this line (it may continue on others) anchors the tooltip.
-      const a = Math.max(0, hit.start - stmt.lineStart);
-      const b = Math.min(code.length, hit.end - stmt.lineStart);
-      const range = b > a ? this.rangeForOffsets(container, marker + a, marker + b) : null;
+      // The term on each line it spans (shaded); its part on this line anchors the tooltip.
+      const parts = stmt.parts || [{ cell: null, start: stmt.lineStart, len: code.length }];
+      const shade = [];
+      let range = null;
+      for (const p of parts) {
+        let lo = Math.max(hit.start, p.start);
+        let hi = Math.min(hit.end, p.start + p.len);
+        // Not the indentation of a continuation line.
+        while (lo < hi && /\s/.test(stmt.text[lo])) lo++;
+        while (hi > lo && /\s/.test(stmt.text[hi - 1])) hi--;
+        if (hi <= lo) continue;
+        const el = p.cell ? this.codeContainer(p.cell) : container;
+        const m = p.cell ? this.markerLength(el) : marker;
+        const r = el && this.rangeForOffsets(el, m + lo - p.start, m + hi - p.start);
+        if (!r) continue;
+        shade.push(r);
+        if (!p.cell) range = r;
+      }
       if (!range) return null;
       const rect = range.getBoundingClientRect();
       return {
+        shade,
         kind: 'term',
         token: `⟪term ${Math.round(rect.top)}:${hit.start}:${hit.end}⟫ ${hit.text}`,
         subToken: null,
@@ -281,11 +309,17 @@
         termParent: hit.parent,
         termPath: hit.path,
         termExpected: hit.expected,
+        termOnParens: hit.onParens,
         linePrefix: prefix,
         lineSuffix: code.slice(at + 1),
         boundingRect: rect,
         textNode: textNode
       };
+    }
+
+    /** The element holding a diff cell's code line (marker included, as `markerLength` expects). */
+    static codeContainer(cell) {
+      return cell.querySelector('.blob-code-inner, .react-code-text, [data-code-text], code') || cell;
     }
 
     /** Length of a rendered `+`/`-` diff marker at the start of a line container. */
@@ -354,6 +388,7 @@
         if (x !== undefined && !this.pointInRange(range, x, y)) return null;
         const rect = range.getBoundingClientRect();
         return {
+          shade: [range],
           token: res.token,
           subToken: res.subToken,
           chainUpToCursor: res.chainUpToCursor,
