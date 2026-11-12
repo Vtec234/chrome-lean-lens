@@ -172,6 +172,12 @@ body.dark-mode .verso-hover-container,
   border: 1px solid rgba(250, 204, 21, 0.3);
 }
 
+.verso-kind-term {
+  background: rgba(129, 140, 248, 0.15);
+  color: #818cf8;
+  border: 1px solid rgba(129, 140, 248, 0.3);
+}
+
 .verso-kind-variable {
   background: rgba(244, 114, 182, 0.15);
   color: #f472b6;

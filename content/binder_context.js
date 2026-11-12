@@ -490,12 +490,18 @@
   }
 
   /**
-   * Declaration text around the hovered DOM node, read from the diff.
-   * Skips deleted lines unless the hover itself is on a deleted line.
+   * The lines of the hovered DOM node's file in the diff, with the hovered line's index:
+   * { lines, idx } or null. Deleted lines are skipped unless the hover is on one.
    */
-  function contextFromDom(node) {
+  function domLines(node) {
+    const d = domLineEls(node);
+    return d ? { lines: d.els.map(d.text), idx: d.idx } : null;
+  }
+
+  /** Like `domLines`, with the line elements and a reader: { els, idx, text(el) } or null. */
+  function domLineEls(node) {
     const el = node && (node.nodeType === 1 ? node : node.parentElement);
-    if (!el || !el.closest) return '';
+    if (!el || !el.closest) return null;
     for (const sel of LINE_SELECTORS) {
       const lineEl = el.closest(sel);
       if (!lineEl) continue;
@@ -504,9 +510,45 @@
       const all = Array.from(fileEl.querySelectorAll(sel)).filter(l => l === lineEl || isDeletion(l) === onDeletion);
       const idx = all.indexOf(lineEl);
       if (idx === -1) continue;
-      return declarationContext(all.map(l => l.textContent || ''), idx);
+      return { els: all, idx, text: (l) => l.textContent || '' };
     }
-    return contextFromRows(el);
+    return rowLineEls(el);
+  }
+
+  /** Declaration text around the hovered DOM node, read from the diff. */
+  function contextFromDom(node) {
+    const d = domLines(node);
+    return d ? declarationContext(d.lines, d.idx) : '';
+  }
+
+  /**
+   * The statement around the hovered line (`joinStatement`), with `code` as the hovered
+   * line's text: { text, lineStart }.
+   */
+  const statementCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+  function statementAround(node, code) {
+    const el = node && (node.nodeType === 1 ? node : node.parentElement);
+    const key = el && el.closest ? el.closest(`${LINE_SELECTORS.join(', ')}, ${ROW_SEL}`) : null;
+    const hit = key && statementCache && statementCache.get(key);
+    if (hit && hit.code === code && Date.now() - hit.at < 2000) return hit.result;
+    // Only the lines near the hovered one matter: walk the neighbouring rows (cheap on every
+    // mouse move), else read the file's lines.
+    let d = null;
+    try { d = (el && nearbyRowLines(el, 15)) || domLineEls(node); } catch (err) { d = null; }
+    let result = { text: code, lineStart: 0 };
+    if (d && d.lines) {
+      const lines = d.lines.slice();
+      lines[d.idx] = code;
+      result = joinStatement(lines, d.idx);
+    } else if (d) {
+      const from = Math.max(0, d.idx - 15);
+      const to = Math.min(d.els.length - 1, d.idx + 15);
+      const lines = [];
+      for (let i = from; i <= to; i++) lines.push(i === d.idx ? code : d.text(d.els[i]));
+      result = joinStatement(lines, d.idx - from);
+    }
+    if (key && statementCache) statementCache.set(key, { code, at: Date.now(), result });
+    return result;
   }
 
   const ROW_SEL = 'tr, [role="row"]';
@@ -543,27 +585,54 @@
    * Works for GitHub's newer diff views, whose class names we don't hard-code.
    */
   function contextFromRows(el) {
+    const d = rowLineEls(el);
+    return d ? declarationContext(d.els.map(d.text), d.idx) : '';
+  }
+
+  /** Up to `span` lines of the same diff column (and side) before and after the hovered row. */
+  function nearbyRowLines(el, span) {
     const row = el.closest(ROW_SEL);
     const cell = el.closest(CELL_SEL);
-    if (!row || !cell) return '';
-    const table = row.closest('table, [role="grid"], [role="table"]') || row.parentElement;
-    if (!table) return '';
+    if (!row || !cell) return null;
     const cellsOf = (r) => Array.from(r.children).filter(c => c.matches(CELL_SEL));
     const col = cellsOf(row).indexOf(cell);
-    if (col === -1) return '';
+    if (col === -1) return null;
+    const onDeletion = rowIsDeletion(row, cell);
+    const take = (next) => {
+      const out = [];
+      for (let r = next(row); r && out.length < span; r = next(r)) {
+        const c = cellsOf(r)[col];
+        if (c && rowIsDeletion(r, c) === onDeletion) out.push(cellCodeText(c));
+      }
+      return out;
+    };
+    const before = take(r => r.previousElementSibling).reverse();
+    const after = take(r => r.nextElementSibling);
+    return { lines: [...before, cellCodeText(cell), ...after], idx: before.length };
+  }
+
+  function rowLineEls(el) {
+    const row = el.closest(ROW_SEL);
+    const cell = el.closest(CELL_SEL);
+    if (!row || !cell) return null;
+    const table = row.closest('table, [role="grid"], [role="table"]') || row.parentElement;
+    if (!table) return null;
+    const cellsOf = (r) => Array.from(r.children).filter(c => c.matches(CELL_SEL));
+    const col = cellsOf(row).indexOf(cell);
+    if (col === -1) return null;
     const onDeletion = rowIsDeletion(row, cell);
 
-    const lines = [];
+    const cells = [];
     let idx = -1;
     for (const r of table.querySelectorAll(ROW_SEL)) {
       if (r.closest('table, [role="grid"], [role="table"]') !== table && r !== row) continue;
       const c = cellsOf(r)[col];
       if (!c) continue;
       if (r !== row && rowIsDeletion(r, c) !== onDeletion) continue;
-      if (r === row) idx = lines.length;
-      lines.push(cellCodeText(c));
+      if (r === row) idx = cells.length;
+      cells.push(c);
     }
-    return idx === -1 ? '' : declarationContext(lines, idx);
+    return idx === -1 ? null : { els: cells, idx, text: cellCodeText };
   }
 
   // --- Local variables: show the type of a hovered binder ---
@@ -1344,23 +1413,25 @@
 
   const T_START = /[A-Za-z_Ͱ-ΟΡ΢Τ-κμ-Ͽἀ-῿℀-⅏\u{1D400}-\u{1D7FF}]/u;
   const T_CONT = /[A-Za-z0-9_'!?Ͱ-ΟΡ΢Τ-κμ-Ͽἀ-῿₀-ₜᵢ-ᵪ℀-⅏\u{1D400}-\u{1D7FF}]/u;
-  const T_OPS = ["∑'", "∏'", '[[', ']]', '×ˢ', '×ℂ', '⁻¹', ':=', '=>', '∃!', '<-', '↔', '→', '←', '∧', '∨', '¬', '≠', '≤', '≥',
+  const T_OPS = ["⁻¹'", "''", "∑'", "∏'", '[[', ']]', '×ˢ', '×ℂ', '⁻¹', ':=', '<|', '|>', '=>', '∃!', '<-', '↔', '→', '←', '∧', '∨', '¬', '≠', '≤', '≥',
     '∈', '∉', '⊆', '⊂', '⊇', '⊃', '∩', '∪', '⊓', '⊔', '•', '∘', '∣', '×', 'ᶜ', '↑', '⇑', '↦', '‖', '⟨', '⟩',
     '(', ')', '[', ']', '{', '}', ',', '|', '+', '-', '*', '/', '%', '^', '=', '<', '>', '\\', '∑', '∏', '∫',
     '∀', '∃', '⋃', '⋂', '⨆', '⨅', 'λ', 'Π', '·', ':', '∞', '⊤', '⊥', '∅'];
   // [precedence, associativity] as in Lean / Mathlib.
   const T_BIN = {
-    '↔': [20, 'n'], '→': [25, 'r'], '∨': [30, 'r'], '∧': [35, 'r'], '×': [35, 'r'],
+    '<|': [10, 'r'], '|>': [10, 'l'], '↔': [20, 'n'], '→': [25, 'r'], '≃': [25, 'r'], '↪': [25, 'r'], '∨': [30, 'r'], '∧': [35, 'r'], '×': [35, 'r'],
     '=': [50, 'n'], '≠': [50, 'n'], '<': [50, 'n'], '>': [50, 'n'], '≤': [50, 'n'], '≥': [50, 'n'],
     '∈': [50, 'n'], '∉': [50, 'n'], '⊆': [50, 'n'], '⊂': [50, 'n'], '⊇': [50, 'n'], '⊃': [50, 'n'], '∣': [50, 'n'],
     '∪': [65, 'l'], '+': [65, 'l'], '-': [65, 'l'], '⊔': [68, 'l'], '⊓': [69, 'l'],
     '∩': [70, 'l'], '*': [70, 'l'], '/': [70, 'l'], '%': [70, 'l'], '\\': [70, 'l'], '×ℂ': [72, 'l'],
-    '•': [73, 'r'], '^': [75, 'r'], '×ˢ': [82, 'r'], '∘': [90, 'r']
+    '•': [73, 'r'], '^': [75, 'r'], '▸': [75, 'r'], "''": [80, 'l'], "⁻¹'": [80, 'l'], '×ˢ': [82, 'r'], '∘': [90, 'r']
   };
   const T_BINDER_HEADS = new Set(['∀', '∃', '∃!', '∑', '∏', "∑'", "∏'", '⋃', '⋂', '⨆', '⨅', '∫', 'λ', 'Π']);
   // Precedence of a binder notation's body (Mathlib: `∑ x ∈ s, f x` takes `term:67`, `∫ … , r:60`).
   const T_BODY_PREC = { '∑': 67, '∏': 67, "∑'": 67, "∏'": 67, '∫': 60, '⋃': 60, '⋂': 60, '⨆': 60, '⨅': 60 };
   const T_STOP_WORDS = new Set(['at', 'with', 'from', 'by', 'using', 'then', 'else', 'in', 'do']);
+  // Syntax that isn't modelled: a term containing it doesn't parse (rather than misparse).
+  const T_UNMODELLED = new Set(['if', 'match', 'let', 'have', 'show', 'calc', 'return', 'suffices']);
   const T_OPENERS = ['(', '[', '{', '⟨', '[['];
   const T_CLOSERS = [')', ']', '}', '⟩', ']]'];
 
@@ -1385,6 +1456,11 @@
           if (chars[j] === '.' && j + 1 < chars.length && (T_START.test(chars[j + 1]) || /[0-9]/.test(chars[j + 1]))) { j += 2; continue; }
           break;
         }
+        toks.push({ k: 'id', v: chars.slice(i, j).join(''), s: offs[i], e: offs[j] });
+      } else if (c === '?' && i + 1 < chars.length && T_START.test(chars[i + 1])) {
+        // A hole / metavariable `?_`, `?x`.
+        j = i + 1;
+        while (j < chars.length && T_CONT.test(chars[j])) j++;
         toks.push({ k: 'id', v: chars.slice(i, j).join(''), s: offs[i], e: offs[j] });
       } else if (c === '.' && i + 1 < chars.length && (T_START.test(chars[i + 1]) || /[0-9]/.test(chars[i + 1]))) {
         j = i + 1;
@@ -1448,13 +1524,29 @@
     return { k: 'bind', head, binders, sep: sep.v, body: tExpr(st, T_BODY_PREC[head] || 0) };
   }
 
+  // Source spans: `span` is [start, end) of a node in the parsed text; a parenthesised term
+  // also has `pspan`, its span including the parentheses (hovering a bracket shows the term).
+  const tSpan = (n) => n.pspan || n.span;
+
   function tPrefix(st) {
+    const first = st.i;
+    const node = tPrefixBody(st);
+    const span = [st.toks[first].s, st.toks[st.i - 1].e];
+    return node.paren ? Object.assign(node, { pspan: span }) : Object.assign(node, { span });
+  }
+
+  function tPrefixBody(st) {
     const t = tNext(st);
     if (!t) throw new Error('eof');
     if (t.k === 'num') return { k: 'num', v: t.v };
     if (t.k === 'id') {
       if (t.v === 'fun') return tBinder(st, 'fun');
-      if (T_STOP_WORDS.has(t.v)) throw new Error('stop word');
+      if (t.v === 'by') {
+        // A tactic block inside a term (`⟨by simp, h⟩`, `(by positivity)`): opaque text.
+        const body = tRawUntil(st, [',']);
+        return { k: 'raw', v: body ? `by ${body}` : 'by', loose: true };
+      }
+      if (T_STOP_WORDS.has(t.v) || T_UNMODELLED.has(t.v)) throw new Error('stop word');
       return { k: 'id', v: t.v };
     }
     if (t.k === 'field') throw new Error('field');
@@ -1463,6 +1555,14 @@
       case '-': return { k: 'pre', op: '-', e: tExpr(st, 75) };
       case '↑': case '⇑': return { k: 'pre', op: t.v, e: tArg(st) };
       case '(': {
+        const t1 = tPeek(st), t2 = st.toks[st.i + 1];
+        if (t1 && t1.k === 'id' && tIs(t2, ':=')) {
+          // A named argument `(x := v)`.
+          st.i += 2;
+          const value = tExpr(st, 0);
+          tExpect(st, ')');
+          return { k: 'named', name: t1.v, value };
+        }
         const e = tExpr(st, 0);
         if (tIs(tPeek(st), ':')) { tNext(st); const ty = tExpr(st, 0); tExpect(st, ')'); return { k: 'asc', e, ty }; }
         tExpect(st, ')');
@@ -1495,8 +1595,8 @@
   function tPostfix(st, e) {
     for (;;) {
       const t = tPeek(st);
-      if (tIs(t, '⁻¹') || tIs(t, 'ᶜ')) { tNext(st); e = { k: 'post', op: t.v, e }; continue; }
-      if (t && t.k === 'field') { tNext(st); e = { k: 'proj', e, f: t.v }; continue; }
+      if (tIs(t, '⁻¹') || tIs(t, 'ᶜ')) { tNext(st); e = { k: 'post', op: t.v, e, span: [tSpan(e)[0], t.e] }; continue; }
+      if (t && t.k === 'field') { tNext(st); e = { k: 'proj', e, f: t.v, span: [tSpan(e)[0], t.e] }; continue; }
       return e;
     }
   }
@@ -1512,13 +1612,17 @@
         const [p, assoc] = T_BIN[t.v];
         if (p < minPrec) break;
         tNext(st);
-        left = { k: 'bin', op: t.v, l: left, r: tExpr(st, assoc === 'r' ? p : p + 1) };
+        const right = tExpr(st, assoc === 'r' ? p : p + 1);
+        left = { k: 'bin', op: t.v, l: left, r: right, span: [tSpan(left)[0], tSpan(right)[1]] };
         continue;
       }
       const applicable = ['id', 'app', 'proj'].includes(left.k) || left.paren || (left.k === 'pre' && (left.op === '↑' || left.op === '⇑'));
       if (minPrec <= 1024 && applicable && tStartsArg(t)) {
         const arg = tArg(st);
-        left = left.k === 'app' ? { k: 'app', f: left.f, args: left.args.concat([arg]) } : { k: 'app', f: left, args: [arg] };
+        const span = [tSpan(left)[0], tSpan(arg)[1]];
+        left = left.k === 'app' && !left.paren
+          ? { k: 'app', f: left.f, args: left.args.concat([arg]), span }
+          : { k: 'app', f: left, args: [arg], span };
         continue;
       }
       break;
@@ -1532,7 +1636,8 @@
       case 'pre': return n.op === '¬' ? 40 : n.op === '-' ? 75 : 2000;
       case 'post': return 1100;
       case 'app': return 1024;
-      case 'bind': return 0;
+      case 'bind': return T_BODY_PREC[n.head] || 0; // `∑ i ∈ s, f i ≤ c`: the body stops at `≤`
+      case 'raw': return n.loose ? 0 : 2000; // text we couldn't parse: parenthesise when nested
       default: return 2000;
     }
   }
@@ -1546,6 +1651,7 @@
       case 'abs': s = `|${showTerm(n.e)}|`; break;
       case 'norm': s = `‖${showTerm(n.e)}‖`; break;
       case 'tuple': s = `⟨${n.es.map(e => showTerm(e)).join(', ')}⟩`; break;
+      case 'named': s = `(${n.name} := ${showTerm(n.value)})`; break;
       case 'proj': s = `${showTerm(n.e, 1025)}.${n.f}`; break;
       case 'post': s = `${showTerm(n.e, 1025)}${n.op}`; break;
       case 'pre':
@@ -1582,6 +1688,7 @@
       case 'pre': case 'post': case 'abs': case 'norm': case 'proj': case 'asc': return [n.e];
       case 'tuple': return n.es;
       case 'bind': return [n.body];
+      case 'named': return [n.value];
       default: return [];
     }
   }
@@ -1592,6 +1699,7 @@
       case 'pre': case 'post': case 'abs': case 'norm': case 'proj': case 'asc': return Object.assign({}, n, { e: kids[0] });
       case 'tuple': return Object.assign({}, n, { es: kids });
       case 'bind': return Object.assign({}, n, { body: kids[0] });
+      case 'named': return Object.assign({}, n, { value: kids[0] });
       default: return n;
     }
   }
@@ -1638,6 +1746,7 @@
         return tp.args.length === tt.args.length && matchTerm(tp.f, tt.f, vars, sub) &&
           tp.args.every((e, i) => matchTerm(e, tt.args[i], vars, sub));
       case 'bin': return tp.op === tt.op && matchTerm(tp.l, tt.l, vars, sub) && matchTerm(tp.r, tt.r, vars, sub);
+      case 'named': return tp.name === tt.name && matchTerm(tp.value, tt.value, vars, sub);
       case 'bind': {
         if (tp.head !== tt.head) return false;
         const bp = binderParts(tp.binders), bt = binderParts(tt.binders);
@@ -1784,8 +1893,8 @@
       const c = g.indexOf(' : ');
       // A default value (`(hq : P := by simp)`) isn't part of the type.
       const dflt = c === -1 ? -1 : g.indexOf(' := ', c);
-      if (c !== -1) binders.push({ names: g.slice(0, c).trim().split(/\s+/), type: g.slice(c + 3, dflt === -1 ? g.length : dflt).trim(), explicit: t[i] === '(' });
-      else binders.push({ names: [], type: g.trim(), explicit: false });
+      if (c !== -1) binders.push({ names: g.slice(0, c).trim().split(/\s+/), type: g.slice(c + 3, dflt === -1 ? g.length : dflt).trim(), explicit: t[i] === '(', bi: t[i] });
+      else binders.push({ names: [], type: g.trim(), explicit: false, bi: t[i] });
       i = close + 1;
       while (t[i] === ' ') i++;
     }
@@ -1808,18 +1917,18 @@
             if (close === -1) break;
             const g = seg.slice(j + 1, close);
             const c = g.indexOf(':');
-            binders.push({ names: (c === -1 ? g : g.slice(0, c)).trim().split(/\s+/), type: c === -1 ? '' : g.slice(c + 1).trim(), explicit: seg[j] === '(' });
+            binders.push({ names: (c === -1 ? g : g.slice(0, c)).trim().split(/\s+/), type: c === -1 ? '' : g.slice(c + 1).trim(), explicit: seg[j] === '(', bi: seg[j] });
             j = close + 1;
           }
         } else {
           const pm = seg.match(/^([\w'Ͱ-Ͽ₀-ₜ\s]+?)\s*(∈|∉|<|≤|>|≥|≠|⊆)\s*(.+)$/);
           if (pm) {
             const names = pm[1].trim().split(/\s+/);
-            binders.push({ names, type: '', explicit: true });
-            names.forEach(v => binders.push({ names: [], type: `${v} ${pm[2]} ${pm[3]}`, explicit: true }));
+            binders.push({ names, type: '', explicit: true, bi: '(' });
+            names.forEach(v => binders.push({ names: [], type: `${v} ${pm[2]} ${pm[3]}`, explicit: true, bi: '(' }));
           } else {
             const c = seg.indexOf(':');
-            binders.push({ names: (c === -1 ? seg : seg.slice(0, c)).trim().split(/\s+/), type: c === -1 ? '' : seg.slice(c + 1).trim(), explicit: true });
+            binders.push({ names: (c === -1 ? seg : seg.slice(0, c)).trim().split(/\s+/), type: c === -1 ? '' : seg.slice(c + 1).trim(), explicit: true, bi: '(' });
           }
         }
         t = t.slice(comma + 1).trim();
@@ -1835,7 +1944,7 @@
         else if (depth === 0 && (ch === '=' || ch === '↔')) break; // an equation's sides may contain arrows
       }
       if (cut > 0) {
-        binders.push({ names: [], type: t.slice(0, cut).trim(), explicit: true });
+        binders.push({ names: [], type: t.slice(0, cut).trim(), explicit: true, bi: '(' });
         t = t.slice(cut + 1).trim();
         continue;
       }
@@ -1856,33 +1965,283 @@
    * explicit binders in order; hypothesis arguments fix variables through their types
    * (`h : 0 ≤ s` for `(h : a ≤ b)` gives `a := 0, b := s`); named arguments win.
    */
-  function instantiateSignature(sig, positional, named, text) {
+  function instantiateSignature(sig, positional, named, text, opts = {}) {
     const peeled = peelSignature(sig);
     const own = [...new Set(peeled.binders.flatMap(b => b.names))];
     const fresh = (n) => `__pv_${n}`;
     const ren = (str) => own.reduce((acc, n) => replaceWord(acc, n, fresh(n)), str || '');
-    const binders = peeled.binders.map(b => ({ names: b.names.map(fresh), type: ren(b.type), explicit: b.explicit }));
+    const binders = peeled.binders.map(b => ({ names: b.names.map(fresh), type: ren(b.type), explicit: b.explicit, bi: b.bi }));
     const vars = new Set(binders.flatMap(b => b.names));
-    const slots = binders.filter(b => b.explicit).flatMap(b => (b.names.length ? b.names : [null]).map(n => ({ name: n, type: b.type })));
+    const allSlots = binders.filter(b => b.explicit).flatMap(b => (b.names.length ? b.names : [null]).map(n => ({ name: n, type: b.type, binder: b })));
+    // A named argument `(h := …)` fills its own parameter; positional ones fill the others.
+    const namedKeys = new Set(Object.keys(named || {}).map(fresh));
+    let slots = allSlots.filter(sl => !(sl.name && namedKeys.has(sl.name)));
     const sub = new Map();
+    // Keep what a match fixed, except values with unknowns (`?a`, from an argument's own
+    // unsolved type): those tell nothing and would block later arguments.
+    const absorb = (extended) => extended.forEach((v, key) => {
+      if (!sub.has(key) && ![...freeNames(v)].some(x => x.startsWith('?'))) sub.set(key, v);
+    });
+    const unify = (slotType, argType) => {
+      const slotT = slotType && parseTerm(slotType);
+      const argT = argType && parseTerm(argType);
+      if (!slotT || !argT) return;
+      const extended = new Map(sub);
+      if (matchTerm(slotT, argT, vars, extended)) absorb(extended);
+    };
+    if (opts.receiver) {
+      // `h.foo args`: the receiver fills the first explicit parameter of its type's head.
+      const head = typeHead(opts.receiver.type || '', null);
+      const k = slots.findIndex(sl => sl.type && head && typeHead(sl.type, null) === head);
+      const at = k === -1 ? 0 : k;
+      const slot = slots[at];
+      if (slot) {
+        const node = parseTerm(opts.receiver.term);
+        if (node && slot.name) sub.set(slot.name, node);
+        unify(slot.type, opts.receiver.type);
+        slots = slots.filter((_, i) => i !== at);
+      }
+    }
     positional.forEach((a, k) => {
       const slot = slots[k];
       if (!slot || a === '_' || a === '?_') return;
       const node = parseTerm(a);
       if (node && slot.name) sub.set(slot.name, node);
-      const argType = /^[^\s()]+$/.test(a) ? localType(a, text) : null;
-      const slotT = argType && slot.type && parseTerm(slot.type);
-      const argT = argType && parseTerm(argType);
-      if (slotT && argT) {
-        const extended = new Map(sub);
-        if (matchTerm(slotT, argT, vars, extended)) extended.forEach((v, key) => sub.set(key, v));
+      const given = opts.argTypes && opts.argTypes[k];
+      if (given && typeof given === 'object') {
+        // `⟨h₁, h₂⟩` for a parameter `A ∧ B` (or `A ↔ B`): each component's type against its part.
+        const parts = tupleParts(slot.type && parseTerm(slot.type), given.tuple.length);
+        (parts || []).forEach((part, i) => {
+          const argT = given.tuple[i] && parseTerm(given.tuple[i]);
+          const extended = new Map(sub);
+          if (argT && matchTerm(part, argT, vars, extended)) absorb(extended);
+        });
+        return;
       }
+      const argType = given || (/^[^\s()]+$/.test(a) ? localType(a, text) : null);
+      unify(slot.type, argType);
     });
-    for (const [n, v] of Object.entries(named)) {
+    for (const [n, v] of Object.entries(named || {})) {
       const node = parseTerm(v);
       if (node && own.includes(n)) sub.set(fresh(n), node);
     }
-    return { concl: ren(peeled.concl), vars, sub, own, fresh };
+    return {
+      concl: ren(peeled.concl), vars, sub, own, fresh, binders, slots: allSlots, remaining: slots.slice(positional.length),
+      // Arguments beyond the parameters (`hs hx` with `hs : s ⊆ t`), with their types.
+      extra: positional.slice(slots.length).map((a, i) => ({ arg: a, type: opts.argTypes ? opts.argTypes[slots.length + i] : null }))
+    };
+  }
+
+  /** Expected types of the `n` components of `⟨…⟩` for type `t`: `A ∧ B ∧ C`, `A ↔ B`; or null. */
+  function tupleParts(t, n) {
+    t = tCore(t);
+    if (!t || n < 2) return null;
+    if (n === 2 && t.k === 'bin' && t.op === '↔') {
+      return [{ k: 'bin', op: '→', l: t.l, r: t.r }, { k: 'bin', op: '→', l: t.r, r: t.l }];
+    }
+    const parts = [];
+    for (let i = 0; i < n - 1; i++) {
+      t = tCore(t);
+      if (!t || t.k !== 'bin' || t.op !== '∧') return null;
+      parts.push(t.l);
+      t = t.r;
+    }
+    parts.push(t);
+    return parts;
+  }
+
+  /**
+   * Lean prints elaborated terms: type ascriptions `(0 : ℝ)` are gone (`0`), and a local
+   * ascribed another type than its own is coerced (`(n : ℝ)` with `n : ℕ` is `↑n`; needs `text`).
+   */
+  function stripAscriptions(n, text) {
+    if (!n) return n;
+    if (n.k === 'proj' && n.e.k === 'asc' && tCore(n.e).k === 'num') return n; // `(0 : ℂ).im`
+    if (n.k === 'asc') {
+      const inner = stripAscriptions(n.e, text);
+      if (text && n.e.k === 'id' && LOCAL_NAME.test(n.e.v)) {
+        const own = parseTerm(localType(n.e.v, text) || '');
+        if (own && !sameTerm(own, n.ty)) return { k: 'pre', op: '↑', e: inner };
+      }
+      return inner;
+    }
+    const kids = tChildren(n);
+    return kids.length ? tWithChildren(n, kids.map(k => stripAscriptions(k, text))) : n;
+  }
+
+  /**
+   * What an application leaves of a signature, as Lean elaborates it: implicit parameters up to
+   * the first unfilled explicit one are instantiated (solved from the arguments' types, or left
+   * as metavariables), instance parameters are synthesized (dropped here), and the remaining
+   * parameters stay in the type. Returns { lead, rest, concl } (ASTs): `lead` are variables
+   * nothing determined (Lean shows them as `?x`), `rest` the parameters from the first unfilled
+   * explicit one on, `concl` the conclusion. `opts.receiver = { term, type, binders }` fills the
+   * parameter of generalized field notation; `binders` are the receiver's own unsolved variables.
+   */
+  function residualParts(sig, positional, named, text, opts = {}) {
+    const inst = instantiateSignature(sig, positional, named, text, opts);
+    // A type with its variables substituted; notation we can't parse is kept as text.
+    const subst = (s) => {
+      if (!s || s === '_') return null;
+      const n = parseTerm(s);
+      return substTerm(n || { k: 'raw', v: s, loose: true }, inst.sub);
+    };
+    let concl = subst(inst.concl);
+    if (!concl) return null;
+    if (inst.extra.length) {
+      // More arguments than parameters: only a few types are functions in disguise.
+      if (inst.extra.length !== 1) return null;
+      const c = tCore(concl);
+      const argT = typeof inst.extra[0].type === 'string' ? tCore(parseTerm(inst.extra[0].type)) : null;
+      if (c && c.k === 'bin' && (c.op === '⊆' || c.op === '⊂')) {
+        // `hs : s ⊆ t` applied to `hx : x ∈ s` is `x ∈ t`.
+        if (!argT || argT.k !== 'bin' || argT.op !== '∈' || !sameTerm(argT.r, c.l)) return null;
+        concl = { k: 'bin', op: '∈', l: argT.l, r: c.r };
+      } else {
+        // A bundled map (`e : A ≃ B`, `f : M →+* N`) applied to a point lands in its codomain.
+        const cod = codomainOf(showTerm(concl));
+        const codT = cod && parseTerm(cod);
+        if (!codT) return null;
+        concl = codT;
+      }
+    }
+    const lead = [];
+    const rest = [];
+    const recv = (opts.receiver && opts.receiver.binders) || [];
+    recv.forEach(x => lead.push({ name: x.name, type: x.type }));
+    const remaining = new Set(inst.remaining);
+    let open = false; // past the first unfilled explicit parameter
+    for (const b of inst.binders) {
+      if (b.explicit) {
+        for (const sl of inst.slots) {
+          if (sl.binder !== b || !remaining.has(sl)) continue;
+          open = true;
+          rest.push({ name: sl.name, type: subst(sl.type), bi: '(' });
+        }
+      } else if (b.bi !== '[') {
+        for (const n of b.names) {
+          if (inst.sub.has(n)) continue;
+          (open ? rest : lead).push({ name: n, type: subst(b.type), bi: '{' });
+        }
+      }
+    }
+    if (rest.some(x => x.bi === '(' && !x.type && !x.name)) return null;
+    // Back from the internal `__pv_x` names, avoiding names already free in the result.
+    const taken = new Set(recv.map(x => x.name));
+    [concl, ...lead.map(x => x.type), ...rest.map(x => x.type)].filter(Boolean)
+      .forEach(n => freeNames(n).forEach(x => { if (!x.startsWith('__pv_')) taken.add(x); }));
+    const back = new Map();
+    for (const x of [...lead, ...rest]) {
+      if (!x.name || !x.name.startsWith('__pv_') || back.has(x.name)) continue;
+      let nm = x.name.slice(5);
+      while (taken.has(nm)) nm += "'";
+      taken.add(nm);
+      back.set(x.name, { k: 'id', v: nm });
+    }
+    const fix = (n) => (n ? substTerm(n, back) : n);
+    const rename = (nm) => (nm && back.has(nm) ? back.get(nm).v : nm);
+    const out = {
+      lead: lead.map(x => ({ name: rename(x.name), type: fix(x.type) })),
+      rest: rest.map(x => ({ name: rename(x.name), type: fix(x.type), bi: x.bi })),
+      concl: fix(concl)
+    };
+    // A parameter whose argument we couldn't read would dangle in the result.
+    const dangling = [out.concl, ...out.rest.map(x => x.type)].filter(Boolean)
+      .some(n => [...freeNames(n)].some(x => x.startsWith('__pv_')));
+    return dangling ? null : out;
+  }
+
+  const BINDER_PRED_OPS = new Set(['∈', '∉', '<', '≤', '>', '≥', '≠', '⊆', '⊂']);
+
+  /** `rest` and `concl` of `residualParts` as a type: `(x : T) → …` / `T → …` / `∀ {x : T}, …`. */
+  function piOf(rest, concl) {
+    let body = concl;
+    for (let i = rest.length - 1; i >= 0; i--) {
+      const x = rest[i];
+      const later = [body, ...rest.slice(i + 1).map(r => r.type)].filter(Boolean);
+      const dependent = Boolean(x.name) && later.some(n => freeNames(n).has(x.name));
+      const ty = x.type ? showTerm(x.type) : null;
+      // `∀ x, x ∈ s → p x` is written `∀ x ∈ s, p x` (Mathlib's binder predicates).
+      const pred = body && body.k === 'bin' && body.op === '→' && body.l.k === 'bin' && BINDER_PRED_OPS.has(body.l.op) &&
+        body.l.l.k === 'id' && body.l.l.v === x.name;
+      if (x.bi === '{') body = { k: 'bind', head: '∀', binders: ty ? `{${x.name} : ${ty}}` : `{${x.name}}`, sep: ',', body };
+      else if (pred && !x.type) body = { k: 'bind', head: '∀', binders: `${x.name} ${body.l.op} ${showTerm(body.l.r, 51)}`, sep: ',', body: body.r };
+      else if (dependent || !x.type) body = { k: 'bind', head: '∀', binders: ty ? `(${x.name} : ${ty})` : (x.name || '_'), sep: ',', body };
+      else body = { k: 'bin', op: '→', l: x.type, r: body };
+    }
+    return body;
+  }
+
+  const leadBinderText = (lead) => lead.map(x => `{${x.name} : ${x.type ? showTerm(x.type) : '_'}}`).join(' ');
+
+  /**
+   * The residual of `residualParts` as a signature text that can be applied further:
+   * `{b : α} : 0 < b → 0 < x * b` for `mul_pos hx`. Null if it can't be worked out.
+   */
+  function residualSignature(sig, positional, named, text, opts = {}) {
+    const r = residualParts(sig, positional, named, text, opts);
+    return r ? `${leadBinderText(r.lead)} : ${showTerm(piOf(r.rest, r.concl))}`.trim() : null;
+  }
+
+  /**
+   * Type of an application from its head's signature, as Lean's hover shows it: explicit
+   * arguments fill parameters in order, implicit ones are solved from the arguments' types,
+   * unfilled parameters stay as arrows (`f 1 : ℕ → ℕ`), unknown variables show as `?x`.
+   */
+  function applyArgs(sig, positional, named, text, opts = {}) {
+    const r = residualParts(sig, positional, named, text, opts);
+    if (!r) return null;
+    const mv = new Map(r.lead.map(x => [x.name, { k: 'id', v: `?${x.name}` }]));
+    const out = substTerm(piOf(r.rest, r.concl), mv);
+    return showTerm(opts.keepAscriptions ? out : stripAscriptions(out, text));
+  }
+
+  /** Does `t` start with binder groups followed by ` : ` (a signature, not a plain type)? */
+  function isSignature(t) {
+    let i = 0;
+    const s = (t || '').trim();
+    if (/^:(?!=)/.test(s)) return true;
+    while (i < s.length && '({[⦃'.includes(s[i])) {
+      const close = matchClose(s, i);
+      if (close === -1) return false;
+      i = close + 1;
+      while (s[i] === ' ') i++;
+    }
+    return i > 0 && s[i] === ':' && s[i + 1] !== '=';
+  }
+
+  /**
+   * A declaration's signature as Lean's hover prints it, `name.{u} binders : type`: no
+   * declaration keyword, no auto-generated instance names (`[inst : Ring R]` → `[Ring R]`),
+   * the universe parameters named in the statement after the name.
+   */
+  function leanSignature(name, sig) {
+    let t = (sig || '').replace(/\s+/g, ' ').trim();
+    if (!t) return name;
+    t = t.replace(/\[inst(?:_\d+|✝\d*)? : /g, '[');
+    const univs = [];
+    const add = (u) => { if (/^[a-zA-Z_][\w'\u2080-\u2089]*$/.test(u) && !['max', 'imax'].includes(u) && !univs.includes(u)) univs.push(u); };
+    for (const m of t.matchAll(/(?<![\w'.])(?:Type|Sort)\s+(\([^()]*\)|[a-zA-Z_][\w'\u2080-\u2089]*)/g)) {
+      (m[1].startsWith('(') ? m[1].slice(1, -1).split(/[\s+]+/) : [m[1]]).forEach(add);
+    }
+    const head = univs.length ? `${name}.{${univs.join(', ')}}` : name;
+    // Binders only (`structure Foo (α : Type*) where`): no type to show.
+    let i = 0;
+    while (i < t.length && '({[⦃'.includes(t[i])) {
+      const close = matchClose(t, i);
+      if (close === -1) break;
+      i = close + 1;
+      while (t[i] === ' ') i++;
+    }
+    return isSignature(t) || (i > 0 && i >= t.length) ? `${head} ${t}` : `${head} : ${t}`;
+  }
+
+  /** A signature or type as Lean prints the type of a term: `?x` for unsolved variables. */
+  function displayType(sig, text = '', keepAscriptions = false) {
+    if (!sig) return null;
+    if (isSignature(sig)) return applyArgs(sig, [], {}, text, { keepAscriptions });
+    const n = parseTerm(sig);
+    return n ? showTerm(keepAscriptions ? n : stripAscriptions(n, text)) : sig.replace(/\s+/g, ' ').trim();
   }
 
   function ruleEquationFrom(sig, positional, named, rev, text) {
@@ -2140,6 +2499,502 @@
     return n && n.k === 'id' ? { base: n.v, path } : null;
   }
 
+  // --- Hovering inside a term: the smallest term containing the position, with its type ---
+  //
+  // Lean's hover on the space in `f x`, on a bracket or an operator shows the innermost term
+  // there with its type (`f x : β`). Here the term is parsed from the source line (joined with
+  // the lines it continues) and its type inferred from local types and constants' signatures.
+
+  const GAP_OPEN = '([{⟨', GAP_CLOSE = ')]}⟩';
+  // Tactic keywords in front of a term (`exact`, `refine`, `have h :`, …).
+  const GAP_LEAD = /^\s*(?:·\s*)?(?:(?:exact|exacts|apply|refine'?|use|exists|existsi|calc|show|change|convert|convert_to|specialize|trans|rcases|have|haveI|let|letI|suffices|replace|from|by|return|then|else|if|using|mod_cast|exact_mod_cast|apply_mod_cast|simpa(?:\s+[^\n]*?\busing)?)(?![\w'!?])\s*)+/;
+  // Lines / segments that aren't terms: declarations, and tactics whose arguments are names,
+  // patterns or tactic-specific syntax.
+  const GAP_NOT_TERM = /^\s*(?:·\s*)?(?:@\[[^\]]*\]\s*)?(?:(?:private|protected|public|noncomputable|scoped|local|partial|nonrec|unsafe|meta)\s+)*(?:theorem|lemma|def|instance|example|abbrev|opaque|structure|class|inductive|axiom|variable|universe|open|namespace|section|end|import|attribute|alias|notation|macro|syntax|set_option|deriving|match|do|intro|intros|rintro|cases|induction|obtain|subst|ext|funext|congr|gcongr|constructor|exfalso|contradiction|norm_num|simp|simp_all|dsimp|simp_rw|rw|rwa|erw|nth_rw|rewrite|field_simp|ring|ring_nf|linarith|nlinarith|polyrith|linear_combination|positivity|omega|decide|aesop|tauto|unfold|delta|clear|revert|generalize|by_contra|by_cases|push_neg|contrapose|filter_upwards|norm_cast|push_cast|split_ifs|interval_cases|fin_cases|choose|lift|wlog|rename_i|set|conv|apply_fun|bound|abel|module|match_scalars|fun_prop|continuity|measurability)(?![\w'!?])/;
+  // Top-level separators between terms.
+  const GAP_SEP = /^(?:,|:=|;|<;>|=>|↦|←|<-|<\||\|>|\$| : | at | with | using | then | else | from | by | generalizing )/;
+  const GAP_NAMES_AFTER = new Set(['at', 'with', 'generalizing']); // what follows is names, not a term
+  const GAP_LEAVES = new Set(['id', 'raw', 'named']);
+
+  /** Index of the opener matching the closer at `closeIdx`, or -1. */
+  function matchOpenBack(text, closeIdx) {
+    for (let i = closeIdx - 1, depth = 0; i >= 0; i--) {
+      const ch = text[i];
+      if (GAP_CLOSE.includes(ch) || ch === '⦄') depth++;
+      else if (GAP_OPEN.includes(ch) || ch === '⦃') { if (depth === 0) return i; depth--; }
+    }
+    return -1;
+  }
+
+  /**
+   * Is the bracket at `open` a binder group (`{s y : ℝ}`, `fun (x y : ℝ) =>`, `theorem foo
+   * (f g : ℕ → ℕ)`) rather than a term (`(f x : ℝ)` ascribes `f x`)? Looks back over earlier
+   * groups and names for a binding keyword.
+   */
+  function isBinderGroup(text, open) {
+    if ('{⦃['.includes(text[open])) return true;
+    let j = open;
+    for (let guard = 0; guard < 40; guard++) {
+      while (j > 0 && /\s/.test(text[j - 1])) j--;
+      if (j === 0) return false;
+      if (')}]⦄'.includes(text[j - 1])) {
+        const o = matchOpenBack(text, j - 1);
+        if (o === -1) return false;
+        j = o;
+        continue;
+      }
+      const w = text.slice(0, j).match(/([^\s()[\]{}⦃⦄⟨⟩,]+)$/);
+      if (!w) return false;
+      if (/^(?:fun|λ|∀|∃|∃!|Π|∑|∏|∑'|∏'|⋃|⋂|⨆|⨅|theorem|lemma|def|instance|example|abbrev|opaque|have|let|suffices|obtain|structure|class|inductive)$/.test(w[1])) return true;
+      if (!/^[\w'.\u0370-\u03FF\u1F00-\u1FFF\u2080-\u209C!?]+$/.test(w[1])) return false; // `:=`, operators: a term context
+      j -= w[1].length;
+    }
+    return false;
+  }
+
+  /** Innermost-first path of nodes whose span contains `off` (empty if none). */
+  function pathTo(node, off) {
+    const sp = tSpan(node);
+    if (!sp || off < sp[0] || off >= sp[1]) return [];
+    for (const c of tChildren(node)) {
+      const p = pathTo(c, off);
+      if (p.length) return p.concat([node]);
+    }
+    return [node];
+  }
+
+  /**
+   * The term at `offset` in `text` when the offset isn't on a name (a space, bracket, operator
+   * or numeral): { node, parent, src, start, end, text } with `node` parsed from `src` and
+   * [start, end) its span in `text`; null where there is no term (names, patterns, tactics).
+   * Candidate segments run between top-level separators inside the innermost bracket; the
+   * nearest one that parses wins (`∀ x : ℝ, p x` needs its `:` and `,`).
+   */
+  function termAtOffset(text, offset) {
+    if (!text || offset < 0 || offset >= text.length) return null;
+    let lo = 0, hi = text.length;
+    for (let i = offset - 1, depth = 0; i >= 0; i--) {
+      const ch = text[i];
+      if (GAP_CLOSE.includes(ch)) depth++;
+      else if (GAP_OPEN.includes(ch)) { if (depth === 0) { lo = i + 1; break; } depth--; }
+    }
+    for (let i = offset, depth = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (GAP_OPEN.includes(ch)) depth++;
+      else if (GAP_CLOSE.includes(ch)) { if (depth === 0) { hi = i; break; } depth--; }
+    }
+    // The names of a binder group (`{s y : ℝ}`) are being bound, not applied.
+    const group = lo > 0 && text.slice(lo, hi).match(/^\s*[^\s:()[\]{}⟨⟩,]+(?:\s+[^\s:()[\]{}⟨⟩,]+)*\s:\s/);
+    if (group && offset < lo + group[0].length - 2 && isBinderGroup(text, lo - 1)) return null;
+    const seps = [];
+    for (let i = lo, depth = 0; i < hi;) {
+      const ch = text[i];
+      if (GAP_OPEN.includes(ch)) { depth++; i++; continue; }
+      if (GAP_CLOSE.includes(ch)) { depth--; i++; continue; }
+      const m = depth === 0 && text.slice(i, Math.min(hi, i + 14)).match(GAP_SEP);
+      if (m) {
+        if (i <= offset && offset < i + m[0].length) return null; // on a separator
+        seps.push({ s: i, e: i + m[0].length, v: m[0].trim() });
+        i += m[0].length;
+        continue;
+      }
+      i++;
+    }
+    // Widest candidate first: the parser knows which commas and colons belong to binders
+    // (`∑ i ∈ s, f i = 0` is `(∑ i ∈ s, f i) = 0`), and segments that don't parse are skipped.
+    const starts = [{ at: lo, after: null }, ...seps.filter(x => x.e <= offset).map(x => ({ at: x.e, after: x.v }))];
+    const ends = [hi, ...seps.filter(x => x.s > offset).map(x => x.s).reverse()];
+    for (const st of starts) {
+      if (GAP_NAMES_AFTER.has(st.after)) return null;
+      if (GAP_NOT_TERM.test(text.slice(st.at, hi))) continue;
+      for (const en of ends) {
+        let a = st.at, b = en;
+        const lead = text.slice(a, b).match(GAP_LEAD);
+        if (lead) a += lead[0].length;
+        while (a < b && /\s/.test(text[a])) a++;
+        while (b > a && /\s/.test(text[b - 1])) b--;
+        if (offset < a || offset >= b) continue;
+        const src = text.slice(a, b);
+        const tree = parseTerm(src);
+        if (!tree) continue;
+        const path = pathTo(tree, offset - a);
+        const node = path[0];
+        if (!node || (GAP_LEAVES.has(node.k) && !node.paren)) return null;
+        const sp = tSpan(node);
+        // `have h : T := term`: the declared type is what the whole term is elaborated against.
+        let expected = null;
+        if (path.length === 1 && st.after === ':=') {
+          const assign = seps.find(x => x.e === st.at);
+          const colon = assign && seps.find(x => x.v === ':' && x.e <= assign.s);
+          if (colon && !seps.some(x => x.v === ':=' && x.s > colon.e && x.s < assign.s)) expected = text.slice(colon.e, assign.s).trim();
+        }
+        // `(2 : ℝ)` with the segment `2`: the ascription gives the numeral's type.
+        const sepAfter = seps.find(x => x.s === en);
+        const ascribed = st.at === lo && sepAfter && sepAfter.v === ':' && lo > 0 && text[lo - 1] === '(' && path.length === 1
+          ? text.slice(sepAfter.e, hi).trim() : null;
+        return {
+          node, parent: path[1] || (ascribed ? { k: 'asc', e: node, ty: parseTerm(ascribed) || { k: 'raw', v: ascribed } } : null),
+          path, expected, src, start: a + sp[0], end: a + sp[1], text: showTerm(stripAscriptions(node))
+        };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Line `idx` joined with the lines it continues and the lines continuing it (deeper indented,
+   * open brackets; not a nested tactic block), so a term broken across lines parses whole.
+   * Returns { text, lineStart }: newlines become one space (`;` after a `by` block, which the
+   * next line can't continue) and comments become spaces, so offsets on the line carry over.
+   */
+  function joinStatement(lines, idx, maxSpan = 15) {
+    const from = Math.max(0, idx - maxSpan);
+    const to = Math.min(lines.length - 1, idx + maxSpan);
+    const clean = lines.map((l, i) => (i < from || i > to ? '' : (l || '').replace(/--.*$/, m => ' '.repeat(m.length))));
+    const blank = (i) => !clean[i].trim();
+    const indent = (i) => (clean[i].match(/^\s*(?:·\s+)?/) || [''])[0].length;
+    const fresh = (i) => /^\s*(?:\||case\b|next\b|·)/.test(clean[i]) || DECL_START.test(clean[i]);
+    const opens = (i) => /(?:\bby|\bdo|\bwhere|\bwith|\bthen|\belse)\s*$/.test(clean[i]) ||
+      (/=>\s*$/.test(clean[i]) && /^\s*(?:\||case\b|next\b|·)/.test(clean[i]));
+    const net = (i) => {
+      let d = 0;
+      for (const ch of clean[i]) { if (GAP_OPEN.includes(ch)) d++; else if (GAP_CLOSE.includes(ch)) d--; }
+      return d;
+    };
+    const startOf = new Map();
+    const depthAt = new Map(); // bracket depth at the end of the line, within its statement
+    let prev = -1;
+    for (let i = from; i <= to; i++) {
+      if (blank(i)) continue;
+      let cont = false;
+      if (prev !== -1 && !fresh(i)) {
+        const s0 = startOf.get(prev);
+        cont = depthAt.get(prev) > 0 || (!opens(prev) && indent(i) > indent(s0));
+      }
+      startOf.set(i, cont ? startOf.get(prev) : i);
+      depthAt.set(i, Math.max(0, (cont ? depthAt.get(prev) : 0) + net(i)));
+      prev = i;
+    }
+    if (!startOf.has(idx)) return { text: clean[idx] || '', lineStart: 0 };
+    const s0 = startOf.get(idx);
+    let e = idx;
+    for (let j = idx + 1; j <= to; j++) {
+      if (blank(j)) continue;
+      if (startOf.get(j) !== s0) break;
+      e = j;
+    }
+    let text = '';
+    let lineStart = 0;
+    let lastCode = '';
+    for (let j = s0; j <= e; j++) {
+      if (j > s0) text += /(^|[^\w'])by(?![\w'])/.test(lastCode) && !/[([{⟨]\s*by\b/.test(lastCode) ? ';' : ' ';
+      if (j === idx) lineStart = text.length;
+      text += clean[j];
+      if (!blank(j)) lastCode = clean[j];
+    }
+    return { text, lineStart };
+  }
+
+  const PROP_OPS = new Set(['=', '≠', '<', '>', '≤', '≥', '∈', '∉', '⊆', '⊂', '⊇', '⊃', '∣', '↔', '∧', '∨']);
+  const ARITH_OPS = new Set(['+', '-', '*', '/', '%', '∪', '∩', '\\', '⊔', '⊓']);
+  const NUMERAL_SIBLING_OPS = new Set(['+', '-', '*', '/', '%', '⊔', '⊓', '=', '≠', '<', '>', '≤', '≥']);
+  const NOTATION_TYPES = { 'π': 'ℝ', 'Complex.I': 'ℂ' }; // `π` is `Real.pi` (open Real)
+  const TYPE_SORTS = {
+    'ℕ': 'Type', 'ℤ': 'Type', 'ℚ': 'Type', 'ℝ': 'Type', 'ℂ': 'Type', 'Nat': 'Type', 'Int': 'Type', 'Rat': 'Type',
+    'Real': 'Type', 'Complex': 'Type', 'Bool': 'Type', 'Prop': 'Type', 'True': 'Prop', 'False': 'Prop'
+  };
+  const COMP_SIG = '{α : Sort u} {β : Sort v} {δ : Sort w} (f : β → δ) (g : α → β) : α → δ';
+  const LOCAL_NAME = /^[\w'Ͱ-Ͽἀ-῿₀-ₜ]+$/;
+
+  /**
+   * A term as Lean prints it after elaboration: ascriptions are gone, and a local ascribed a
+   * different type is coerced (`(n : ℝ)` with `n : ℕ` prints as `↑n`).
+   */
+  function termDisplay(node, text) {
+    return showTerm(stripAscriptions(node, text || ''));
+  }
+
+  const NUMBER_TOWER = ['ℕ', 'ℤ', 'ℚ', 'ℝ', 'ℂ'];
+  const NUMBER_ALIASES = { Nat: 'ℕ', Int: 'ℤ', Rat: 'ℚ', Real: 'ℝ', Complex: 'ℂ' };
+  /** One type for operands of these types: all equal, or the widest of ℕ ⊆ ℤ ⊆ ℚ ⊆ ℝ ⊆ ℂ. */
+  function widestType(types) {
+    const norm = types.map(t => { const s = t.replace(/\s+/g, ' ').trim(); return NUMBER_ALIASES[s] || s; });
+    if (norm.every(t => t === norm[0])) return norm[0];
+    const ranks = norm.map(t => NUMBER_TOWER.indexOf(t));
+    return ranks.every(r => r >= 0) ? NUMBER_TOWER[Math.max(...ranks)] : null;
+  }
+
+  /** Is `type` a proposition (so a value of it is a proof, not a number)? */
+  function isPropType(type) {
+    const n = tCore(parseTerm(type || ''));
+    if (!n) return false;
+    if (n.k === 'bin') return PROP_OPS.has(n.op) || n.op === '→';
+    if (n.k === 'pre') return n.op === '¬';
+    if (n.k === 'bind') return ['∀', '∃', '∃!'].includes(n.head);
+    return n.k === 'id' && (n.v === 'True' || n.v === 'False');
+  }
+
+  /**
+   * Type of a term from `termAtOffset`, as Lean's hover shows it. Locals use their written or
+   * inferred types (with `rw … at` replayed), constants `sigOf(name)` (PR declarations,
+   * Loogle); `x.f` is generalized field notation. `hint.parent` types numerals from their
+   * neighbours (`x + 1`, `x ^ 2`). Resolves to the type text, or null when it can't be told.
+   */
+  async function termTypeOf(node, src, text, sigOf, hint = {}) {
+    let budget = 80;
+    const srcOf = (n) => { const sp = tSpan(n); return sp ? src.slice(sp[0], sp[1]) : showTerm(n); };
+    const lookup = async (name) => {
+      if (!sigOf || --budget < 0) return null;
+      try { return (await sigOf(name)) || null; } catch (err) { return null; }
+    };
+
+    // A local's current type; `undefined` when `name` isn't a local, null when it is one whose
+    // type can't be told (untyped, or changed by a tactic we can't replay).
+    const localSig = async (name) => {
+      if (!LOCAL_NAME.test(name)) return undefined;
+      const info = localVariableInfo(name, text);
+      if (!info) {
+        // A file-level `variable` (`[hT : Fact (0 < T)]`), when the caller can read the file.
+        let v = null;
+        if (hint.variableOf && --budget >= 0) { try { v = await hint.variableOf(name); } catch (err) { v = null; } }
+        return v || undefined;
+      }
+      const prefix = `${name} : `;
+      let type = info.typeSignature && info.typeSignature.startsWith(prefix) ? info.typeSignature.slice(prefix.length) : null;
+      if (info.inferNeeded) {
+        let r = null;
+        try { r = await inferPending(info.inferNeeded, text, sigOf); } catch (err) { r = null; }
+        type = r && r.typeSignature.startsWith(prefix) ? r.typeSignature.slice(prefix.length) : null;
+      }
+      if (!type || type === '_') return null;
+      if (info.replay) {
+        let res = null;
+        try { res = await replayChanges(info.replay.baseType || type, info.replay.changes, text, sigOf); } catch (err) { res = null; }
+        if (!res || res.stoppedAt || res.failedAt) return null;
+        type = res.type;
+      }
+      return type;
+    };
+
+    // `recv.field`: the field of the receiver's type's namespace (or a numeric projection).
+    const fieldSig = async (recvSig, recvText, field) => {
+      const r = residualParts(recvSig, [], {}, text);
+      if (!r) return null;
+      const recvType = showTerm(piOf(r.rest, r.concl));
+      if (/^\d+$/.test(field)) {
+        if (r.rest.length) return null;
+        const p = projectionType(recvType, Number(field));
+        return p && p.type && p.type !== '_' ? `${leadBinderText(r.lead)} : ${p.type}`.trim() : null;
+      }
+      const resolveVar = (v) => {
+        const b = r.lead.find(x => x.name === v);
+        const t = b ? (b.type ? showTerm(b.type) : null) : localType(v, text);
+        return t ? typeHead(t, null) : null;
+      };
+      const ns = r.rest.length ? 'Function' : typeHead(recvType, resolveVar);
+      if (!ns) return null;
+      const fsig = await lookup(`${ns}.${field}`);
+      return fsig ? residualSignature(fsig, [], {}, text, { receiver: { term: recvText, type: recvType, binders: r.lead } }) : null;
+    };
+    const fieldChain = async (sig, recvText, fields) => {
+      for (const f of fields) {
+        if (!sig) return null;
+        sig = await fieldSig(sig, recvText, f);
+        recvText = `${recvText}.${f}`;
+      }
+      return sig;
+    };
+
+    const idSig = async (v) => {
+      if (Object.prototype.hasOwnProperty.call(TYPE_SORTS, v)) return TYPE_SORTS[v];
+      if (Object.prototype.hasOwnProperty.call(NOTATION_TYPES, v)) return NOTATION_TYPES[v];
+      if (/^\?/.test(v) || v === '_' || v === '·') return null;
+      const segs = v.split('.');
+      const local = await localSig(segs[0]);
+      if (local !== undefined) return local === null ? null : segs.length === 1 ? local : fieldChain(local, segs[0], segs.slice(1));
+      if (segs.length === 1 && /^[a-z]['\w]?$/.test(v)) return null; // a short unbound name: a bound variable
+      const sig = await lookup(v);
+      if (sig) return sig;
+      // `abs_le.mp`, `Set.mem_Icc.1`: a constant followed by fields.
+      for (let k = segs.length - 1; k >= 1; k--) {
+        if (!/^[a-z_]/.test(segs[k - 1])) continue; // a namespace, not a term
+        const base = await lookup(segs.slice(0, k).join('.'));
+        if (base) return fieldChain(base, segs.slice(0, k).join('.'), segs.slice(k));
+      }
+      return null;
+    };
+
+    // Signature (a type, possibly with leading binders) of a term.
+    const sigOfTerm = async (n) => {
+      if (!n || --budget < 0) return null;
+      switch (n.k) {
+        case 'asc': return showTerm(n.ty);
+        case 'id': return idSig(n.v);
+        case 'proj': {
+          const recv = await sigOfTerm(n.e);
+          return recv ? fieldSig(recv, srcOf(n.e), n.f) : null;
+        }
+        case 'app': {
+          const fSig = await sigOfTerm(n.f);
+          if (!fSig) return null;
+          const { positional, named, argTypes } = await argsOf(n);
+          return residualSignature(fSig, positional, named, text, { argTypes });
+        }
+        case 'bin': {
+          if (n.op === '<|' || n.op === '|>') {
+            // `f <| x` / `x |> f` is `f x`.
+            const [fn, arg] = n.op === '<|' ? [n.l, n.r] : [n.r, n.l];
+            const fSig = await sigOfTerm(fn);
+            return fSig ? residualSignature(fSig, [srcOf(arg)], {}, text, { argTypes: [await typeOf(arg)] }) : null;
+          }
+          if (PROP_OPS.has(n.op)) return 'Prop';
+          if (n.op === '→') {
+            // The sort of a function type is its codomain's (`A → P : Prop` for a proposition `P`).
+            const r = await typeOf(n.r);
+            return r === 'Prop' || /^(Type|Sort)\b/.test(r || '') ? r : null;
+          }
+          if (n.op === '×') {
+            const l = await typeOf(n.l);
+            return /^(Type|Sort)\b/.test(l || '') ? l : null;
+          }
+          if (n.op === "⁻¹'" || n.op === "''") {
+            // Preimage `f ⁻¹' s : Set α`, image `f '' s : Set β`, for `f : α → β`.
+            const f = parseTerm((await typeOf(n.l)) || '');
+            if (!f || f.k !== 'bin' || f.op !== '→') return null;
+            return `Set ${showTerm(n.op === "''" ? f.r : f.l, 1025)}`;
+          }
+          if (n.op === '×ℂ') return 'Set ℂ';
+          if (n.op === '×ˢ') {
+            const [l, r] = [parseTerm((await typeOf(n.l)) || ''), parseTerm((await typeOf(n.r)) || '')];
+            const elem = (t) => (t && t.k === 'app' && t.f.k === 'id' && t.f.v === 'Set' && t.args.length === 1 ? t.args[0] : null);
+            return elem(l) && elem(r) ? `Set (${showTerm(elem(l), 36)} × ${showTerm(elem(r), 35)})` : null;
+          }
+          if (n.op === '∘') {
+            return residualSignature(COMP_SIG, [srcOf(n.l), srcOf(n.r)], {}, text, { argTypes: [await typeOf(n.l), await typeOf(n.r)] });
+          }
+          if (n.op === '^' || n.op === '•') {
+            const t = await typeOf(n.op === '•' ? n.r : n.l);
+            return t && t !== 'Prop' && !isPropType(t) ? t : null;
+          }
+          if (!ARITH_OPS.has(n.op)) return null;
+          // `2 * π * k * s`: Lean elaborates the whole tree at the widest type of its leaves (ℤ
+          // coerced to ℝ). Numerals and `↑x` adapt; any other unknown leaf leaves it unknown.
+          const leaves = [];
+          const collect = (m) => {
+            const c = m.paren ? m : m;
+            if (c.k === 'bin' && ARITH_OPS.has(c.op)) { collect(c.l); collect(c.r); } else leaves.push(c);
+          };
+          collect(n);
+          const fixed = leaves.filter(x => x.k !== 'num' && !(x.k === 'pre' && x.op === '↑'));
+          if (!fixed.length) return null;
+          const types = await Promise.all(fixed.map(typeOf));
+          if (types.some(t => !t || t === 'Prop' || isPropType(t))) return null;
+          return widestType(types);
+        }
+        case 'pre':
+          if (n.op === '¬') return 'Prop';
+          return n.op === '-' ? typeOf(n.e) : null;
+        case 'post': case 'abs': return typeOf(n.e);
+        case 'norm': return 'ℝ';
+        case 'bind': {
+          if (['∀', '∃', '∃!'].includes(n.head)) return 'Prop';
+          if (n.head === 'fun' || n.head === 'λ') {
+            // `fun (x : ℝ) (n : ℕ) => b : ℝ → ℕ → B`; untyped binders need the expected type.
+            const groups = [...n.binders.matchAll(/\(\s*([^():]+?)\s*:\s*([^()]*(?:\([^()]*\)[^()]*)*)\)/g)];
+            const covered = groups.map(g => g[0]).join(' ').replace(/\s+/g, '');
+            if (!groups.length || covered !== n.binders.replace(/\s+/g, '')) return null;
+            const body = await typeOf(n.body);
+            const bodyT = body && parseTerm(body);
+            if (!bodyT) return null;
+            const rest = groups.flatMap(g => g[1].trim().split(/\s+/).map(name => ({ name, type: parseTerm(g[2].trim()), bi: '(' })));
+            return rest.some(x => !x.type) ? null : showTerm(piOf(rest, bodyT));
+          }
+          return ['∑', '∏', "∑'", "∏'", '∫', '⋃', '⋂', '⨆', '⨅'].includes(n.head) ? typeOf(n.body) : null;
+        }
+        default: return null;
+      }
+    };
+    // Types of subterms keep their ascriptions (matching sees through them); only what is
+    // shown at the end is printed the way Lean prints it.
+    const typeOf = async (n) => displayType(await sigOfTerm(n), text, true);
+    // Positional / named arguments of an application and the types used to solve variables.
+    const argsOf = async (n) => {
+      const positional = [];
+      const named = {};
+      const argNodes = [];
+      for (const a of n.args) {
+        if (a.k === 'named') named[a.name] = srcOf(a.value);
+        else { positional.push(srcOf(a)); argNodes.push(a); }
+      }
+      const argTypes = await Promise.all(argNodes.map(async (a) => {
+        if (a.k === 'tuple') return { tuple: await Promise.all(a.es.map(e => (['num', 'raw', 'tuple'].includes(e.k) ? null : typeOf(e)))) };
+        return ['num', 'raw'].includes(a.k) ? null : typeOf(a);
+      }));
+      return { positional, named, argTypes };
+    };
+
+    // `have h : T := term`: variables the term leaves open are fixed by matching T, as Lean
+    // elaborates the term against it (`?f ?a` against `f b` once `f` is known: matched twice).
+    const solvedByExpected = (sig, expected) => {
+      const r = residualParts(sig, [], {}, text);
+      const tgt = parseTerm(expected);
+      if (!r || !r.lead.length || !tgt) return null;
+      const vars = new Set(r.lead.map(x => x.name));
+      const pat = piOf(r.rest, r.concl);
+      const sub = new Map();
+      if (!matchTerm(pat, tgt, vars, sub)) {
+        const again = new Map();
+        if (!matchTerm(substTerm(pat, sub), tgt, new Set([...vars].filter(v => !sub.has(v))), again)) return null;
+        again.forEach((v, k) => sub.set(k, v));
+      }
+      const mv = new Map(r.lead.map(x => [x.name, sub.get(x.name) || { k: 'id', v: `?${x.name}` }]));
+      return showTerm(stripAscriptions(substTerm(pat, mv), text));
+    };
+
+    // Variables a term's type leaves open can be fixed by where it's used, as Lean's elaboration
+    // fixes them: in `(abs_le).mpr ⟨h₁, h₂⟩` the arguments of `.mpr` fix `abs_le`'s `a` and `b`.
+    const solvedByUse = async (n, sig) => {
+      const path = hint.path || [];
+      const parent = path[1];
+      const r = sig && residualParts(sig, [], {}, text);
+      if (!r || !r.lead.length || !parent) return null;
+      let combined = null;
+      let app = null;
+      if (parent.k === 'proj' && parent.e === n) {
+        combined = await fieldSig(sig, srcOf(n), parent.f);
+        app = path[2] && path[2].k === 'app' && path[2].f === parent ? path[2] : null;
+      } else if (parent.k === 'app' && parent.f === n) {
+        combined = sig;
+        app = parent;
+      }
+      if (!combined || !app) return null;
+      const { positional, named, argTypes } = await argsOf(app);
+      const inst = instantiateSignature(combined, positional, named, text, { argTypes });
+      let solved = 0;
+      const mv = new Map(r.lead.map((x) => {
+        const v = inst.sub.get(inst.fresh(x.name));
+        if (v && ![...freeNames(v)].some(y => y.startsWith('__pv_'))) { solved++; return [x.name, v]; }
+        return [x.name, { k: 'id', v: `?${x.name}` }];
+      }));
+      return solved ? showTerm(stripAscriptions(substTerm(piOf(r.rest, r.concl), mv), text)) : null;
+    };
+
+    if (node && node.k === 'num') {
+      // A numeral takes its type from where it is: `x + 1`, `0 < x`, `x ^ 2` (a natural exponent).
+      const p = hint.parent;
+      if (p && p.k === 'asc') return displayType(showTerm(p.ty));
+      if (!p || p.k !== 'bin') return null;
+      if (p.op === '^') return p.r === node ? 'ℕ' : null;
+      if (!NUMERAL_SIBLING_OPS.has(p.op)) return null;
+      const other = p.l === node ? p.r : p.l;
+      const t = other.k === 'num' ? null : await typeOf(other);
+      return t && t !== 'Prop' && !isPropType(t) ? t : null;
+    }
+    const sig = await sigOfTerm(node);
+    const shown = (await solvedByUse(node, sig)) || displayType(sig, text);
+    return (shown && shown.includes('?') && hint.expected && solvedByExpected(sig, hint.expected)) || shown;
+  }
+
   /** Apply anonymous projections `[1, 2, …]` to a type; null if a step isn't known. */
   function projectionChain(type, indices) {
     let t = type;
@@ -2254,6 +3109,15 @@
     describeReplay,
     inferPending,
     applicationTypeFrom,
+    applyArgs,
+    residualSignature,
+    displayType,
+    leanSignature,
+    termAtOffset,
+    termTypeOf,
+    termDisplay,
+    joinStatement,
+    statementAround,
     receiverResultType,
     termChain,
     parenReceiver,

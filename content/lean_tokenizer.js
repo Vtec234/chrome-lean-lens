@@ -207,11 +207,10 @@
           const fullLineText = lineContainer.textContent || '';
 
           const lineRes = this.extractTokenFromLine(fullLineText, lineOffset);
-          if (lineRes) {
-            // Measure the hovered identifier itself (not the caret or the whole line),
-            // and ignore points that aren't over it, e.g. blank space after a line's end.
-            const tokenRange = this.rangeForOffsets(lineContainer, lineRes.subStart, lineRes.subEnd);
-            if (!tokenRange || !this.pointInRange(tokenRange, event.clientX, event.clientY)) return null;
+          // Measure the hovered identifier itself (not the caret or the whole line),
+          // and ignore points that aren't over it, e.g. blank space after a line's end.
+          const tokenRange = lineRes && this.rangeForOffsets(lineContainer, lineRes.subStart, lineRes.subEnd);
+          if (lineRes && tokenRange && this.pointInRange(tokenRange, event.clientX, event.clientY)) {
             return {
               token: lineRes.token,
               subToken: lineRes.subToken,
@@ -225,7 +224,9 @@
               textNode: textNode
             };
           }
-          return null;
+          // Not over a name: the term there (a space, bracket, operator or numeral), as Lean's
+          // hover on the space in `f x` shows `f x : β`.
+          return this.termAt(lineContainer, fullLineText, lineOffset, event.clientX, event.clientY, textNode);
         } catch (err) {
           // Fall through to single text node extractor
         }
@@ -233,6 +234,58 @@
 
       // 2. Fallback to single textNode extractor
       return this.extractTokenAt(textNode, offset, event.clientX, event.clientY);
+    }
+
+    /**
+     * The term under the pointer when it isn't over a name: { kind: 'term', token (a key for
+     * this term), termText, termNode, termSource, termParent, boundingRect, … } or null.
+     */
+    static termAt(container, lineText, caret, x, y, textNode) {
+      const bc = window.VersoBinderContext;
+      if (!bc || !bc.termAtOffset) return null;
+      const marker = this.markerLength(container);
+      // The character under the pointer (the caret sits at its nearer edge).
+      let ch = -1;
+      for (const i of [caret, caret - 1]) {
+        if (i < marker || i >= lineText.length) continue;
+        const r = this.rangeForOffsets(container, i, i + 1);
+        if (r && this.pointInRange(r, x, y, 0.5)) { ch = i; break; }
+      }
+      if (ch === -1) return null;
+      const c = lineText[ch];
+      if (this.isIdentChar(c) && !/[0-9]/.test(c)) return null; // part of a name or `_`
+      if (/[0-9]/.test(c) && this.isIdentChar(lineText[ch - 1] || '') && !/[0-9.]/.test(lineText[ch - 1])) return null; // `h2`
+      const code = lineText.slice(marker);
+      const at = ch - marker;
+      const prefix = code.slice(0, at);
+      if (/(^|[^-])--(?!-)/.test(prefix.replace(/`[^`]*`/g, '')) || /^\s*(--|\/-)/.test(code)) return null; // a comment
+      const stmt = (bc.statementAround && bc.statementAround(textNode, code)) || { text: code, lineStart: 0 };
+      const hit = bc.termAtOffset(stmt.text, stmt.lineStart + at);
+      if (!hit) return null;
+      // The term's part on this line (it may continue on others) anchors the tooltip.
+      const a = Math.max(0, hit.start - stmt.lineStart);
+      const b = Math.min(code.length, hit.end - stmt.lineStart);
+      const range = b > a ? this.rangeForOffsets(container, marker + a, marker + b) : null;
+      if (!range) return null;
+      const rect = range.getBoundingClientRect();
+      return {
+        kind: 'term',
+        token: `⟪term ${Math.round(rect.top)}:${hit.start}:${hit.end}⟫ ${hit.text}`,
+        subToken: null,
+        chainUpToCursor: null,
+        fullChain: null,
+        isKeyword: false,
+        termText: hit.text,
+        termNode: hit.node,
+        termSource: hit.src,
+        termParent: hit.parent,
+        termPath: hit.path,
+        termExpected: hit.expected,
+        linePrefix: prefix,
+        lineSuffix: code.slice(at + 1),
+        boundingRect: rect,
+        textNode: textNode
+      };
     }
 
     /** Length of a rendered `+`/`-` diff marker at the start of a line container. */

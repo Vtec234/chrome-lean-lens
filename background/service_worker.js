@@ -233,10 +233,12 @@ function buildAmbiguousResult(token, candidates) {
 function hitToResult(hit) {
   const kind = inferKind(hit.name, hit.type, hit.doc);
   const moduleName = hit.module || "";
+  const bc = self.VersoBinderContext;
   return {
     name: hit.name,
     kind: kind,
-    typeSignature: hit.type || `${kind} ${hit.name}`,
+    // As Lean's hover prints it: `mul_pos.{u_1} {α : Type u_1} … : 0 < a * b`.
+    typeSignature: hit.type ? (bc && bc.leanSignature ? bc.leanSignature(hit.name, hit.type) : `${hit.name} : ${hit.type}`) : `${kind} ${hit.name}`,
     docstring: hit.doc || "",
     module: moduleName,
     source: "loogle",
@@ -988,7 +990,7 @@ async function handleLookupToken(token, subToken, fileRef, contextText, tacticPo
   if (receiver && receiver.maybeVariable && !receiver.applied && fileRef) {
     const dotted = [receiver.const, ...(receiver.path || []), token].join('.');
     const named = await lookupInFileScope(dotted, fileRef, contextText, true);
-    if (named && !named.ambiguous && named.typeSignature && !/^def /.test(named.typeSignature)) return named;
+    if (named && !named.ambiguous && named.typeSignature && !(named.kind === 'def' && named.source !== 'loogle')) return named;
   }
 
   // `(f a).field` / `h.f₁.f₂.field`: Lean resolves `field` in the receiver's type.
@@ -1129,6 +1131,11 @@ const MESSAGE_HANDLERS = {
     return hit && hit.type ? { name: hit.name, type: hit.type } : null;
   },
   INFER_PATTERN: (request) => inferPattern(request),
+  // A file-level `variable` (`[hT : Fact (0 < T)]`) for typing terms around a hovered gap.
+  FILE_VARIABLE: async (request) => {
+    const v = await lookupFileVariable(request.name, request.fileRef);
+    return v ? { type: v.rawType } : null;
+  },
   STRUCTURE_FIELD: async (request) => {
     const f = await structureField(request.type, request.index, request.rest);
     return f ? { field: { name: f.name, type: f.type }, structure: f.structure } : null;

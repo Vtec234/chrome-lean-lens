@@ -821,7 +821,8 @@ const sampleRequests = {
   GET_SETTINGS: {},
   SET_SETTINGS: { settings: { hoverDelay: 300 } },
   CLEAR_CACHE: {},
-  TEST_LOCAL_SERVER: { url: 'http://127.0.0.1:9' }
+  TEST_LOCAL_SERVER: { url: 'http://127.0.0.1:9' },
+  FILE_VARIABLE: { name: 'hT', fileRef: null }
 };
 // Handlers run concurrently; the worker logs failures as "[Lean Lens] message handler failed: ACTION …".
 const realWarn = console.warn;
@@ -848,6 +849,115 @@ asyncChecks.push(Promise.all(handlerRuns).then(() => {
   assert.deepStrictEqual(handlerFailures, [], `message handlers failed:\n${handlerFailures.join('\n')}`);
 }, (err) => { console.warn = realWarn; throw err; }));
 assert.strictEqual(workerListeners[0]({ action: 'NO_SUCH_ACTION' }, {}, () => {}), false, "unknown actions are ignored");
+
+// 18. Hovering a gap shows the term there with its type, as Lean's infoview does (`a b : Y`).
+//     Expected outputs were checked against Lean's own hovers (lean-lsp) on the same code.
+console.log("18. Testing gap hovers (terms and their types)...");
+{
+  const SIGS = {
+    'mul_pos': '{α : Type u_1} [inst : MulZeroClass α] {a b : α} [inst_1 : Preorder α] [PosMulStrictMono α] (ha : 0 < a) (hb : 0 < b) : 0 < a * b',
+    'abs_le': '{α : Type u_1} [inst : AddCommGroup α] [inst_1 : LinearOrder α] [IsOrderedAddMonoid α] {a b : α} : |a| ≤ b ↔ -b ≤ a ∧ a ≤ b',
+    'Iff.mp': '{a b : Prop} (self : a ↔ b) : a → b',
+    'Iff.mpr': '{a b : Prop} (self : a ↔ b) : b → a',
+    'le_trans': '{α : Type u_1} [inst : Preorder α] {a b c : α} : a ≤ b → b ≤ c → a ≤ c',
+    'LE.le.trans': '{α : Type u_1} [inst : Preorder α] {a b c : α} : a ≤ b → b ≤ c → a ≤ c',
+    'Set.mem_Icc': '{α : Type u_1} [inst : Preorder α] {a b x : α} : x ∈ Set.Icc a b ↔ a ≤ x ∧ x ≤ b',
+    'Nat.cast_le': '{α : Type u_1} [inst : AddMonoidWithOne α] [inst_1 : PartialOrder α] [AddLeftMono α] [ZeroLEOneClass α] [CharZero α] {m n : ℕ} : (↑m : α) ≤ ↑n ↔ m ≤ n',
+    'Finset.sum_le_sum': '{ι : Type u_1} {N : Type u_5} [inst : AddCommMonoid N] [inst_1 : Preorder N] {f g : ι → N} {s : Finset ι} [AddLeftMono N] (h : ∀ i ∈ s, f i ≤ g i) : ∑ i ∈ s, f i ≤ ∑ i ∈ s, g i',
+    'Filter.Tendsto.mono_left': '{α : Type u_1} {β : Type u_2} {f : α → β} {x y : Filter α} {z : Filter β} (hx : Filter.Tendsto f x z) (h : y ≤ x) : Filter.Tendsto f y z',
+    'ContinuousAt.tendsto': '{X : Type u_1} {Y : Type u_2} [inst : TopologicalSpace X] [inst_1 : TopologicalSpace Y] {f : X → Y} {x : X} (h : ContinuousAt f x) : Filter.Tendsto f (nhds x) (nhds (f x))'
+  };
+  const sigOf = async (n) => SIGS[n] || null;
+  // `|` marks the hovered character in the last line of `code`.
+  const gap = async (code, marker) => {
+    const lines = code.split('\n');
+    const line = lines[lines.length - 1];
+    const at = line.indexOf(marker.replace('|', '')) + marker.indexOf('|');
+    const j = bc.joinStatement(lines, lines.length - 1);
+    const hit = bc.termAtOffset(j.text, j.lineStart + at);
+    if (!hit) return null;
+    const type = await bc.termTypeOf(hit.node, hit.src, code, sigOf, { parent: hit.parent, path: hit.path, expected: hit.expected });
+    return type ? `${bc.termDisplay(hit.node, code)} : ${type}` : `${hit.text} : ?`;
+  };
+  const H = (binders, body) => `example ${binders} : True := by\n  ${body}`;
+  const cases = [
+    [H('(X Y : Type) (a : X → Y) (b : X)', 'have := a b'), 'a| b', 'a b : Y'],
+    [H('(f : ℕ → ℕ → ℕ) (n : ℕ)', 'have := f n'), 'f| n', 'f n : ℕ → ℕ'],
+    // Lean prints unassigned implicit arguments as metavariables.
+    [H('(x : ℝ) (hx : 0 < x)', 'have := mul_pos hx'), 'mul_pos| hx', 'mul_pos hx : 0 < ?b → 0 < x * ?b'],
+    [H('(x y : ℝ) (hx : 0 < x) (hy : 0 < y)', 'have := mul_pos hx hy'), 'mul_pos hx| hy', 'mul_pos hx hy : 0 < x * y'],
+    [H('(a b c : ℝ) (h1 : a ≤ b) (h2 : b ≤ c)', 'exact le_trans h1 h2'), 'le_trans| h1', 'le_trans h1 h2 : a ≤ c'],
+    // Generalized field notation, on a local and on a constant.
+    [H('(a b c : ℝ) (h1 : a ≤ b) (h2 : b ≤ c)', 'exact h1.trans h2'), 'h1.trans| h2', 'h1.trans h2 : a ≤ c'],
+    [H('(x : ℝ) (h : |x| ≤ 1)', 'have := abs_le.mp h'), 'abs_le.mp| h', 'abs_le.mp h : -1 ≤ x ∧ x ≤ 1'],
+    [H('(x : ℝ) (h : |x| ≤ 1)', 'have := (abs_le.mp h).2'), 'h)|.2', '(abs_le.mp h).2 : x ≤ 1'],
+    [H('(x : ℝ) (hx : x ∈ Set.Icc (0 : ℝ) 1)', 'have := Set.mem_Icc.mp hx'), 'Set.mem_Icc.mp| hx', 'Set.mem_Icc.mp hx : 0 ≤ x ∧ x ≤ 1'],
+    // An anonymous constructor fixes variables through its components.
+    [H('(u : ℝ) (h1 : -1 ≤ u) (h2 : u ≤ 1)', 'exact (abs_le).mpr ⟨h1, h2⟩'), '(abs_le).mpr| ⟨', 'abs_le.mpr ⟨h1, h2⟩ : |u| ≤ 1'],
+    // …and so does the use of a term: `(abs_le)` here is `|u| ≤ 1 ↔ …`, as Lean shows it.
+    [H('(u : ℝ) (h1 : -1 ≤ u) (h2 : u ≤ 1)', 'exact (abs_le).mpr ⟨h1, h2⟩'), '|(abs_le)', 'abs_le : |u| ≤ 1 ↔ -1 ≤ u ∧ u ≤ 1'],
+    [H('(m n : ℕ) (hmn : m ≤ n)', 'have := (Nat.cast_le (α := ℝ)).mpr hmn'), '(Nat.cast_le (α := ℝ)).mpr| hmn', '(Nat.cast_le (α := ℝ)).mpr hmn : ↑m ≤ ↑n'],
+    [H('(s : Finset ℕ) (g k : ℕ → ℝ) (hg : ∀ i ∈ s, g i ≤ k i)', 'have := Finset.sum_le_sum hg'), 'Finset.sum_le_sum| hg', 'Finset.sum_le_sum hg : ∑ i ∈ s, g i ≤ ∑ i ∈ s, k i'],
+    // Operators, binders, numerals (typed from their neighbours), `fun`, coercions.
+    [H('(x : ℝ)', 'have : x + 1 = 2 * x ^ 2 := sorry'), 'x |+', 'x + 1 : ℝ'],
+    [H('(x : ℝ)', 'have : x + 1 = 2 * x ^ 2 := sorry'), 'x ^ |2', '2 : ℕ'],
+    [H('(x : ℝ)', 'have : x + 1 = 2 * x ^ 2 := sorry'), '= |2', '2 : ℝ'],
+    [H('(n : ℕ) (g : ℕ → ℝ)', 'have : ∑ i ∈ Finset.range n, g i = 0 := sorry'), 'g i |=', '∑ i ∈ Finset.range n, g i = 0 : Prop'],
+    [H('(n : ℕ) (g : ℕ → ℝ)', 'have : ∑ i ∈ Finset.range n, g i = 0 := sorry'), '|∑', '∑ i ∈ Finset.range n, g i : ℝ'],
+    [H('(p : ℝ → Prop)', 'have : ∀ z : ℝ, p z := sorry'), '|∀', '∀ z : ℝ, p z : Prop'],
+    [H('(s : Set ℝ)', 'have : ∀ x ∈ s, 0 ≤ x := sorry'), '0 |≤', '0 ≤ x : Prop'],
+    [H('(n : ℕ)', 'have := fun (x : ℝ) => x + 1'), '|fun', 'fun (x : ℝ) => x + 1 : ℝ → ℝ'],
+    [H('(n : ℕ)', 'have := ((n : ℝ) + 1)'), '((n : ℝ) |+', '↑n + 1 : ℝ'],
+    [H('(f g : ℕ → ℕ)', 'have := f ∘ g'), 'f |∘', 'f ∘ g : ℕ → ℕ'],
+    [H('(t : ℝ → ℝ) (s : Set ℝ)', "have := t ⁻¹' s"), "t |⁻¹'", "t ⁻¹' s : Set ℝ"],
+    [H('(k : ℤ) (s : ℝ)', 'have := 2 * π * k * s'), '2 * π * k |*', '2 * π * k * s : ℝ'],
+    [H('(hf : ∀ n, f n = n + 1)', 'rw [hf 3] at h'), 'hf| 3', 'hf 3 : f 3 = 3 + 1'],
+    // `hs : A ⊆ B` applied to a membership proof.
+    [H('(x : ℝ) (A B : Set ℝ) (hs : A ⊆ B) (hx : x ∈ A)', 'have := hs hx'), 'hs| hx', 'hs hx : x ∈ B'],
+    // The declared type of `have h : T := term` fixes what the term leaves open.
+    [H('(c e b : ℝ)', 'have ht : Filter.Tendsto (fun s : ℝ => c * Real.exp (e * s)) (nhdsWithin b (Set.Iio b)) (nhds (c * Real.exp (e * b))) :=\n    (ContinuousAt.tendsto (h := by fun_prop)).mono_left nhdsWithin_le_nhds'),
+      '.mono_left| nhds', '(ContinuousAt.tendsto (h := by fun_prop)).mono_left nhdsWithin_le_nhds : Filter.Tendsto (fun s : ℝ => c * Real.exp (e * s)) (nhdsWithin b (Set.Iio b)) (nhds (c * Real.exp (e * b)))'],
+    // Not terms: binder names, `intro` names, patterns, `linear_combination` syntax.
+    [H('(n : ℕ)', 'intro x y'), 'x| y', null],
+    [H('(n : ℕ)', 'obtain ⟨x, hx⟩ := foo n'), '⟨x,| hx', null],
+    [H('(h : 2 ≤ 3)', 'linear_combination h + 2 * h'), 'h |+', null],
+    ['theorem foo {s y : ℝ} (f g : ℕ → ℕ) : True := by', 'f| g', null],
+    [H('(n : ℕ)', 'exact foo (f g : ℕ)'), 'f| g', 'f g : ?']
+  ];
+  for (const [code, marker, want] of cases) {
+    asyncChecks.push(gap(code, marker).then(got => assert.strictEqual(got, want, `gap hover at ${marker}`)));
+  }
+
+  // A term broken across lines is read whole; a `by` block on the line before isn't continued.
+  const joined = bc.joinStatement(['  exact foo a', '    (bar b) c', '  trivial'], 1);
+  assert.strictEqual(joined.text.replace(/\s+/g, ' ').trim(), 'exact foo a (bar b) c', 'continuation lines join the statement');
+  assert.strictEqual(bc.termAtOffset(joined.text, joined.lineStart + 11).text, 'foo a (bar b) c', 'the gap after `(bar b)` is the whole application');
+  const calc = bc.joinStatement(['  calc a = b := by rw [h]', '    _ = c + d := by ring'], 1);
+  assert(/by rw \[h\];/.test(calc.text), `a line ending a \`by\` block is closed before the next one: ${calc.text}`);
+  assert.strictEqual(bc.termAtOffset(calc.text, calc.lineStart + 10).text, 'c + d', 'calc step after a `by` line');
+  const nested = bc.joinStatement(['  have h : P := by', '    exact foo a b'], 1);
+  assert.strictEqual(nested.lineStart, 0, 'a nested tactic block starts its own statement');
+
+  // Constants are shown as Lean's hover shows them: `name.{u} binders : type`.
+  assert.strictEqual(bc.leanSignature('mul_pos', SIGS.mul_pos),
+    'mul_pos.{u_1} {α : Type u_1} [MulZeroClass α] {a b : α} [Preorder α] [PosMulStrictMono α] (ha : 0 < a) (hb : 0 < b) : 0 < a * b');
+  assert.strictEqual(bc.leanSignature('Finset.sum_le_sum', SIGS['Finset.sum_le_sum']).slice(0, 52), 'Finset.sum_le_sum.{u_1, u_5} {ι : Type u_1} {N : Typ');
+  assert.strictEqual(bc.leanSignature('Real.exp', 'ℝ → ℝ'), 'Real.exp : ℝ → ℝ');
+  assert.strictEqual(bc.leanSignature('foo', ': True'), 'foo : True');
+  assert.strictEqual(bc.leanSignature('Foo', '(α : Type*)'), 'Foo (α : Type*)', 'binders without a type (a structure)');
+  const loogleHit = context.hitToResult({ name: 'abs_le', type: SIGS.abs_le, doc: 'd', module: 'Mathlib.Algebra.Order.AbsoluteValue' });
+  assert(loogleHit.typeSignature.startsWith('abs_le.{u_1} {α : Type u_1} [AddCommGroup α]'), `Loogle hits print like Lean: ${loogleHit.typeSignature}`);
+  // PR declarations too, keeping the bare `binders : type` for the term machinery.
+  prScanner.reset();
+  prScanner.scanDiffLines({ querySelectorAll: (sel) => (sel === '.diff-text-inner' ? [
+    { textContent: 'theorem foo_le {x : ℝ} (hx : 0 ≤ x) : x ≤ x + 1 := by', classList: { contains: () => false }, getAttribute: () => null, closest: () => null }
+  ] : []) }, 'A.lean');
+  const fooLe = prScanner.declarations.get('foo_le');
+  assert.strictEqual(fooLe.typeSignature, 'foo_le {x : ℝ} (hx : 0 ≤ x) : x ≤ x + 1', 'PR declaration printed like Lean');
+  assert.strictEqual(fooLe.signature, '{x : ℝ} (hx : 0 ≤ x) : x ≤ x + 1');
+  prScanner.reset();
+}
+console.log("   ✓ Gap hovers verified.\n");
 
 Promise.all(asyncChecks).then(() => {
   console.log("   ✓ Rewrite replay verified.\n");

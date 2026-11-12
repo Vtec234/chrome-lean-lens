@@ -150,8 +150,8 @@
       const sourceEl = this.container.querySelector('#verso-footer-source');
       const docsLink = this.container.querySelector('#verso-docs-link');
 
-      // Populate Name & Kind
-      titleEl.textContent = data.name || 'Unknown';
+      // Populate Name & Kind (a term's text is already in its signature line)
+      titleEl.textContent = data.kind === 'term' ? '' : (data.name || 'Unknown');
       const kind = (data.kind || 'def').toLowerCase();
       kindEl.textContent = kind;
       kindEl.className = `verso-kind-badge verso-kind-${kind}`;
@@ -165,7 +165,8 @@
       }
 
       // Type Signature with Lean syntax highlighting
-      sigEl.innerHTML = this.highlightLean(data.typeSignature || `${kind} ${data.name}`);
+      // A term's brackets are lists / sets, not binders: don't colour them as such.
+      sigEl.innerHTML = this.highlightLean(data.typeSignature || `${kind} ${data.name}`, { binders: kind !== 'term' });
 
       // PR Diff Banner
       if (data.source === 'pr_diff' && data.element) {
@@ -178,12 +179,16 @@
         prBanner.classList.add('verso-hidden');
       }
 
-      // Docstring
+      // Docstring (a term's hover is just its type, as in Lean)
       if (data.docstring) {
         docEl.innerHTML = this.renderMarkdown(data.docstring);
         docEl.classList.remove('verso-hidden');
+      } else if (data.kind === 'term') {
+        docEl.innerHTML = '';
+        docEl.classList.add('verso-hidden');
       } else {
         docEl.innerHTML = '<span class="verso-no-doc">No docstring available.</span>';
+        docEl.classList.remove('verso-hidden');
       }
 
       // Source & Docs Link
@@ -205,6 +210,9 @@
         } else {
           docsLink.classList.add('verso-hidden');
         }
+      } else if (data.source === 'term') {
+        sourceEl.textContent = 'Type inferred from the source';
+        docsLink.classList.add('verso-hidden');
       } else if (data.source === 'local_var') {
         sourceEl.textContent = data.declaredAt ? `Declared with \`variable\` (line ${data.declaredAt})` : 'Local variable';
         docsLink.classList.add('verso-hidden');
@@ -353,8 +361,9 @@
      * Single-pass syntax highlighter for Lean 4 signatures.
      * Prevents regex corruption of injected HTML tags.
      */
-    highlightLean(code) {
+    highlightLean(code, opts = {}) {
       if (!code) return '';
+      const binders = opts.binders !== false;
 
       function escapeHtml(str) {
         return str
@@ -390,10 +399,13 @@
           result += `<span class="v-str">${escapeHtml(str)}</span>`;
         } else if (kw) {
           result += `<span class="v-kw">${escapeHtml(kw)}</span>`;
-        } else if (inst) {
-          result += `<span class="v-inst">${escapeHtml(inst)}</span>`;
-        } else if (implicit) {
-          result += `<span class="v-implicit">${escapeHtml(implicit)}</span>`;
+        } else if (inst || implicit) {
+          if (binders) {
+            result += `<span class="${inst ? 'v-inst' : 'v-implicit'}">${escapeHtml(full)}</span>`;
+          } else {
+            // Highlight inside the brackets as ordinary code.
+            result += full[0] + this.highlightLean(full.slice(1, -1), { binders: false }) + full[full.length - 1];
+          }
         } else if (sym) {
           result += `<span class="v-sym">${escapeHtml(sym)}</span>`;
         }

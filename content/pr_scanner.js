@@ -10,6 +10,13 @@
   const DECL_REGEX = /^(?:@\[[^\]]*\]\s*)*(?:private\s+|protected\s+|public\s+|noncomputable\s+|scoped\s+|partial\s+|nonrec\s+|unsafe\s+|meta\s+)*(theorem|lemma|def|inductive|structure|class|abbrev|opaque|instance|alias)\s+([A-Za-z0-9_'.\u0370-\u03FF\u2070-\u209F]+)([\s\S]*)/;
   const SIG_END = /:=|\bwhere\b|(^|\s)by\b|^\s*\|/;
 
+  /** A declaration's signature as Lean's hover prints it (`foo (x : ℝ) : P`); aliases as written. */
+  function leanStyle(kind, name, body) {
+    const bc = (typeof window !== 'undefined' ? window : self).VersoBinderContext;
+    if (kind === 'alias' || !bc || !bc.leanSignature) return `${kind} ${name}${body ? ' ' + body : ''}`;
+    return bc.leanSignature(name, body);
+  }
+
   /**
    * Where a declaration's signature ends: the first `:=`, `where`, ` by` or leading `|` at
    * bracket depth 0 (a parameter's default value, `(hq : P := by simp)`, is inside it). -1 if none.
@@ -214,7 +221,7 @@
           }
           const sigEnd = signatureEnd(rest, kind === 'alias');
           const body = (sigEnd !== -1 ? rest.substring(0, sigEnd) : rest).replace(/\s+/g, ' ').trim();
-          const signature = `${kind} ${name}${body ? ' ' + body : ''}`;
+          const signature = leanStyle(kind, name, body);
 
           const lineNum = this.extractLineNumber(row, i + 1);
 
@@ -223,6 +230,7 @@
             shortName: name.split('.').pop(),
             kind: kind,
             typeSignature: signature,
+            signature: body,
             docstring: currentDocstring || `*Defined locally in this pull request.*`,
             module: filePath,
             filePath: filePath,
@@ -312,7 +320,7 @@
         const name = declared.startsWith('_root_.') ? declared.slice(7) : (ns ? `${ns}.${declared}` : declared);
         decls.push({
           name, declaredAs: declared, shortName: declared.split('.').pop(), kind,
-          typeSignature: `${kind} ${name}${body ? ' ' + body : ''}`,
+          typeSignature: leanStyle(kind, name, body), signature: body,
           docstring: doc, module, filePath, lineNumber: i + 1, source: 'project'
         });
         doc = '';

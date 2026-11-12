@@ -101,6 +101,9 @@
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
+  /** A PR / project declaration's `binders : type` (records from older scans: strip `kind name`). */
+  const declSig = (d) => (typeof d.signature === 'string' ? d.signature : d.typeSignature.replace(/^\S+\s+\S+\s*/, ''));
+
   /**
    * `Namespace.field` for `receiver.field` when the receiver is a local whose binder
    * type can be read from the surrounding declaration; null otherwise.
@@ -165,7 +168,7 @@
         }
         const prBase = window.LeanPRScanner && window.LeanPRScanner.find(nested.base);
         if (prBase && prBase.typeSignature) {
-          const sig = prBase.typeSignature.replace(/^\S+\s+\S+\s*/, '');
+          const sig = declSig(prBase);
           const ns = ctx.typeHead(ctx.conclusionOf(sig), (v) => {
             const vt = ctx.findBinderType(v, sig);
             return vt ? ctx.typeHead(vt, null) : null;
@@ -185,7 +188,7 @@
         // A declaration from this PR (not in Loogle yet): use its signature here.
         const prDecl = window.LeanPRScanner && window.LeanPRScanner.find(head);
         if (prDecl && prDecl.typeSignature) {
-          const sig = prDecl.typeSignature.replace(/^\S+\s+\S+\s*/, '');
+          const sig = declSig(prDecl);
           const sigVar = (v) => {
             const vt = ctx.findBinderType(v, sig);
             return vt ? ctx.typeHead(vt, null) : null;
@@ -234,7 +237,7 @@
     if (fields.length >= 2 && !isLocal(fields[0]) && /^[a-z_]/.test(fields[0]) && scanner && !scanner.declarations.has(fields.join('.'))) {
       const prHead = scanner.declarations.get(fields[0]);
       if (prHead && prHead.typeSignature && prHead.kind !== 'alias') {
-        const sig = prHead.typeSignature.replace(/^\S+\s+\S+\s*/, '');
+        const sig = declSig(prHead);
         const ns = ctx.typeHead(ctx.conclusionOf(sig), (v) => {
           const vt = ctx.findBinderType(v, sig);
           return vt ? ctx.typeHead(vt, null) : null;
@@ -375,7 +378,7 @@
    */
   async function constantSignature(name, fileRef) {
     const pr = window.LeanPRScanner;
-    const strip = (d) => d.typeSignature.replace(/^\S+\s+\S+\s*/, '');
+    const strip = declSig;
     const exact = pr && pr.declarations.get(name);
     if (exact && (exact.name === name || exact.name === `_root_.${name}`)) return strip(exact);
     const res = await sendMessageP({ action: 'CONSTANT_SIGNATURE', name, fileRef });
@@ -442,9 +445,46 @@
   }
 
   /**
+   * The type of the term around a gap, like Lean's hover on the space in `f x` (`f x : β`).
+   * Shown only when the type can be worked out from the source and constants' signatures.
+   */
+  async function triggerTermLookup(tokenInfo) {
+    const ctx = window.VersoBinderContext;
+    const { token, boundingRect } = tokenInfo;
+    if (!ctx || !ctx.termTypeOf) return;
+    if (loadingTimer) clearTimeout(loadingTimer);
+    loadingTimer = setTimeout(() => {
+      if (lastHoveredToken === token) window.VersoTooltipView.showLoading(tokenInfo.termText, boundingRect);
+    }, 180);
+    let type = null;
+    try {
+      const contextText = ctx.contextFromDom(tokenInfo.textNode) || '';
+      const fileRef = ctx.fileRefFromDom(tokenInfo.textNode);
+      const variableOf = fileRef
+        ? async (name) => { const r = await sendMessageP({ action: 'FILE_VARIABLE', name, fileRef }); return r && r.type; }
+        : null;
+      type = await ctx.termTypeOf(tokenInfo.termNode, tokenInfo.termSource, contextText,
+        (name) => constantSignature(name, fileRef), { parent: tokenInfo.termParent, path: tokenInfo.termPath, expected: tokenInfo.termExpected, variableOf });
+    } catch (err) {
+      type = null;
+    }
+    if (loadingTimer) { clearTimeout(loadingTimer); loadingTimer = null; }
+    if (lastHoveredToken !== token) return;
+    if (!type) { window.VersoTooltipView.hide(false); return; }
+    let shown = tokenInfo.termText;
+    try { shown = ctx.termDisplay(tokenInfo.termNode, ctx.contextFromDom(tokenInfo.textNode) || '') || shown; } catch (err) { /* source text */ }
+    const clip = (t, n) => (t.length > n ? t.slice(0, n - 1) + '…' : t);
+    window.VersoTooltipView.show({
+      name: shown, kind: 'term', source: 'term',
+      typeSignature: `${clip(shown, 300)} : ${clip(type, 600)}`
+    }, boundingRect);
+  }
+
+  /**
    * Resolve and display hover definition.
    */
   function triggerHoverLookup(tokenInfo) {
+    if (tokenInfo.kind === 'term') { triggerTermLookup(tokenInfo); return; }
     const { token, subToken, boundingRect } = tokenInfo;
     const lookup = lookupContext(tokenInfo);
     if (lookup.skip) return;
@@ -554,12 +594,21 @@
     const root = document.getElementById('verso-hover-root');
     if (root && root.contains(e.target)) {
       window.VersoTooltipView.clearHideTimer();
+      // Don't let a token crossed on the way here replace the tooltip being read.
+      if (hoverTimer) {
+        clearTimeout(hoverTimer);
+        hoverTimer = null;
+        lastHoveredToken = null;
+        lastHoveredRect = null;
+      }
       return;
     }
 
     // 2. Hysteresis: if tooltip is visible, check if mouse is still inside the active token's area
+    // (a name's; a term's area holds names with their own hovers). Narrow sideways, so the gap
+    // next to a name (`f x`) can be hovered.
     if (window.VersoTooltipView.isVisible() && lastHoveredRect) {
-      const padX = 14;
+      const padX = 3;
       const padY = 8;
       const inX = e.clientX >= (lastHoveredRect.left - padX) && e.clientX <= (lastHoveredRect.right + padX);
       const inY = e.clientY >= (lastHoveredRect.top - padY) && e.clientY <= (lastHoveredRect.bottom + padY);
@@ -622,7 +671,7 @@
     }
 
     lastHoveredToken = tokenInfo.token;
-    lastHoveredRect = tokenInfo.boundingRect;
+    lastHoveredRect = tokenInfo.kind === 'term' ? null : tokenInfo.boundingRect;
 
     // Debounce hover before showing definition
     hoverTimer = setTimeout(() => {
@@ -673,7 +722,7 @@
   });
 
   // Exposed for the test suite.
-  window.VersoContentInternals = { receiverFor, lookupContext, isInProse, isInAttribute, refineLocal };
+  window.VersoContentInternals = { receiverFor, lookupContext, isInProse, isInAttribute, refineLocal, triggerTermLookup };
 
   // Startup
   loadSettings();

@@ -8,14 +8,15 @@ It works on both GitHub diff views (the classic `/files` view and the newer `/ch
 
 ## What a hover shows
 
-- **Mathlib / Lean declarations**: signature, docstring, module and a link to the Mathlib docs, via [Loogle](https://loogle.lean-lang.org/).
+- **Terms**: hover the space between a function and its arguments, a bracket or an operator, and you get the term there with its type, as in Lean's infoview: `a b : Y`, `abs_le.mp h : -1 ≤ x ∧ x ≤ 1`, `2 : ℕ` for the exponent in `x ^ 2`. The type is worked out from local types and the signatures of the constants involved: arguments' types, anonymous constructors `⟨h₁, h₂⟩`, the declared type in `have h : T := …`, and how the term is used all fix implicit arguments. Arguments still unknown show as `?b`, as Lean shows unassigned metavariables. Terms broken across lines are read whole. When the type can't be worked out, no tooltip appears.
+- **Mathlib / Lean declarations**: the signature as Lean's hover prints it (`mul_pos.{u_1} {α : Type u_1} [MulZeroClass α] … : 0 < a * b`), docstring, module and a link to the Mathlib docs, via [Loogle](https://loogle.lean-lang.org/).
 - **Declarations added in the PR**: indexed from the diff (`theorem`, `lemma`, `def`, `structure`, `alias`, …) with multi-line signatures and docstrings, plus a "Jump to line in PR" button.
 - **Tactics**: docstrings for ~470 tactics, parsed from Mathlib's tactic reference and cached for a week (`fun_prop`, `positivity`, `filter_upwards`, …).
 - **Local variables and hypotheses**: their type, whether written (`(hb : 0 < b)`, `have h : …`, `by_cases h : …`, file-level `variable`s) or inferred:
   - `intro` / `rintro` / `fun`: binders peeled off the goal (`∀ x ∈ s, …`, `A → B`, `s ⊆ t`);
   - `obtain` / `rcases`: patterns destructured through `∃` / `∧` / `↔` / `∨` (for constant terms such as `le_or_gt b 1`, the lemma's signature is instantiated with the arguments); the `·` bullet you hover in picks the case;
   - anonymous projections such as `hy.1`, `hy.2`;
-  - a warning when the hypothesis was changed earlier (`rw … at h`, `simp at h`).
+  - after `rw … at h` (also `nth_rw`, `erw`, `change … at h`), the type is replayed from the rewrite rules' statements; when a tactic that can't be replayed changes it (`simp at h`, `norm_num at h`, …), the type from before that tactic is shown, marked `-- outdated`.
 - **Named arguments**: `(b := a)` shows the parameter `b` of the function being applied.
 
 ## How names are resolved
@@ -56,8 +57,8 @@ chrome-lean-lens/
 ├── background/
 │   └── service_worker.js          # Loogle, file scope, tactic docs, caching, companion server
 ├── content/
-│   ├── lean_tokenizer.js          # Token under the cursor, tactic position, notation
-│   ├── binder_context.js          # Binders, type heads, receivers, local type inference
+│   ├── lean_tokenizer.js          # Name or term under the cursor, tactic position, notation
+│   ├── binder_context.js          # Binders, receivers, local types; term parser for gap hovers and rewrite replay
 │   ├── pr_scanner.js              # Declarations added in the PR
 │   ├── builtins_db.js             # Offline docs for core tactics and types
 │   ├── tooltip_view.js            # Tooltip UI and Markdown rendering
