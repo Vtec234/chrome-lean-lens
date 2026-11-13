@@ -246,6 +246,11 @@
               linePrefix: fullLineText.slice(this.markerLength(lineContainer), lineRes.start),
               tokenText: fullLineText.slice(lineRes.start, lineRes.end),
               lineSuffix: fullLineText.slice(lineRes.end),
+              // Where the hovered text and the pointer are in the line of code (after any diff
+              // marker), to look up what Lean itself recorded there.
+              column: lineRes.subStart - this.markerLength(lineContainer),
+              columnEnd: lineRes.subEnd - this.markerLength(lineContainer),
+              caret: lineOffset - this.markerLength(lineContainer),
               boundingRect: tokenRange.getBoundingClientRect(),
               textNode: textNode
             };
@@ -325,6 +330,9 @@
         termOnParens: hit.onParens,
         linePrefix: prefix,
         lineSuffix: code.slice(at + 1),
+        column: at,
+        columnEnd: at + 1,
+        caret: at,
         boundingRect: rect,
         textNode: textNode
       };
@@ -431,7 +439,7 @@
      * Fully compatible with both GitHub's classic diffs and the new React-based /changes view.
      */
     static isInsideLeanContext(element) {
-      if (!element) return false;
+      if (!element || typeof element.closest !== 'function') return false; // the document itself
 
       // 1. Check for standard GitHub diff lines (classic, split, and new React /changes views)
       const inDiff = element.closest(

@@ -823,7 +823,10 @@ const sampleRequests = {
   GET_SETTINGS: {},
   SET_SETTINGS: { settings: { hoverDelay: 300 } },
   CLEAR_CACHE: {},
-  TEST_LOCAL_SERVER: { url: 'http://127.0.0.1:9' },
+  TEST_HELPER: { url: 'http://127.0.0.1:9', token: 'x' },
+  EXACT_HOVER: { fileRef: null },
+  HELPER_RUN: { owner: 'o', repo: 'r', paths: ['A.lean'] },
+  HELPER_ALLOW: { repo: 'o/r' },
   FILE_VARIABLE: { name: 'hT', fileRef: null },
   FILE_INSTANCES: { fileRef: null },
   NOTATION_DOC: { name: '«term_+_»' },
@@ -1423,6 +1426,366 @@ console.log("21. Testing cases from sweeping DifferentProofs PRs...");
   }));
 }
 console.log("   ✓ DifferentProofs cases verified.\n");
+
+// 22. Real Lean, from the local helper. SubVerso's output for test/fixtures/Sample.lean (made by
+//     running Lean on it) becomes the data the extension reads; the worker and the page use it.
+console.log("22. Testing real Lean data (the local helper)...");
+{
+  const { pathToFileURL } = require('url');
+  const os = require('os');
+  const sampleSource = fs.readFileSync(path.join(__dirname, 'fixtures/Sample.lean'), 'utf8');
+  const sampleModule = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures/Sample.subverso.json'), 'utf8'));
+  const srcLines = sampleSource.split('\n');
+  /** Column (UTF-16, as the browser counts) of the `nth` occurrence of `word` on a 1-based line. */
+  const col = (line, word, nth = 0) => {
+    let i = -1;
+    for (let k = 0; k <= nth; k++) i = srcLines[line - 1].indexOf(word, i + 1);
+    assert(i >= 0, `"${word}" is on line ${line}`);
+    return i;
+  };
+  const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
+  loadScript('background/exact_data.js');
+  const exact = context.LeanLensExact;
+
+  asyncChecks.push((async () => {
+    const helperDir = path.join(__dirname, '..', 'helper');
+    const { convertModule, DATA_FORMAT_VERSION } = await import(pathToFileURL(path.join(helperDir, 'convert.mjs')).href);
+    const helper = await import(pathToFileURL(path.join(helperDir, 'lean-lens-helper.mjs')).href);
+
+    // --- The converter: Lean's hovers, proof states and messages, by line and column.
+    const data = Object.assign(convertModule(sampleModule, sampleSource), { lean: 'leanprover/lean4:v4.35.0' });
+    assert.strictEqual(data.version, DATA_FORMAT_VERSION);
+    assert.strictEqual(exact.FORMAT_VERSION, DATA_FORMAT_VERSION, 'the extension reads the format the helper writes');
+    const at = (line, word, nth = 0, caretIn = 0) => {
+      const c = col(line, word, nth);
+      return exact.describe(data, line, c, c + word.length, c + caretIn);
+    };
+    // A constant: Lean's signature and docstring.
+    const dbl = at(4, 'double', 1);
+    assert.strictEqual(dbl.token.kind, 'const');
+    assert.strictEqual(dbl.token.name, 'double');
+    assert.strictEqual(dbl.token.typeSignature, 'double (n : Nat) : Nat');
+    assert.strictEqual(dbl.token.docstring, 'Doubles a number.');
+    assert.strictEqual(dbl.goals, null, 'a statement is not in a proof');
+    assert.strictEqual(dbl.lean, 'leanprover/lean4:v4.35.0');
+    // A variable and a numeral: their types.
+    assert.strictEqual(at(4, 'n', 0).token.typeSignature, 'n : Nat');
+    assert.strictEqual(at(4, 'n', 0).token.kind, 'variable');
+    assert.strictEqual(at(4, '2').token.typeSignature, '2 : Nat');
+    // The pointer at a token's right edge still means that token.
+    assert.strictEqual(at(5, 'double', 0, 6).token.name, 'double');
+    // A tactic: its docs, and the goals after it.
+    const omega = at(6, 'omega');
+    assert.strictEqual(omega.token.kind, 'tactic');
+    assert(/omega/.test(omega.token.docstring), 'the tactic\'s docstring');
+    assert.strictEqual(JSON.stringify(omega.goals.goals), '[]', 'no goals after `omega`');
+    assert.strictEqual(omega.goals.at, false);
+    const unfold = at(5, 'unfold');
+    assert.strictEqual(unfold.goals.tactic, 'unfold double');
+    assert.strictEqual(unfold.goals.goals.join('|'), 'n : Nat\n⊢ n + n = 2 * n');
+    // `by`: the goal the proof starts from.
+    const by4 = at(4, 'by');
+    assert.strictEqual(by4.goals.at, true);
+    assert.strictEqual(by4.goals.goals.join('|'), 'n : Nat\n⊢ double n = 2 * n');
+    // Several goals; hypotheses of one type share a line, as in Lean's infoview.
+    assert.strictEqual(at(14, 'constructor').goals.goals.join('|'),
+      'case left\np q : Prop\nhp : p\nhq : q\n⊢ p|case right\np q : Prop\nhp : p\nhq : q\n⊢ q');
+    // `have … := by`: SubVerso records the theorem's opening goal on that `by` (`⊢ p ∧ q`, where
+    // Lean's goal is `⊢ q`). That state is dropped; the `have` shows the state after it.
+    assert(!data.tactics.some((t) => t[0] === 16 && t[1] === col(16, 'by')), 'no state on the nested `by`');
+    const nestedBy = at(16, 'by');
+    assert.strictEqual(nestedBy.goals.tactic, "have hq' : q := by exact hq");
+    assert.strictEqual(nestedBy.goals.goals.join('|'), "case right\np q : Prop\nhp : p\nhq hq' : q\n⊢ q");
+    assert.strictEqual(at(16, 'exact').goals.goals.length, 0);
+    // A case of `induction … with`: the goal it starts from; each `rw` rule: the goal after it.
+    const succ = at(22, 'succ');
+    assert.strictEqual(succ.goals.at, true);
+    assert.strictEqual(succ.goals.goals.join('|'), 'case succ\nk : Nat\nih : 0 + k = k\n⊢ 0 + (k + 1) = k + 1');
+    const rule = at(23, 'Nat.add_succ');
+    assert(rule.token.typeSignature.startsWith('Nat.add_succ '), rule.token.typeSignature);
+    assert.strictEqual(rule.goals.goals.join('|'), 'case succ\nk : Nat\nih : 0 + k = k\n⊢ (0 + k).succ = k + 1');
+    // Lean's messages: an error, and `#check`'s output.
+    const failed = at(30, 'rfl');
+    assert.strictEqual(failed.messages[0].severity, 'error');
+    assert(failed.messages[0].text.startsWith('Tactic `rfl` failed'), failed.messages[0].text);
+    assert.strictEqual(at(27, '#check').messages[0].text, 'double (n : Nat) : Nat');
+    // Columns count UTF-16 units: `𝕜` is two.
+    assert.strictEqual(at(32, 'h𝕜').token.typeSignature, 'h𝕜 : 𝕜 = 𝕜');
+    assert.strictEqual(at(32, 'by').goals.goals.join('|'), '𝕜 : Nat\nh𝕜 : 𝕜 = 𝕜\n⊢ 𝕜 + 0 = 𝕜');
+    // Output that doesn't rebuild the source is refused rather than shown at the wrong place.
+    assert.throws(() => convertModule(sampleModule, sampleSource.replace('double', 'triple')), /does not match the source/);
+
+    // Whitespace is the one thing SubVerso may drop (the blank lines between a Verso document's
+    // blocks); any other difference is refused.
+    const blocks = { items: [{ code: 0, defines: [] }, { code: 1, defines: [] }],
+      data: { tokens: {}, goals: {}, messageContents: {}, code: { 0: { unparsed: { str: '#doc (Manual) "T" =>' } }, 1: { unparsed: { str: ':::group "g"\nProse.\n:::' } } } } };
+    assert.strictEqual(convertModule(blocks, '#doc (Manual) "T" =>\n\n:::group "g"\nProse.\n:::\n').tactics.length, 0);
+    assert.throws(() => convertModule(blocks, '#doc (Manual) "T" =>\n\nextra\n:::group "g"\nProse.\n:::\n'), /does not match the source/);
+    assert.throws(() => convertModule(blocks, '#doc (Manual) "T" =>\n\n:::group "g"\nProse.\n:::\nmore'), /covers/);
+
+    // --- The helper: what it accepts, and what it answers without running anything.
+    assert(helper.isRepo('seewoo5/DifferentProofs') && helper.isRepo('leanprover-community/mathlib4'));
+    for (const bad of ['../x', 'a/b/c', 'a/..', 'a', '-a/b', 'a/b c']) assert(!helper.isRepo(bad), `not a repository: ${bad}`);
+    assert(helper.isSha('1adf3d0cad950f5a9059596b4df342c38aae8353') && !helper.isSha('1adf3d0') && !helper.isSha('HEAD'));
+    assert(helper.isLeanPath('A/B.lean') && helper.isLeanPath('Formal/DF_1/DF_1_2.lean'));
+    for (const bad of ['../A.lean', '/abs/A.lean', 'A/../B.lean', 'A/B.txt', 'A\\B.lean', 'A//B.lean']) assert(!helper.isLeanPath(bad), `not a file path: ${bad}`);
+    assert.strictEqual(helper.importsOf(['module', '', 'public import Mathlib.A', 'import all B.C -- note', '/- import Not.This -/', 'meta import D', '',
+      '/-- doc: import Nope -/', 'theorem x : True := trivial', 'import Late'].join('\n')).join(' '), 'Mathlib.A B.C D');
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lean-lens-test-'));
+    try {
+      fs.mkdirSync(path.join(root, 'src'));
+      assert.strictEqual(helper.moduleNameFor(root, './.', 'A/B/C.lean'), 'A.B.C');
+      assert.strictEqual(helper.moduleNameFor(root, `./.${path.delimiter}${path.join(root, 'src')}`, 'src/Foo/Bar.lean'), 'Foo.Bar', 'the deepest source root');
+      assert.strictEqual(helper.moduleNameFor(root, path.join(root, 'src'), 'Other/X.lean'), null, 'outside every source root');
+      fs.writeFileSync(path.join(root, 'lakefile.toml'), 'name = "x"\n');
+      fs.mkdirSync(path.join(root, 'sub', 'deep'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'sub', 'lakefile.lean'), '');
+      assert.strictEqual(helper.lakeRootFor(root, 'A/B.lean'), '');
+      assert.strictEqual(helper.lakeRootFor(root, 'sub/deep/C.lean'), 'sub');
+      assert(helper.usesMathlib('{"name":"x","packages":[{"name":"mathlib"}]}') && helper.usesMathlib('{"name":"mathlib","packages":[]}'));
+      assert(!helper.usesMathlib('{"name":"x","packages":[{"name":"batteries"}]}') && !helper.usesMathlib('not json'));
+      // Only this machine's extension, with the token.
+      const ok = { host: '127.0.0.1:5326', origin: 'chrome-extension://abcdef', 'x-lean-lens-token': 'secret-token' };
+      assert(helper.authorized(ok, 5326, 'secret-token'));
+      assert(helper.authorized(Object.assign({}, ok, { origin: undefined }), 5326, 'secret-token'), 'no Origin: not a browser');
+      assert(!helper.authorized(Object.assign({}, ok, { origin: 'https://evil.example' }), 5326, 'secret-token'), 'a web page');
+      assert(!helper.authorized(Object.assign({}, ok, { host: 'evil.example:5326' }), 5326, 'secret-token'), 'DNS rebinding');
+      assert(!helper.authorized(Object.assign({}, ok, { 'x-lean-lens-token': 'wrong' }), 5326, 'secret-token'));
+      assert(!helper.authorized(Object.assign({}, ok, { 'x-lean-lens-token': undefined }), 5326, 'secret-token'));
+
+      const h = helper.createHelper({ cacheDir: path.join(root, 'cache'), log: () => {} });
+      const sha = '1adf3d0cad950f5a9059596b4df342c38aae8353';
+      const ask = (method, url, body) => { const r = h.handle(method, url, body); return { status: r.status, body: JSON.parse(r.body) }; };
+      assert(h.config.token.length >= 20, 'a token is made on first run');
+      assert.strictEqual(helper.createHelper({ cacheDir: path.join(root, 'cache'), log: () => {} }).config.token, h.config.token, 'and kept');
+      assert.strictEqual(ask('GET', '/status').body.format, DATA_FORMAT_VERSION);
+      // A repository that was not allowed is never touched.
+      const refused = ask('POST', '/run', { repo: 'o/r', sha, paths: ['A.lean'] });
+      assert.strictEqual(refused.status, 403);
+      assert.strictEqual(refused.body.state, 'not_allowed');
+      assert.strictEqual(ask('POST', '/file', { repo: 'o/r', sha, path: 'A.lean' }).body.state, 'not_allowed');
+      assert.strictEqual(ask('POST', '/allow', { repo: 'o/r' }).body.ok, true);
+      assert.strictEqual(ask('POST', '/file', { repo: 'o/r', sha, path: 'A.lean' }).body.state, 'missing');
+      assert.strictEqual(ask('GET', `/job?repo=o/r&sha=${sha}`).body.state, 'idle');
+      assert.strictEqual(ask('POST', '/file', { repo: 'o/r', sha: 'main', path: 'A.lean' }).status, 400);
+      assert.strictEqual(ask('POST', '/file', { repo: 'o/r', sha, path: '../../etc/passwd.lean' }).status, 400);
+      assert.strictEqual(ask('POST', '/run', { repo: 'o/r', sha, paths: ['A.lean', '/etc/x.lean'] }).status, 400);
+      assert.strictEqual(ask('POST', '/allow', { repo: '../..' }).status, 400);
+      // Once Lean has run, the file's data is served from disk.
+      const stored = path.join(root, 'cache', 'data', `v${DATA_FORMAT_VERSION}`, 'o', 'r', sha, 'Sample.lean.json');
+      fs.mkdirSync(path.dirname(stored), { recursive: true });
+      fs.writeFileSync(stored, JSON.stringify(data));
+      const ready = ask('POST', '/file', { repo: 'o/r', sha, path: 'Sample.lean' });
+      assert.strictEqual(ready.body.state, 'ready');
+      assert.strictEqual(ready.body.data.hovers.length, data.hovers.length);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+
+    // --- The worker: asks the helper, keeps a file's data once Lean has run.
+    const send = (message) => new Promise((resolve) => workerListeners[0](message, {}, resolve));
+    const calls = [];
+    let fileAnswer = { state: 'missing' };
+    context.URL = URL;
+    context.AbortController = AbortController;
+    context.fetch = async (url, init = {}) => {
+      const u = new URL(url);
+      if (u.host !== '127.0.0.1:5326') return { ok: false, status: 404, json: async () => null, text: async () => '' };
+      const body = init.body ? JSON.parse(init.body) : null;
+      calls.push({ path: u.pathname, body });
+      if ((init.headers || {})['X-Lean-Lens-Token'] !== 'tok') return { ok: false, status: 401, json: async () => ({ error: 'no' }) };
+      const answers = {
+        '/file': body && body.path === 'Old.lean' ? { state: 'ready', data: { version: 1 } } : fileAnswer,
+        '/run': { state: 'pending', phase: 'queued', message: 'Waiting for the previous run', done: 0, total: 2 },
+        '/allow': { ok: true, allow: ['o/r'] },
+        '/status': { ok: true, allow: ['o/r'] }
+      };
+      return { ok: true, status: 200, json: async () => answers[u.pathname] };
+    };
+    const settingsWith = (extra) => send({ action: 'SET_SETTINGS', settings: Object.assign({ enableHelper: true, helperUrl: 'http://127.0.0.1:5326', helperToken: 'tok' }, extra) });
+    const fileRef = { owner: 'o', repo: 'r', pr: '7', sha: 'a'.repeat(40), side: 'right', path: 'Sample.lean', line: 4 };
+    const hover = (extra = {}) => send(Object.assign({ action: 'EXACT_HOVER', fileRef, column: col(4, 'double', 1), columnEnd: col(4, 'double', 1) + 6, caret: col(4, 'double', 1) + 2 }, extra));
+    try {
+      await settingsWith({});
+      let res = await hover();
+      assert.strictEqual(res.state, 'missing');
+      assert.strictEqual(res.repo, 'o/r');
+      assert.strictEqual(res.sha, 'a'.repeat(40));
+      assert.strictEqual(JSON.stringify(calls[0].body), JSON.stringify({ repo: 'o/r', sha: 'a'.repeat(40), path: 'Sample.lean' }));
+      const run = await send({ action: 'HELPER_RUN', owner: 'o', repo: 'r', pr: '7', sha: 'a'.repeat(40), paths: ['Sample.lean', 'Other.lean'] });
+      assert.strictEqual(run.state, 'pending');
+      assert.strictEqual(JSON.stringify(calls[calls.length - 1]), JSON.stringify({ path: '/run', body: { repo: 'o/r', sha: 'a'.repeat(40), pr: 7, paths: ['Sample.lean', 'Other.lean'] } }));
+      const allowed = await send({ action: 'HELPER_RUN', owner: 'o', repo: 'r', sha: 'a'.repeat(40), paths: ['Sample.lean'], allow: true });
+      assert.strictEqual(allowed.state, 'pending');
+      assert.strictEqual(calls[calls.length - 2].path, '/allow', 'allowing comes first');
+      fileAnswer = { state: 'ready', data };
+      res = await hover();
+      assert.strictEqual(res.state, 'ready', 'asked again after a run was started');
+      assert.strictEqual(res.token.typeSignature, 'double (n : Nat) : Nat');
+      const before = calls.length;
+      fileAnswer = { state: 'missing' };
+      res = await hover({ fileRef: Object.assign({}, fileRef, { line: 5 }), column: col(5, 'unfold'), columnEnd: col(5, 'unfold') + 6, caret: col(5, 'unfold') });
+      assert.strictEqual(res.goals.tactic, 'unfold double');
+      assert.strictEqual(calls.length, before, 'a commit\'s file is fetched once');
+      res = await hover({ fileRef: Object.assign({}, fileRef, { path: 'Old.lean' }) });
+      assert.strictEqual(res.state, 'error', 'data in another format is not used');
+      assert.strictEqual((await send({ action: 'TEST_HELPER', url: 'http://127.0.0.1:5326', token: 'tok' })).success, true);
+      assert.strictEqual((await send({ action: 'TEST_HELPER', url: 'http://127.0.0.1:5326', token: 'bad' })).state, 'unauthorized');
+      // Switched off: the helper is not contacted.
+      await settingsWith({ enableHelper: false });
+      const quiet = calls.length;
+      assert.strictEqual((await hover()).state, 'off');
+      assert.strictEqual(calls.length, quiet);
+    } finally {
+      delete context.fetch;
+      await send({ action: 'SET_SETTINGS', settings: {} });
+    }
+
+    // --- The page: Lean's hover when it has one; its goals added to any hover; a run only on a click.
+    const shown = [];
+    const sentMessages = [];
+    let exactAnswer = null;
+    const pctx = {
+      console, setTimeout, clearTimeout, location: { pathname: '/o/r/pull/7/changes' },
+      document: { addEventListener: () => {}, getElementById: () => null, querySelectorAll: () => [], body: {} },
+      Node: { ELEMENT_NODE: 1, TEXT_NODE: 3 }, MutationObserver: function () { this.observe = () => {}; },
+      chrome: { runtime: { onMessage: { addListener: () => {} }, lastError: null, sendMessage: (message, cb) => {
+        sentMessages.push(message);
+        if (message.action === 'GET_SETTINGS') cb({ settings: { enableHelper: true } });
+        else if (message.action === 'EXACT_HOVER') cb(exactAnswer && JSON.parse(JSON.stringify(exactAnswer)));
+        else if (message.action === 'HELPER_RUN') cb({ state: 'pending', phase: 'queued', message: 'Waiting for the previous run' });
+        else cb(null);
+      } }, storage: { local: { get: (k, cb) => cb({}), set: () => {} } } }
+    };
+    pctx.window = pctx; pctx.self = pctx; pctx.addEventListener = () => {};
+    pctx.VersoTooltipView = {
+      isPinned: false, isVisible: () => true, clearHideTimer: () => {}, scheduleHide: () => {}, showLoading: () => {},
+      show: (card, rect, shade, extras) => shown.push({ card, extras }),
+      hide: () => shown.push({ hidden: true }),
+      setExtras: (extras) => shown.push({ update: extras })
+    };
+    vm.createContext(pctx);
+    for (const f of ['content/builtins_db.js', 'content/lean_tokenizer.js', 'content/lean_terms.js', 'content/binder_context.js', 'content/term_hover.js', 'content/pr_scanner.js', 'content/content.js']) {
+      vm.runInContext(fs.readFileSync(path.join(__dirname, '..', f), 'utf8'), pctx);
+    }
+    const PI = pctx.VersoContentInternals;
+    pctx.VersoBinderContext.fileRefFromDom = () => ({ owner: 'o', repo: 'r', pr: '7', sha: 'a'.repeat(40), side: 'right', path: 'Sample.lean', line: 5 });
+    pctx.VersoBinderContext.contextFromDom = () => 'theorem double_eq (n : Nat) : double n = 2 * n := by\n  unfold double';
+    const hoverToken = async (token, extra = {}) => {
+      shown.length = 0;
+      sentMessages.length = 0;
+      PI.hovering(token);
+      PI.triggerHoverLookup(Object.assign({ token, subToken: token, chainUpToCursor: token, fullChain: token, linePrefix: '  ', lineSuffix: '',
+        boundingRect: {}, shade: [], textNode: {}, column: 2, columnEnd: 2 + token.length, caret: 3 }, extra));
+      await tick(5);
+      return shown[shown.length - 1];
+    };
+    const afterUnfold = { at: false, tactic: 'unfold double', goals: ['n : Nat\n⊢ n + n = 2 * n'] };
+    // Lean has a hover for the token: that is the card, with the proof state under it.
+    exactAnswer = { state: 'ready', repo: 'o/r', sha: 'a'.repeat(40), lean: 'leanprover/lean4:v4.35.0', messages: [], goals: afterUnfold,
+      token: { name: 'double', kind: 'const', typeSignature: 'double (n : Nat) : Nat', docstring: 'Doubles a number.', definedHere: false } };
+    let last = await hoverToken('double');
+    assert.strictEqual(last.card.source, 'lean');
+    assert.strictEqual(last.card.typeSignature, 'double (n : Nat) : Nat');
+    assert(last.card.sourceUrl.endsWith('find/?pattern=double#doc'), last.card.sourceUrl);
+    assert.strictEqual(last.extras.goals.tactic, 'unfold double');
+    assert.strictEqual(sentMessages.filter((m) => m.action === 'EXACT_HOVER').length, 1);
+    assert.strictEqual(sentMessages.find((m) => m.action === 'EXACT_HOVER').column, 2);
+    assert(!sentMessages.some((m) => m.action === 'LOOKUP_TOKEN'), 'no estimate is looked up');
+    // A keyword Lean has no docs for: the proof state alone; with no state either, nothing.
+    exactAnswer = Object.assign({}, exactAnswer, { token: null, goals: { at: true, tactic: 'by', goals: ['n : Nat\n⊢ double n = 2 * n'] } });
+    last = await hoverToken('by', { isKeyword: true });
+    assert.strictEqual(last.card, null, 'the goals-only card');
+    assert.strictEqual(last.extras.goals.at, true);
+    exactAnswer = Object.assign({}, exactAnswer, { goals: null });
+    assert.strictEqual((await hoverToken('by', { isKeyword: true })).hidden, true);
+    // On an operator Lean's data has documentation only: the estimate (the term and its type) is
+    // kept, with Lean's proof state added.
+    exactAnswer = { state: 'ready', repo: 'o/r', sha: 'a'.repeat(40), lean: 'leanprover/lean4:v4.35.0', messages: [], goals: afterUnfold,
+      token: { name: '+', kind: 'syntax', typeSignature: '', docstring: '`a + b` computes the sum of `a` and `b`.' } };
+    pctx.VersoBinderContext.termTypeOf = async () => 'ℕ';
+    pctx.VersoBinderContext.termDisplay = () => 'n + n';
+    last = await hoverToken('⟪term⟫ n + n', { kind: 'term', termText: 'n + n', termNode: {}, termSource: 'n + n' });
+    assert.strictEqual(last.card.source, 'term', 'the estimated term hover');
+    assert.strictEqual(last.card.typeSignature, 'n + n : ℕ');
+    assert.strictEqual(last.extras.goals.tactic, 'unfold double');
+    assert.strictEqual(last.extras.helper.state, 'ready');
+    // A later answer for an earlier hover of a token with the same text is dropped.
+    exactAnswer = { state: 'ready', repo: 'o/r', sha: 'a'.repeat(40), lean: 'l', messages: [], goals: null,
+      token: { name: 'hx', kind: 'variable', typeSignature: 'hx : 0 < x', docstring: '' } };
+    const answers = [];
+    const realSend = pctx.chrome.runtime.sendMessage;
+    pctx.chrome.runtime.sendMessage = (message, cb) => { if (message.action === 'EXACT_HOVER') answers.push(cb); else realSend(message, cb); };
+    shown.length = 0;
+    PI.hovering('hx');
+    const hoverAgain = (column) => PI.triggerHoverLookup({ token: 'hx', subToken: 'hx', chainUpToCursor: 'hx', fullChain: 'hx', linePrefix: '  ', lineSuffix: '',
+      boundingRect: {}, shade: [], textNode: {}, column, columnEnd: column + 2, caret: column });
+    hoverAgain(2);
+    hoverAgain(20);
+    answers[1]({ state: 'ready', lean: 'l', messages: [], goals: null, token: { name: 'hx', kind: 'variable', typeSignature: 'hx : second', docstring: '' } });
+    answers[0]({ state: 'ready', lean: 'l', messages: [], goals: null, token: { name: 'hx', kind: 'variable', typeSignature: 'hx : first', docstring: '' } });
+    await tick(5);
+    assert.strictEqual(shown.map((x) => x.card.typeSignature).join('|'), 'hx : second', 'only the hover in progress is shown');
+    pctx.chrome.runtime.sendMessage = realSend;
+    // Lean has not run: the estimate, with a button. Lean starts only when it is pressed.
+    exactAnswer = { state: 'missing', repo: 'o/r', sha: 'a'.repeat(40) };
+    last = await hoverToken('simp');
+    assert.strictEqual(last.card.source, 'builtin');
+    assert.strictEqual(last.extras.helper.state, 'missing');
+    assert(!sentMessages.some((m) => m.action === 'HELPER_RUN'), 'hovering never starts Lean');
+    last.extras.helper.run();
+    await tick(5);
+    const runMessage = sentMessages.find((m) => m.action === 'HELPER_RUN');
+    assert.strictEqual(JSON.stringify([runMessage.owner, runMessage.repo, runMessage.pr, runMessage.sha, runMessage.paths, runMessage.allow]),
+      JSON.stringify(['o', 'r', '7', 'a'.repeat(40), ['Sample.lean'], false]));
+    assert.strictEqual(shown[shown.length - 1].update.helper.state, 'pending', 'the open hover shows the run');
+    // A repository the helper may not run yet: the button allows it, then runs.
+    exactAnswer = { state: 'not_allowed', repo: 'o/r', sha: 'a'.repeat(40) };
+    last = await hoverToken('simp');
+    last.extras.helper.run();
+    await tick(5);
+    assert.strictEqual(sentMessages.find((m) => m.action === 'HELPER_RUN').allow, true);
+    // The helper switched off: nothing is asked of it.
+    PI.setSettings({ enableHelper: false });
+    last = await hoverToken('simp');
+    assert.strictEqual(last.card.source, 'builtin');
+    assert.strictEqual(last.extras, null);
+    assert(!sentMessages.some((m) => m.action === 'EXACT_HOVER'));
+    PI.hovering(null);
+
+    // --- The tooltip: the proof state, Lean's messages and the helper's status row.
+    const parts = {};
+    const part = () => ({ innerHTML: '', textContent: '', href: '', className: '', addEventListener: () => {},
+      classList: { names: new Set(), add(n) { this.names.add(n); }, remove(n) { this.names.delete(n); }, toggle(n, on) { if (on) this.names.add(n); else this.names.delete(n); }, contains(n) { return this.names.has(n); } } });
+    const view = tooltipView;
+    view.container = Object.assign(part(), { querySelector: (selector) => {
+      if (!parts[selector]) parts[selector] = Object.assign(part(), { parentElement: part(), querySelector: () => part() });
+      return parts[selector];
+    } });
+    view.show(null, null, null, { lean: 'leanprover/lean4:v4.35.0', goals: afterUnfold, messages: [{ severity: 'error', text: 'unsolved <goals>' }], helper: { state: 'ready' } });
+    assert.strictEqual(parts['#verso-kind'].textContent, 'goal');
+    assert(parts['#verso-goals-title'].innerHTML.includes('After <code class="verso-inline-code">unfold double</code>'), parts['#verso-goals-title'].innerHTML);
+    assert(parts['#verso-goals-body'].innerHTML.includes('n + n'), parts['#verso-goals-body'].innerHTML);
+    assert(parts['#verso-messages'].innerHTML.includes('verso-message-error') && parts['#verso-messages'].innerHTML.includes('unsolved &lt;goals&gt;'));
+    assert.strictEqual(parts['#verso-footer-source'].textContent, 'Lean 4.35.0 · run on this machine');
+    assert(parts['#verso-helper-bar'].classList.contains('verso-hidden'), 'no status row on Lean\'s own card');
+    view.show({ name: 'simp', kind: 'tactic', source: 'builtin', typeSignature: 'simp', docstring: 'd' }, null, null,
+      { goals: null, messages: [], helper: { state: 'missing', run: () => {} } });
+    assert.strictEqual(parts['#verso-helper-text'].textContent, 'Estimated. Lean has not run on this file.');
+    assert.strictEqual(parts['#verso-helper-btn'].textContent, 'Run Lean');
+    assert(!parts['#verso-helper-btn'].classList.contains('verso-hidden'));
+    assert(parts['#verso-goals'].classList.contains('verso-hidden'));
+    view.setExtras({ goals: { at: false, tactic: 'omega', goals: [] }, messages: [], helper: { state: 'pending', phase: 'elaborating', message: 'Elaborating 3 files', done: 1, total: 3 } });
+    assert.strictEqual(parts['#verso-helper-text'].textContent, 'Lean is running: Elaborating 3 files (1/3)');
+    assert(parts['#verso-helper-btn'].classList.contains('verso-hidden'));
+    assert(parts['#verso-goals-body'].innerHTML.includes('No goals'));
+    assert.strictEqual(view.helperStatus({ state: 'ready' }, true).text, "Estimated: Lean's data has no hover for this spot.");
+    assert.strictEqual(view.helperStatus({ state: 'ready' }, false), null);
+    assert.strictEqual(view.helperStatus({ state: 'not_allowed', repo: 'o/r' }, true).button, 'Allow and run');
+    assert.strictEqual(view.helperStatus({ state: 'off' }, true), null);
+  })());
+}
+console.log("   ✓ Real Lean data verified (asynchronous checks follow).\n");
 
 Promise.all(asyncChecks).then(() => {
   console.log("   ✓ Rewrite replay verified.\n");

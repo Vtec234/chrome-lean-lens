@@ -9,10 +9,11 @@ document.addEventListener('DOMContentLoaded', () => {
   const enablePRScanner = document.getElementById('enable-pr-scanner');
   const enableBuiltins = document.getElementById('enable-builtins');
   const enableLoogle = document.getElementById('enable-loogle');
-  const enableLocalVerso = document.getElementById('enable-local-verso');
-  const localVersoUrl = document.getElementById('local-verso-url');
-  const testServerBtn = document.getElementById('test-server-btn');
-  const serverTestResult = document.getElementById('server-test-result');
+  const enableHelper = document.getElementById('enable-helper');
+  const helperUrl = document.getElementById('helper-url');
+  const helperToken = document.getElementById('helper-token');
+  const testHelperBtn = document.getElementById('test-helper-btn');
+  const helperTestResult = document.getElementById('helper-test-result');
   const clearCacheBtn = document.getElementById('clear-cache-btn');
   const saveStatus = document.getElementById('save-status');
 
@@ -32,8 +33,9 @@ document.addEventListener('DOMContentLoaded', () => {
       enablePRScanner.checked = currentSettings.enablePRScanner !== false;
       enableBuiltins.checked = currentSettings.enableBuiltins !== false;
       enableLoogle.checked = currentSettings.enableLoogle !== false;
-      enableLocalVerso.checked = Boolean(currentSettings.enableLocalVerso);
-      localVersoUrl.value = currentSettings.localVersoUrl || 'http://127.0.0.1:8000';
+      enableHelper.checked = Boolean(currentSettings.enableHelper);
+      helperUrl.value = currentSettings.helperUrl || 'http://127.0.0.1:5326';
+      helperToken.value = currentSettings.helperToken || '';
     }
 
     if (res && res.stats) {
@@ -52,8 +54,9 @@ document.addEventListener('DOMContentLoaded', () => {
       enablePRScanner: enablePRScanner.checked,
       enableBuiltins: enableBuiltins.checked,
       enableLoogle: enableLoogle.checked,
-      enableLocalVerso: enableLocalVerso.checked,
-      localVersoUrl: localVersoUrl.value.trim()
+      enableHelper: enableHelper.checked,
+      helperUrl: helperUrl.value.trim(),
+      helperToken: helperToken.value.trim()
     };
 
     chrome.runtime.sendMessage({ action: "SET_SETTINGS", settings: currentSettings }, () => {
@@ -81,23 +84,28 @@ document.addEventListener('DOMContentLoaded', () => {
   enablePRScanner.addEventListener('change', saveSettings);
   enableBuiltins.addEventListener('change', saveSettings);
   enableLoogle.addEventListener('change', saveSettings);
-  enableLocalVerso.addEventListener('change', saveSettings);
-  localVersoUrl.addEventListener('change', saveSettings);
+  enableHelper.addEventListener('change', saveSettings);
+  helperUrl.addEventListener('change', saveSettings);
+  helperToken.addEventListener('change', saveSettings);
 
-  // Test Local Server Connection
-  testServerBtn.addEventListener('click', () => {
-    serverTestResult.textContent = 'Testing connection...';
-    serverTestResult.style.color = '#8b949e';
+  // Test the connection to the local helper
+  testHelperBtn.addEventListener('click', () => {
+    helperTestResult.textContent = 'Testing connection...';
+    helperTestResult.style.color = '#8b949e';
 
     chrome.runtime.sendMessage(
-      { action: "TEST_LOCAL_SERVER", url: localVersoUrl.value.trim() },
+      { action: "TEST_HELPER", url: helperUrl.value.trim(), token: helperToken.value.trim() },
       (res) => {
         if (res && res.success) {
-          serverTestResult.textContent = '✓ Connected! The local companion server is responding.';
-          serverTestResult.style.color = '#3fb950';
+          const allowed = (res.details && res.details.allow) || [];
+          helperTestResult.textContent = `✓ Connected. Allowed repositories: ${allowed.length ? allowed.join(', ') : 'none yet'}.`;
+          helperTestResult.style.color = '#3fb950';
+        } else if (res && res.state === 'unauthorized') {
+          helperTestResult.textContent = '✗ The helper is running but rejected this token.';
+          helperTestResult.style.color = '#f85149';
         } else {
-          serverTestResult.textContent = '✗ Could not connect to local server. Make sure companion server is running.';
-          serverTestResult.style.color = '#f85149';
+          helperTestResult.textContent = '✗ Could not reach the helper. Start it with: node helper/lean-lens-helper.mjs';
+          helperTestResult.style.color = '#f85149';
         }
       }
     );

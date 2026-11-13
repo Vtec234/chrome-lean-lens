@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Lean Lens: Lean 4 Hover Inspector for GitHub",
-  "version": "1.0.0",
-  "description": "Hover over Lean 4 code in GitHub pull requests and files to see definitions, types, docstrings, and tactic docs (via Loogle and the Mathlib docs).",
+  "version": "1.1.0",
+  "description": "Hover over Lean 4 code on GitHub to see types, docstrings and tactic docs, or Lean's own hovers and proof states via a local helper.",
   "icons": {
     "16": "icons/icon16.png",
     "32": "icons/icon32.png",

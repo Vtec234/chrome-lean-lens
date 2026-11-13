@@ -1,11 +1,13 @@
 /**
  * Background service worker for Lean Lens.
- * Coordinates definition queries across Loogle, the local companion server, and caches.
+ * Coordinates definition queries across the local Lean helper, Loogle, and caches.
  */
 
 // Shared binder parsing (also used by the content script).
 if (typeof importScripts === 'function') {
   try { importScripts('../content/lean_terms.js', '../content/binder_context.js', '../content/pr_scanner.js'); } catch (err) { /* lookups still work without them */ }
+  // Reading what the local helper's real Lean run produced.
+  try { importScripts('exact_data.js'); } catch (err) { /* approximate hovers still work */ }
 }
 
 const SETTINGS_KEY = "lean_lens_settings";
@@ -17,14 +19,16 @@ const DEFAULT_SETTINGS = {
   enablePRScanner: true,
   enableBuiltins: true,
   enableLoogle: true,
-  enableLocalVerso: false,
-  localVersoUrl: "http://127.0.0.1:8000",
+  // The local helper (helper/lean-lens-helper.mjs) that runs real Lean on this machine.
+  enableHelper: false,
+  helperUrl: "http://127.0.0.1:5326",
+  helperToken: "",
   theme: "auto"
 };
 
 // In-memory cache for speed during active review session
 const memoryCache = new Map();
-let queryStats = { totalQueries: 0, cacheHits: 0, loogleHits: 0, localHits: 0 };
+let queryStats = { totalQueries: 0, cacheHits: 0, loogleHits: 0, leanHits: 0 };
 
 /**
  * Get stored settings merged with defaults.
@@ -70,43 +74,6 @@ function getMathlibDocsUrl(moduleName, declName) {
   }
   const modPath = moduleName.replace(/\./g, "/");
   return `https://leanprover-community.github.io/mathlib4_docs/${modPath}.html#${encodeURIComponent(declName)}`;
-}
-
-/**
- * Query the local companion server if enabled.
- */
-async function queryLocalVerso(token, localUrl) {
-  try {
-    const url = new URL("/lookup", localUrl);
-    url.searchParams.set("name", token);
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 1200);
-
-    const response = await fetch(url.toString(), {
-      method: "GET",
-      signal: controller.signal,
-      headers: { "Accept": "application/json" }
-    });
-    clearTimeout(timeout);
-
-    if (!response.ok) return null;
-    const json = await response.json();
-    if (json && json.name) {
-      return {
-        name: json.name,
-        kind: json.kind || inferKind(json.name, json.type, json.doc),
-        typeSignature: json.type || json.typeSignature || "",
-        docstring: json.doc || json.docstring || "",
-        module: json.module || "LocalProject",
-        source: "local_verso",
-        sourceUrl: json.sourceUrl || `${localUrl}/doc#${encodeURIComponent(json.name)}`
-      };
-    }
-  } catch (err) {
-    // Local server offline or unreachable; fall through quietly
-  }
-  return null;
 }
 
 /**
@@ -1237,17 +1204,7 @@ async function handleLookupToken(token, subToken, fileRef, contextText, tacticPo
 
   const settings = await getSettings();
 
-  // 3. Try the local companion server if enabled
-  if (settings.enableLocalVerso && settings.localVersoUrl) {
-    const localResult = await queryLocalVerso(token, settings.localVersoUrl);
-    if (localResult) {
-      queryStats.localHits++;
-      memoryCache.set(token, localResult);
-      return localResult;
-    }
-  }
-
-  // 4. Try Loogle API (with smart namespace and substring resolution)
+  // 3. Try Loogle API (with smart namespace and substring resolution)
   if (settings.enableLoogle) {
     let loogleResult = await queryLoogle(token, subToken);
     if (!loogleResult || loogleResult.ambiguous) {
@@ -1301,6 +1258,101 @@ async function handleLookupToken(token, subToken, fileRef, contextText, tacticPo
   }
 
   return null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The local helper: real Lean, run on this machine (helper/lean-lens-helper.mjs).
+
+/**
+ * One request to the helper. Resolves to its JSON answer, or to `{state}` when there is none:
+ * 'off' (not set up), 'offline' (not running), 'unauthorized' (wrong token), 'not_allowed'
+ * (the repository is not allowed yet), 'error'.
+ */
+async function helperRequest(path, { body, settings, timeout = 6000 } = {}) {
+  const s = settings || await getSettings();
+  if (!s.enableHelper || !s.helperUrl || !s.helperToken) return { state: 'off' };
+  let timer = null;
+  try {
+    const controller = new AbortController();
+    timer = setTimeout(() => controller.abort(), timeout);
+    const res = await fetch(new URL(path, s.helperUrl).toString(), {
+      method: body ? 'POST' : 'GET',
+      headers: Object.assign({ 'X-Lean-Lens-Token': s.helperToken }, body ? { 'Content-Type': 'application/json' } : {}),
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal
+    });
+    if (res.status === 401) return { state: 'unauthorized' };
+    const json = await res.json().catch(() => null);
+    if (res.status === 403) return { state: 'not_allowed', repo: json && json.repo };
+    if (!res.ok || !json) return { state: 'error', error: (json && json.error) || `The helper answered ${res.status}` };
+    return json;
+  } catch (err) {
+    return { state: 'offline' };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// What the helper said about a file: its data once Lean has run, else a short-lived state.
+const exactCache = new Map(); // owner/repo@sha:path → { until, value: Promise<{state, data?, …}> }
+const EXACT_FILES_KEPT = 40;
+
+async function commitOf(fileRef) {
+  if (fileRef.sha) return fileRef.sha;
+  if (!fileRef.pr) return null;
+  const rev = await getPrRevision(fileRef.owner, fileRef.repo, fileRef.pr);
+  return rev && (fileRef.side === 'left' ? rev.base : rev.head);
+}
+
+function exactFile(repo, sha, path) {
+  const key = `${repo}@${sha}:${path}`;
+  const cached = exactCache.get(key);
+  if (cached && (cached.until === Infinity || cached.until > Date.now())) return cached.value;
+  const entry = { until: Date.now() + 1000, value: null };
+  entry.value = helperRequest('/file', { body: { repo, sha, path }, timeout: 15000 }).then((res) => {
+    if (res.state === 'ready' && res.data && self.LeanLensExact && res.data.version === self.LeanLensExact.FORMAT_VERSION) {
+      entry.until = Infinity; // a commit's file never changes
+      return res;
+    }
+    if (res.state === 'ready') return { state: 'error', error: 'The helper and the extension are different versions' };
+    // Not there yet: ask again soon, but not on every mouse move. A stopped helper is asked rarely.
+    entry.until = Date.now() + (res.state === 'offline' || res.state === 'off' ? 8000 : 1000);
+    return res;
+  });
+  if (exactCache.size >= EXACT_FILES_KEPT) exactCache.delete(exactCache.keys().next().value);
+  exactCache.set(key, entry);
+  return entry.value;
+}
+
+/** What Lean recorded at `request.column` of the file line `request.fileRef` names. */
+async function exactHover(request) {
+  const fileRef = request.fileRef;
+  if (!fileRef || !fileRef.path || !fileRef.line || !self.LeanLensExact) return { state: 'off' };
+  const settings = await getSettings();
+  if (!settings.enableHelper || !settings.helperToken) return { state: 'off' };
+  const sha = await commitOf(fileRef);
+  if (!sha) return { state: 'off' };
+  const repo = `${fileRef.owner}/${fileRef.repo}`;
+  const file = await exactFile(repo, sha, fileRef.path);
+  if (file.state !== 'ready') return Object.assign({}, file, { repo, sha, data: undefined });
+  queryStats.leanHits++;
+  return Object.assign({ state: 'ready', repo, sha },
+    self.LeanLensExact.describe(file.data, fileRef.line, request.column, request.columnEnd, request.caret));
+}
+
+/** Start Lean on files of a commit. The page only sends this after a click. */
+async function helperRun(request) {
+  const sha = request.sha || await commitOf(request);
+  if (!sha) return { state: 'error', error: 'This page does not say which commit it shows' };
+  const repo = `${request.owner}/${request.repo}`;
+  if (request.allow) {
+    const allowed = await helperRequest('/allow', { body: { repo } });
+    if (!allowed.ok) return allowed;
+  }
+  const res = await helperRequest('/run', { body: { repo, sha, pr: request.pr ? Number(request.pr) : undefined, paths: request.paths } });
+  // Forget "not there yet" answers, so the next hover asks again.
+  for (const [key, entry] of exactCache) if (entry.until !== Infinity) exactCache.delete(key);
+  return Object.assign({ repo, sha }, res);
 }
 
 /**
@@ -1366,6 +1418,7 @@ const MESSAGE_HANDLERS = {
     memoryCache.clear();
     rawQueryCache.clear();
     fileTextCache.clear();
+    exactCache.clear();
     tacticDocsPromise = null;
     notationDocsPromise = null;
     // Remove cached lookups only; keep the user's settings.
@@ -1374,9 +1427,18 @@ const MESSAGE_HANDLERS = {
       chrome.storage.local.remove(keys, () => resolve({ success: true }));
     });
   }),
-  TEST_LOCAL_SERVER: async (request) => {
-    const res = await queryLocalVerso("Nat", request.url || "http://127.0.0.1:8000");
-    return { success: Boolean(res), details: res };
+  // What Lean itself recorded at a position of a file (from the local helper), if it has run.
+  EXACT_HOVER: (request) => exactHover(request),
+  // Ask the helper to run Lean on files of a commit (only ever after a click in the page).
+  HELPER_RUN: (request) => helperRun(request),
+  HELPER_ALLOW: async (request) => {
+    const res = await helperRequest('/allow', { body: { repo: request.repo } });
+    exactCache.clear();
+    return res;
+  },
+  TEST_HELPER: async (request) => {
+    const res = await helperRequest('/status', { settings: { enableHelper: true, helperUrl: request.url, helperToken: request.token }, timeout: 2500 });
+    return { success: Boolean(res && res.ok), state: res && res.state, details: res };
   }
 };
 

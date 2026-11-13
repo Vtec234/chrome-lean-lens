@@ -16,6 +16,10 @@
   let loadingTimer = null;
   let lastHoveredToken = null;
   let lastHoveredRect = null;
+  // With Lean's own data, a hover depends on where the token is (its proof state), not only on
+  // its text: where the hovered token is on screen, and the hover Lean's data is being read for.
+  let lastHoveredSpot = null;
+  let activeHover = null;
   let rescanDebounceTimer = null;
 
   /**
@@ -669,17 +673,135 @@
     }
     if (loadingTimer) { clearTimeout(loadingTimer); loadingTimer = null; }
     if (lastHoveredToken !== token) return;
-    if (!type) { window.VersoTooltipView.hide(false); return; }
+    if (!type) { presentNothing(tokenInfo); return; }
     let shown = tokenInfo.termText;
     try { shown = ctx.termDisplay(tokenInfo.termNode, ctx.contextFromDom(tokenInfo.textNode) || '', coerced, binders) || shown; } catch (err) { /* source text */ }
     const docRes = await docRequest;
     if (lastHoveredToken !== token) return;
     const clip = (t, n) => (t.length > n ? t.slice(0, n - 1) + '…' : t);
-    window.VersoTooltipView.show({
+    present(tokenInfo, {
       name: shown, kind: 'term', source: 'term',
       typeSignature: `${clip(shown, 300)} : ${clip(type, 600)}`,
       docstring: (docRes && docRes.doc) || ''
-    }, boundingRect, shade);
+    });
+  }
+
+  // ------------------------------------------------------------------------------------------
+  // Lean's own data, from the local helper (helper/lean-lens-helper.mjs). Where Lean recorded a
+  // hover for the token, that is what is shown. The proof state and Lean's messages at the
+  // pointer are added to whichever hover is shown.
+
+  /** Whether `tokenInfo` is still the hover in progress (not just a token with the same text). */
+  const isCurrent = (tokenInfo) => lastHoveredToken === tokenInfo.token && activeHover === tokenInfo;
+
+  /**
+   * Whether Lean's hover for the token is the one to show. On an operator or a bracket Lean's
+   * data has documentation only, and the estimated hover (the term there, with its type) says more.
+   */
+  const usesExactToken = (tokenInfo, exact) => Boolean(exact && exact.state === 'ready' && exact.token) &&
+    !(tokenInfo.kind === 'term' && exact.token.kind === 'syntax');
+
+  /** Show a hover for `tokenInfo`, with what Lean's run adds to it. */
+  function present(tokenInfo, data) {
+    window.VersoTooltipView.show(data, tokenInfo.boundingRect, tokenInfo.shade, tokenInfo.extras || null);
+  }
+
+  /** Nothing is known about the token itself: the proof state alone, if Lean recorded one. */
+  function presentNothing(tokenInfo) {
+    const extras = tokenInfo.extras;
+    if (extras && (extras.goals || (extras.messages && extras.messages.length))) {
+      window.VersoTooltipView.show(null, tokenInfo.boundingRect, tokenInfo.shade, extras);
+    } else {
+      window.VersoTooltipView.hide(false);
+    }
+  }
+
+  /** What Lean recorded where the pointer is: the helper's answer (with the file it is about), or null. */
+  function exactLookup(tokenInfo) {
+    const ctx = window.VersoBinderContext;
+    const fileRef = ctx && ctx.fileRefFromDom ? ctx.fileRefFromDom(tokenInfo.textNode) : null;
+    if (!settings.enableHelper || !fileRef || typeof tokenInfo.column !== 'number') return Promise.resolve(null);
+    return sendMessageP({ action: 'EXACT_HOVER', fileRef, column: tokenInfo.column, columnEnd: tokenInfo.columnEnd, caret: tokenInfo.caret })
+      .then((res) => (res && res.state && res.state !== 'off' ? Object.assign(res, { fileRef }) : null));
+  }
+
+  /** What the tooltip adds from Lean's run: goals and messages when it has run, else its state. */
+  function exactExtras(tokenInfo, exact) {
+    if (exact.state === 'ready') {
+      return { lean: exact.lean, goals: exact.goals, messages: exact.messages, helper: { state: 'ready' } };
+    }
+    return {
+      lean: null, goals: null, messages: [],
+      helper: {
+        state: exact.state, phase: exact.phase, message: exact.message, done: exact.done, total: exact.total,
+        error: exact.error, repo: exact.repo,
+        run: () => runLean(tokenInfo, exact)
+      }
+    };
+  }
+
+  /** Lean's hover for a token, as a tooltip card. */
+  function exactCard(exact) {
+    const t = exact.token;
+    const card = { name: t.name, kind: t.kind, typeSignature: t.typeSignature, docstring: t.docstring, source: 'lean', lean: exact.lean };
+    if (t.kind !== 'const') return card;
+    // A declaration of this pull request or project: say which kind, and where it is.
+    const pr = settings.enablePRScanner && window.LeanPRScanner ? window.LeanPRScanner.declarations.get(t.name) : null;
+    if (pr) {
+      if (pr.kind) card.kind = pr.kind;
+      if (pr.element) {
+        card.element = pr.element;
+        card.lineNumber = pr.lineNumber;
+      } else if (pr.repo && pr.sha && pr.filePath) {
+        card.sourceUrl = `https://github.com/${pr.repo}/blob/${pr.sha}/${pr.filePath}#L${pr.lineNumber}`;
+        card.sourceLabel = 'View source →';
+      }
+    } else if (!t.definedHere) {
+      card.sourceUrl = `https://leanprover-community.github.io/mathlib4_docs/find/?pattern=${encodeURIComponent(t.name)}#doc`;
+    }
+    return card;
+  }
+
+  /**
+   * Run Lean on this pull request's Lean files (only ever from a click on the tooltip's button):
+   * the hovered file, and on the pull request's own side the other files it changes.
+   */
+  function runLean(tokenInfo, exact) {
+    const fileRef = exact.fileRef;
+    if (!fileRef) return;
+    const paths = new Set([fileRef.path]);
+    if (fileRef.side !== 'left' && window.LeanPRScanner) window.LeanPRScanner.filePaths().forEach((path) => paths.add(path));
+    sendMessageP({
+      action: 'HELPER_RUN', owner: fileRef.owner, repo: fileRef.repo, pr: fileRef.pr, sha: exact.sha,
+      paths: [...paths], allow: exact.state === 'not_allowed'
+    }).then((res) => {
+      if (!isCurrent(tokenInfo)) return;
+      const started = Object.assign({ state: 'error', error: 'The helper did not answer' }, res || {}, { fileRef, sha: exact.sha });
+      if (started.state === 'done' || started.state === 'idle') started.state = 'pending';
+      tokenInfo.extras = exactExtras(tokenInfo, started);
+      window.VersoTooltipView.setExtras(tokenInfo.extras);
+      if (started.state === 'pending') watchHelper(tokenInfo);
+    });
+  }
+
+  /** While Lean runs and the hover stays open: show its progress, then its answer. */
+  function watchHelper(tokenInfo) {
+    const tick = () => {
+      if (!isCurrent(tokenInfo) || !window.VersoTooltipView.isVisible()) return;
+      exactLookup(tokenInfo).then((exact) => {
+        if (!isCurrent(tokenInfo) || !exact) return;
+        tokenInfo.extras = exactExtras(tokenInfo, exact);
+        if (exact.state === 'ready') {
+          tokenInfo.exact = exact;
+          if (usesExactToken(tokenInfo, exact)) present(tokenInfo, exactCard(exact));
+          else triggerHoverLookup(tokenInfo);
+          return;
+        }
+        window.VersoTooltipView.setExtras(tokenInfo.extras);
+        if (exact.state === 'pending') setTimeout(tick, 1500);
+      });
+    };
+    setTimeout(tick, 1500);
   }
 
   /**
@@ -695,24 +817,46 @@
       });
       return;
     }
+    // Lean's own answer first, when the local helper is in use.
+    if (settings.enableHelper && tokenInfo.exact === undefined) {
+      tokenInfo.exact = null;
+      activeHover = tokenInfo;
+      exactLookup(tokenInfo).then((exact) => {
+        if (!isCurrent(tokenInfo)) return;
+        tokenInfo.exact = exact;
+        tokenInfo.extras = exact ? exactExtras(tokenInfo, exact) : null;
+        if (usesExactToken(tokenInfo, exact)) {
+          present(tokenInfo, exactCard(exact));
+          return;
+        }
+        triggerHoverLookup(tokenInfo);
+        if (exact && exact.state === 'pending') watchHelper(tokenInfo);
+      });
+      return;
+    }
+    // A keyword gets here only for Lean's own data: its docs (shown above) or the proof state.
+    if (tokenInfo.isKeyword) { presentNothing(tokenInfo); return; }
     if (tokenInfo.kind === 'term') { triggerTermLookup(tokenInfo); return; }
     const { token, subToken, boundingRect, shade } = tokenInfo;
     // A name in `(lean := "…")` is a declaration's full name, read as written.
     const lookup = tokenInfo.verso === 'name'
       ? { queryToken: tokenInfo.fullChain || tokenInfo.token, fileRef: null, contextText: '', local: null, receiver: null, namedArg: null, structField: null, skip: false, alt: null }
       : lookupContext(tokenInfo);
-    if (lookup.skip) return;
+    if (lookup.skip) {
+      if (tokenInfo.extras) presentNothing(tokenInfo);
+      return;
+    }
 
     // 0. Local variables shadow everything else: show their type.
     if (lookup.local) {
-      window.VersoTooltipView.show(lookup.local, boundingRect, shade);
+      present(tokenInfo, lookup.local);
       // (A written type with `Π i, …`, `∀ i, …` or `⨂[R] i, …` is printed with its binders' types.)
       const needsMore = lookup.local.inferNeeded || lookup.local.structureNeeded || lookup.local.replay ||
         /[∀Π⨂⨁]|\b(?:fun|λ)\b|\b(?:Type|Sort)\*/.test(lookup.local.typeSignature || '');
       if (needsMore) {
         const fileRef = window.VersoBinderContext && window.VersoBinderContext.fileRefFromDom(tokenInfo.textNode);
         refineLocal(lookup.local, lookup.contextText, fileRef).then((info) => {
-          if (lastHoveredToken === token && info) window.VersoTooltipView.show(info, boundingRect, shade);
+          if (lastHoveredToken === token && info) present(tokenInfo, info);
         }).catch(() => { /* keep the provisional tooltip */ });
       }
       return;
@@ -725,13 +869,13 @@
       const prDecl = pr.find(lookup.queryToken) ||
         (lookup.queryToken === token || !lookup.queryToken.includes('.') ? pr.find(token) || (subToken ? pr.find(subToken) : null) : null);
       if (prDecl) {
-        window.VersoTooltipView.show(prDecl, boundingRect, shade);
+        present(tokenInfo, prDecl);
         return;
       }
       // A namespace of the project (`IntegerRectangle` in `_root_.IntegerRectangle.IsTiling.normalized`).
       const ns = /^[A-Z][\w'.]*$/.test(lookup.queryToken) && !projectIndex ? projectNamespace(pr, lookup.queryToken) : null;
       if (ns) {
-        window.VersoTooltipView.show(ns, boundingRect, shade);
+        present(tokenInfo, ns);
         return;
       }
       // The PR's files are still being read: try again once they are.
@@ -745,7 +889,7 @@
     if (settings.enableBuiltins && window.VersoBuiltins) {
       const builtin = window.VersoBuiltins.get(token) || (subToken ? window.VersoBuiltins.get(subToken) : null);
       if (builtin) {
-        window.VersoTooltipView.show(builtin, boundingRect, shade);
+        present(tokenInfo, builtin);
         return;
       }
     }
@@ -753,6 +897,7 @@
     // Single-letter identifiers are local variables, not global Mathlib definitions.
     // Without a file reference (to look for `variable` declarations) there is nothing to show.
     if (lookup.queryToken.length <= 1 && !lookup.fileRef) {
+      if (tokenInfo.extras) presentNothing(tokenInfo);
       return;
     }
 
@@ -760,7 +905,7 @@
     // in the namespace of the receiver's type, as Lean does (`List.SortedLT.nodup`).
     const { queryToken, fileRef, contextText, receiver, namedArg, structField } = lookup;
 
-    // 3. Query background worker (Loogle / local companion server)
+    // 3. Query background worker (Loogle)
     // To prevent flicker, do NOT show loading immediately.
     // If the lookup takes longer than 180ms, only then show a subtle loading spinner.
     if (loadingTimer) clearTimeout(loadingTimer);
@@ -789,16 +934,16 @@
           if (lastHoveredToken !== token) return;
 
           if (res && res.success && res.data) {
-            window.VersoTooltipView.show(res.data, boundingRect, shade);
+            present(tokenInfo, res.data);
           } else {
             // Not found; quietly hide tooltip without flashing
-            window.VersoTooltipView.hide(false);
+            presentNothing(tokenInfo);
           }
         }
       );
     } catch (err) {
       if (loadingTimer) clearTimeout(loadingTimer);
-      window.VersoTooltipView.hide(false);
+      presentNothing(tokenInfo);
     }
   }
 
@@ -867,7 +1012,8 @@
       if (verso === 'prose' || isInProse(tokenInfo) || (isInString(tokenInfo) && !names) || isInAttribute(tokenInfo)) tokenInfo = null;
       else tokenInfo.verso = verso;
     }
-    if (!tokenInfo || !tokenInfo.token || tokenInfo.isKeyword) {
+    // (A keyword has a hover only from Lean's own data: its docs, and the proof state there.)
+    if (!tokenInfo || !tokenInfo.token || (tokenInfo.isKeyword && !settings.enableHelper)) {
       if (hoverTimer) {
         clearTimeout(hoverTimer);
         hoverTimer = null;
@@ -882,8 +1028,11 @@
       return;
     }
 
-    // If still hovering the exact same token, keep tooltip active
-    if (lastHoveredToken === tokenInfo.token) {
+    // If still hovering the exact same token, keep tooltip active. (With Lean's own data, the
+    // same text elsewhere is another hover: its proof state differs.)
+    const rect = tokenInfo.boundingRect;
+    const spot = settings.enableHelper && rect ? `${Math.round(rect.left)}:${Math.round(rect.top)}` : null;
+    if (lastHoveredToken === tokenInfo.token && lastHoveredSpot === spot) {
       window.VersoTooltipView.clearHideTimer();
       return;
     }
@@ -899,6 +1048,7 @@
     }
 
     lastHoveredToken = tokenInfo.token;
+    lastHoveredSpot = spot;
     lastHoveredRect = tokenInfo.kind === 'term' ? null : tokenInfo.boundingRect;
 
     // Debounce hover before showing definition
@@ -950,7 +1100,8 @@
   });
 
   // Exposed for the test suite.
-  window.VersoContentInternals = { receiverFor, lookupContext, isInProse, isInAttribute, isInString, refineLocal, triggerTermLookup, versoState, inLeanNames };
+  window.VersoContentInternals = { receiverFor, lookupContext, isInProse, isInAttribute, isInString, refineLocal, triggerTermLookup, versoState, inLeanNames,
+    triggerHoverLookup, exactCard, exactExtras, setSettings: (values) => Object.assign(settings, values), hovering: (token) => { lastHoveredToken = token; } };
 
   // Startup
   loadSettings();

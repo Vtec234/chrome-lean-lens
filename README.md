@@ -4,6 +4,11 @@ A Chrome extension for reviewing **Lean 4** pull requests on GitHub. Hover over 
 
 It works on both GitHub diff views (the classic `/files` view and the newer `/changes` view) and on file pages.
 
+Hovers come from two sources:
+
+- **Estimated, with nothing to set up.** The extension reads the source, the PR's files and [Loogle](https://loogle.lean-lang.org/), and works out what Lean would show. This is what the sections below describe.
+- **Lean's own output, with the local helper.** A small program on your machine runs Lean on the pull request you are reading. Hovers are then exactly Lean's, and each tactic shows its proof state. See [Real Lean with the local helper](#real-lean-with-the-local-helper).
+
 ---
 
 ## What a hover shows
@@ -36,6 +41,58 @@ Lean Lens works from the text of the diff, the file at the PR's commit (fetched 
 
 ---
 
+## Real Lean with the local helper
+
+The helper runs Lean itself on the code you are reading, so nothing is estimated: a constant shows Lean's signature and docstring, a variable its type, a tactic its documentation, and inside a proof the tooltip adds the goals Lean recorded there. It works on any repository with a Lake project, and needs nothing from the repository.
+
+```bash
+node helper/lean-lens-helper.mjs
+```
+
+It prints an address and a token. Paste both into the extension's options, under **Real Lean**. Then, on a pull request, hover any name and press **Run Lean** in the tooltip. The first run on a project takes a while (see below); after that the files of a commit are kept, and hovers on them are instant.
+
+What a hover shows once Lean has run:
+
+- **Names and tactics**: what Lean recorded for the token, replacing the estimate.
+- **Proof states**: on a tactic, the goals after it; on `by`, `·` and `| case =>`, the goals at that point. Hypotheses of one type share a line, as in Lean's infoview.
+- **Messages**: Lean's errors, warnings and `#check` output at the hovered code.
+- Where Lean recorded no hover (a gap between terms, a bracket), the estimate is shown and marked as estimated.
+
+What the helper does for a repository, a commit and its Lean files:
+
+1. Fetches the commit into its own folder. It never touches your checkouts.
+2. Installs the Lean version the project pins, and downloads Mathlib's prebuilt cache if the project depends on Mathlib.
+3. Builds what the files import, then elaborates each file with [SubVerso](https://github.com/leanprover/subverso), the library [Verso](https://verso.lean-lang.org/) uses to get this information.
+
+It needs Node 20 or later, `git`, and Lean's `elan` and `lake`.
+
+**Reusing a checkout.** A Mathlib-based project takes about 10 GB and several minutes to prepare from nothing. If you already have the project built, link it, and the helper starts from a copy of your checkout and its build. On macOS the copy shares disk space with the original. On Linux it does where the file system can (Btrfs, XFS), and is a full copy otherwise.
+
+```bash
+node helper/lean-lens-helper.mjs --link seewoo5/DifferentProofs=$HOME/code/DifferentProofs
+```
+
+**Safety.** Elaborating a Lean file runs the code in it, so treat running Lean on a pull request like checking it out and building it.
+
+- Lean never starts on its own. It runs when you press **Run Lean**, and only on repositories you have allowed (the button asks the first time; `--allow owner/repo` does it ahead).
+- The helper listens on `127.0.0.1` only and answers only requests that carry its token. Requests from web pages are refused.
+
+**Measured** on an Apple M2 with Lean 4.35 and DifferentProofs linked: 39 seconds from an empty cache to the first file of a pull request, then about 15 seconds for each further file. Building the SubVerso extractor takes about 30 seconds, once for each Lean version.
+
+**Limits**
+
+- A tactic shows the goals after it, as Verso does, where Lean's infoview shows the goals before the tactic under the cursor. Hover the previous tactic (or `by`) for those.
+- SubVerso records the wrong goal on the `by` of `have h : T := by …`, so that `by` shows none. The `have` and the tactics inside it are right.
+- A Verso document (`#doc … =>`) has no Lean hovers in its body.
+- **Run Lean** on an added or unchanged line runs the pull request's Lean files. On a removed line it runs that one file at the base commit, which makes the helper switch commits and rebuild.
+- Tested with Lean 4.35 only. SubVerso's output format is not stable, so the helper builds a pinned revision (`--subverso-rev` picks another), and it refuses output that does not reproduce the source text.
+
+The same program can elaborate files without the extension, for example in a script:
+
+```bash
+node helper/lean-lens-helper.mjs run --repo owner/repo --sha <full commit hash> Path/To/File.lean
+```
+
 ## Installation
 
 1. Open `chrome://extensions` and switch on **Developer mode** (top right).
@@ -52,6 +109,8 @@ node test/run_tests.js
 
 The expected outputs of many cases are Lean's own hovers on the same code (mathlib4 PRs 45819 and 45909, and the closed PRs of [seewoo5/DifferentProofs](https://github.com/seewoo5/DifferentProofs), checked with lean-lsp).
 
+The helper's tests use `test/fixtures/Sample.subverso.json`, which is SubVerso's real output for `test/fixtures/Sample.lean`, so they need no Lean installation.
+
 `test/demo_pr.html` is a static page that imitates a GitHub PR diff for trying tooltips offline.
 
 ---
@@ -63,7 +122,8 @@ chrome-lean-lens/
 ├── manifest.json                  # Manifest V3 configuration
 ├── icons/                         # Icons (generate_icons.py redraws them)
 ├── background/
-│   └── service_worker.js          # Loogle, file scope, tactic docs, caching, companion server
+│   ├── service_worker.js          # Loogle, file scope, tactic docs, caching, the helper's client
+│   └── exact_data.js              # Reading Lean's own data: the token and proof state at a position
 ├── content/
 │   ├── lean_tokenizer.js          # Name or term under the cursor, tactic position, notation
 │   ├── lean_terms.js              # Term model: parser, printer, matching, universes, signatures
@@ -76,8 +136,10 @@ chrome-lean-lens/
 │   └── content.css                # Tooltip styles (light / dark)
 ├── popup/                         # Toolbar popup with symbol search
 ├── options/                       # Settings page
-├── server/                        # Optional local companion server
-└── test/                          # Unit tests and the demo page
+├── helper/
+│   ├── lean-lens-helper.mjs       # The local helper: fetches a commit, runs Lean, serves the result
+│   └── convert.mjs                # SubVerso's output → hovers, proof states and messages by position
+└── test/                          # Unit tests, fixtures and the demo page
 ```
 
 ## Options
@@ -86,14 +148,6 @@ Right-click the toolbar icon → **Options**:
 - **Hover delay** (default 250 ms)
 - **PR declaration scanner**, **Loogle lookups**, **built-in tactic docs**: on/off
 - **Theme**: match GitHub, Slate Dark, or Clean Light
-- **Local companion server**: host/port for private projects
+- **Real Lean**: use the local helper, with its address and token
 
-## Local companion server (optional)
-
-For private Lean repositories that Loogle doesn't index:
-
-```bash
-python3 server/companion_server.py --port 8000 --project /path/to/my-lean-project
-```
-
-Then enable **Local companion server** in the options and click **Test Connection**. The server searches the project's `.lean` files for declarations by name; it does not run Lean.
+The helper replaces the companion server of earlier versions, which searched a project's files by name without running Lean.

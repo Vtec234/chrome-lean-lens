@@ -74,27 +74,29 @@
         </div>
       </div>
 
-      <!-- Section 3: Optional local companion server -->
+      <!-- Section 3: Real Lean, run by the local helper -->
       <div class="card">
-        <h2 class="card-title">Local Companion Server (Optional)</h2>
-        <p class="card-desc">Connect to the bundled companion server (<code>server/companion_server.py</code>), which searches the <code>.lean</code> files of a local project. Useful for private or offline repositories.</p>
+        <h2 class="card-title">Real Lean (Local Helper)</h2>
+        <p class="card-desc">The helper (<code>node helper/lean-lens-helper.mjs</code>) runs Lean on your machine for the pull request you are reading, so hovers and proof states are Lean's own. It prints its address and token when it starts. Elaborating a file runs the code in it, so Lean only runs when you click <strong>Run Lean</strong> in a hover, and only on repositories you have allowed.</p>
 
         <div class="checkbox-group">
           <label class="checkbox-label">
-            <input type="checkbox" id="enable-local-verso">
+            <input type="checkbox" id="enable-helper">
             <div>
-              <strong>Enable local companion server</strong>
+              <strong>Use the local helper</strong>
             </div>
           </label>
         </div>
 
-        <div class="form-group" id="local-server-settings">
-          <label for="local-verso-url">Local Server Endpoint</label>
+        <div class="form-group" id="helper-settings">
+          <label for="helper-url">Helper address</label>
           <div class="input-action-row">
-            <input type="text" id="local-verso-url" value="http://127.0.0.1:8000" placeholder="http://127.0.0.1:8000">
-            <button id="test-server-btn" class="btn btn-secondary">Test Connection</button>
+            <input type="text" id="helper-url" value="http://127.0.0.1:5326" placeholder="http://127.0.0.1:5326">
+            <button id="test-helper-btn" class="btn btn-secondary">Test Connection</button>
           </div>
-          <span id="server-test-result" class="help-text"></span>
+          <label for="helper-token">Helper token</label>
+          <input type="password" id="helper-token" placeholder="Printed by the helper when it starts" autocomplete="off">
+          <span id="helper-test-result" class="help-text"></span>
         </div>
       </div>
 
