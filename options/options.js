@@ -98,7 +98,8 @@ document.addEventListener('DOMContentLoaded', () => {
       (res) => {
         if (res && res.success) {
           const allowed = (res.details && res.details.allow) || [];
-          helperTestResult.textContent = `✓ Connected. Allowed repositories: ${allowed.length ? allowed.join(', ') : 'none yet'}.`;
+          const sandbox = res.details && res.details.sandbox === 'seatbelt' ? 'Sandbox on.' : 'No sandbox: Lean runs with your permissions.';
+          helperTestResult.textContent = `✓ Connected. ${sandbox} Allowed repositories: ${allowed.length ? allowed.join(', ') : 'none yet'}.`;
           helperTestResult.style.color = '#3fb950';
         } else if (res && res.state === 'unauthorized') {
           helperTestResult.textContent = '✗ The helper is running but rejected this token.';

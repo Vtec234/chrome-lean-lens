@@ -1596,12 +1596,52 @@ console.log("22. Testing real Lean data (the local helper)...");
       assert(!helper.authorized(Object.assign({}, ok, { 'x-lean-lens-token': 'wrong' }), 5326, 'secret-token'));
       assert(!helper.authorized(Object.assign({}, ok, { 'x-lean-lens-token': undefined }), 5326, 'secret-token'));
 
+      // The sandbox profile (macOS): only the paths given, no network unless asked, and a
+      // checkout's own `.git` kept as it is.
+      const copy = '/Users/me/Library/Caches/lean-lens/repos/o/r';
+      const profile = helper.seatbeltProfile({ readable: ['/opt/lean'], writable: [copy], guarded: [`${copy}/.git`], home: '/Users/me' });
+      assert(profile.includes('(deny network*)'));
+      assert(!helper.seatbeltProfile({ network: true, readable: ['/opt/lean'] }).includes('(deny network*)'), 'network only when asked');
+      assert(profile.includes('(deny file-read* (subpath "/Users")'), profile);
+      assert(profile.includes(`(allow file-read* (subpath "/opt/lean") (subpath "${copy}"))`), profile);
+      assert(profile.includes(`(deny file-write* (subpath "${copy}/.git"))`), profile);
+      assert(profile.indexOf('(deny file-write* (subpath') > profile.indexOf('(allow file-write*'), 'the guard comes after the allowance, so it wins');
+      assert(profile.includes('(literal "/Users/me/Library/Caches")'), 'folders above an allowed path can be looked through');
+      assert(!/\(allow file-read\*\s*\)/.test(helper.seatbeltProfile({})), 'no allowance without a path (it would allow everything)');
+      assert(helper.seatbeltProfile({ readable: ['/a "b"'] }).includes('(subpath "/a \\"b\\"")'), 'paths are quoted');
+      if (process.platform === 'darwin' && fs.existsSync('/usr/bin/sandbox-exec')) {
+        // The real thing, on files made for the purpose.
+        const { spawnSync } = require('child_process');
+        const box = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lean-lens-box-')));
+        try {
+          fs.mkdirSync(path.join(box, 'in', '.git'), { recursive: true });
+          fs.mkdirSync(path.join(box, 'out'));
+          fs.writeFileSync(path.join(box, 'in', 'a.txt'), 'inside');
+          fs.writeFileSync(path.join(box, 'out', 'b.txt'), 'outside');
+          const confined = helper.seatbeltProfile({ writable: [path.join(box, 'in')], guarded: [path.join(box, 'in', '.git')] });
+          const sb = (...command) => spawnSync('/usr/bin/sandbox-exec', ['-p', confined, ...command], { encoding: 'utf8' });
+          if (sb('/usr/bin/true').status === 0) { // (not when the tests themselves run in a sandbox)
+            assert.strictEqual(sb('/bin/cat', path.join(box, 'in', 'a.txt')).stdout, 'inside');
+            assert.notStrictEqual(sb('/bin/cat', path.join(box, 'out', 'b.txt')).status, 0, 'a file outside is not readable');
+            assert.strictEqual(sb('/usr/bin/touch', path.join(box, 'in', 'new.txt')).status, 0);
+            assert.notStrictEqual(sb('/usr/bin/touch', path.join(box, 'out', 'new.txt')).status, 0, 'nor writable');
+            assert.notStrictEqual(sb('/usr/bin/touch', path.join(box, 'in', '.git', 'hook')).status, 0, 'the checkout\'s .git is kept');
+            assert(!fs.existsSync(path.join(box, 'out', 'new.txt')) && !fs.existsSync(path.join(box, 'in', '.git', 'hook')));
+          }
+        } finally {
+          fs.rmSync(box, { recursive: true, force: true });
+        }
+      }
+
       const h = helper.createHelper({ cacheDir: path.join(root, 'cache'), log: () => {} });
+      assert(['seatbelt', 'none'].includes(await h.sandbox()), 'the sandbox is on wherever the system has one');
+      assert.strictEqual(await helper.createHelper({ cacheDir: path.join(root, 'cache'), log: () => {}, sandbox: false }).sandbox(), 'off');
       const sha = '1adf3d0cad950f5a9059596b4df342c38aae8353';
       const ask = (method, url, body) => { const r = h.handle(method, url, body); return { status: r.status, body: JSON.parse(r.body) }; };
       assert(h.config.token.length >= 20, 'a token is made on first run');
       assert.strictEqual(helper.createHelper({ cacheDir: path.join(root, 'cache'), log: () => {} }).config.token, h.config.token, 'and kept');
       assert.strictEqual(ask('GET', '/status').body.format, DATA_FORMAT_VERSION);
+      assert.strictEqual(ask('GET', '/status').body.sandbox, await h.sandbox());
       // A repository that was not allowed is never touched.
       const refused = ask('POST', '/run', { repo: 'o/r', sha, paths: ['A.lean'] });
       assert.strictEqual(refused.status, 403);

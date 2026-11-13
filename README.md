@@ -31,7 +31,7 @@ Hovers come from two sources:
 
 Lean Lens works from the text of the diff, the file at the PR's commit (fetched from `raw.githubusercontent.com`) and Loogle; it does not run Lean.
 
-- **Dot notation** (`hl.nodup`, `(ContinuousAt.tendsto h).mono_left`, `hT.out.le`): the receiver's type is read from its binder, a file-level `variable`, a PR declaration, or a Loogle signature (conclusion plus argument substitution), step by step for longer chains. Bundled-map notations (`→ₗ[R]`, `≃+*`, `→ₘₛₗ[σ]`, ~60 in total) map to their structures.
+- **Dot notation** (`hl.nodup`, `(ContinuousAt.tendsto h).mono_left`, `hT.out.le`): the receiver's type is read from its binder, a file-level `variable`, a PR declaration, or a Loogle signature (conclusion plus argument substitution), step by step for longer chains. Bundled-map notations (`→ₗ[R]`, `≃+*`, `→ₘₛₗ[σ]`, ~60 in total) map to their structures. A field of a lemma shows what it says in its place, above the field's own statement: `Nat.even_add_one.mp {n : ℕ} : Even (n + 1) → ¬Even n` rather than `Iff.mp`'s `a → b`.
 - **Bare names** (`cons`, `pairwise_sort`): the `namespace` / `section` / `open` scope at the hovered line decides which candidates exist; root names and exported class fields (`mul_zero`, `star`) win over opened namespaces, then the current namespace. In a PR's own file, a name means that file's declaration in the current namespace first (`tprod` inside `namespace PiTensorProduct` is `PiTensorProduct.tprod`, not Mathlib's root `tprod`), unless it is `protected`, as Lean resolves names; and a declaration named exactly so wins over one whose last segment matches (`lift.tprod`).
 - **Leading dots** (`:= .ofLinearMap …`): the namespace of the declaration's own type (`… ≃ₛₗ[σ] …` is `LinearEquiv`).
 - **Scoped notations** for constants (`cexp`, `π`, `𝓝`, `ℝ≥0∞`, `d⁄dX`, `I`, `σ`, … about 70, read from Mathlib's `scoped notation` commands): the one in force at the line, by the file's `open`s (`open Real` makes `π` `Real.pi`, `open Nat.Prime` the prime-counting function).
@@ -54,7 +54,8 @@ It prints an address and a token. Paste both into the extension's options, under
 What a hover shows once Lean has run:
 
 - **Names and tactics**: what Lean recorded for the token, replacing the estimate.
-- **Proof states**: on a tactic, the goals after it; on `by`, `·` and `| case =>`, the goals at that point. Hypotheses of one type share a line, as in Lean's infoview.
+- **Fields in their place**: Lean's hover on the `mp` of `Nat.even_add_one.mp` is `Iff.mp`'s general statement, `a → b`. The tooltip shows what it says there, `Nat.even_add_one.mp {n : ℕ} : Even (n + 1) → ¬Even n`, worked out from the hovers Lean recorded for the names before the dot, and keeps Lean's own hover below it. This works through chains (`hT.out.le : 0 ≤ T`) and for locals (`h.mp : p → q`).
+- **Proof states**: on a tactic, the goals after it; on `by`, `·` and `| case =>`, the goals at that point. Hypotheses of one type share a line, as in Lean's infoview. A hover with a proof state is two columns: the state on the left, the definition on the right.
 - **Messages**: Lean's errors, warnings and `#check` output at the hovered code.
 - Where Lean recorded no hover (a gap between terms, a bracket), the estimate is shown and marked as estimated.
 
@@ -72,16 +73,23 @@ It needs Node 20 or later, `git`, and Lean's `elan` and `lake`.
 node helper/lean-lens-helper.mjs --link seewoo5/DifferentProofs=$HOME/code/DifferentProofs
 ```
 
-**Safety.** Elaborating a Lean file runs the code in it, so treat running Lean on a pull request like checking it out and building it.
+**Safety.** Elaborating a Lean file runs the code in it, and `lake` runs the project's `lakefile`. So running Lean on a pull request means running that pull request's code on your machine.
 
 - Lean never starts on its own. It runs when you press **Run Lean**, and only on repositories you have allowed (the button asks the first time; `--allow owner/repo` does it ahead).
 - The helper listens on `127.0.0.1` only and answers only requests that carry its token. Requests from web pages are refused.
+- **On macOS the project's code runs in a sandbox** (`lake`, and Lean elaborating a file). In it there is no network, except for the one step that fetches the project's dependencies and Mathlib's cache. It cannot read your home folder, other volumes or the temporary folders: only system files, the Lean toolchain and the helper's copy of the project. It can write only to that copy (in the fetching step, also to Mathlib's download cache), and not to the copy's `.git`. It gets none of the helper's environment variables and an empty home folder of its own.
+- On Linux there is no sandbox yet, only the clean environment. The helper says which applies when it starts, and **Test Connection** in the options shows it.
+
+The sandbox guards against the obvious; it is not a guarantee. It uses the system's `sandbox-exec` with rules that deny the things above and allow the rest (starting processes, reading system files). `--no-sandbox` turns it off. That is needed when a project's dependencies are private repositories, because the sandbox has no git credentials.
+
+A test file that tries to read a file in the home folder, write one there, fetch a URL, read an environment variable and plant a git hook is refused all five in the sandbox, and allowed all five without it.
 
 **Measured** on an Apple M2 with Lean 4.35 and DifferentProofs linked: 39 seconds from an empty cache to the first file of a pull request, then about 15 seconds for each further file. Building the SubVerso extractor takes about 30 seconds, once for each Lean version.
 
 **Limits**
 
 - A tactic shows the goals after it, as Verso does, where Lean's infoview shows the goals before the tactic under the cursor. Hover the previous tactic (or `by`) for those.
+- A tactic whose term contains another proof (`exact foo (by simp)`) has no state of its own: SubVerso records states on the innermost tactics only.
 - SubVerso records the wrong goal on the `by` of `have h : T := by …`, so that `by` shows none. The `have` and the tactics inside it are right.
 - A Verso document (`#doc … =>`) has no Lean hovers in its body.
 - **Run Lean** on an added or unchanged line runs the pull request's Lean files. On a removed line it runs that one file at the base commit, which makes the helper switch commits and rebuild.

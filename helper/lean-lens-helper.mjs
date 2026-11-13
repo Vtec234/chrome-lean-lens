@@ -10,13 +10,14 @@
 //   node lean-lens-helper.mjs run --repo owner/repo --sha <commit> [--pr N] File.lean …
 //
 // Elaborating a Lean file runs the code in it. The helper therefore only works on repositories
-// you have allowed, only when asked with its token, and never on its own initiative.
+// you have allowed, only when asked with its token, and never on its own initiative. On macOS
+// that code runs in a sandbox: no network, no access to your files (see `seatbeltProfile`).
 
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { availableParallelism, homedir, tmpdir } from 'node:os';
+import { availableParallelism, homedir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -155,6 +156,54 @@ async function cloneTree(from, to) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The sandbox. `lake` evaluates a project's lakefile and elaborating a file runs the code in it,
+// so both run where they can do little: no network except while fetching dependencies, no
+// writing outside the project's copy, and no reading of the user's own files.
+
+const realOrSame = (target) => { try { return realpathSync(target); } catch { return path.resolve(target); } };
+
+function ancestorsOf(target) {
+  const out = [];
+  for (let dir = path.dirname(target); dir !== path.dirname(dir); dir = path.dirname(dir)) out.push(dir);
+  return out;
+}
+
+/**
+ * A macOS sandbox profile (for `sandbox-exec`). Under it a command can read system files and
+ * the `readable` and `writable` paths, but nothing else under the home directories, mounted
+ * volumes or the temporary directories; it can write only to the `writable` paths, except the
+ * `guarded` ones inside them; and it has no network unless `network` is set. It also cannot
+ * send Apple events to other applications.
+ */
+export function seatbeltProfile({ network = false, readable = [], writable = [], guarded = [], home = homedir() } = {}) {
+  const quote = (target) => `"${target.replace(/[\\"]/g, '\\$&')}"`;
+  const subpaths = (targets) => targets.map((target) => `(subpath ${quote(target)})`).join(' ');
+  const visible = [...new Set([...readable, ...writable])];
+  const above = [...new Set(visible.flatMap(ancestorsOf))];
+  const hidden = [...new Set(['/Users', '/Volumes', '/private/tmp', '/private/var/folders', '/private/var/root', realOrSame(home)])];
+  return [
+    '(version 1)',
+    '(allow default)',
+    '(deny appleevent-send)',
+    ...(network ? [] : ['(deny network*)']),
+    '(deny file-write*)',
+    `(allow file-write* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/dtracehelper") (literal "/dev/tty") (regex #"^/dev/fd/") (regex #"^/dev/ttys[0-9]+")${writable.length ? ` ${subpaths(writable)}` : ''})`,
+    ...(guarded.length ? [`(deny file-write* ${subpaths(guarded)})`] : []),
+    `(deny file-read* ${subpaths(hidden)})`,
+    // (An `allow` with no path would allow everything, so these lines need at least one.)
+    ...(visible.length ? [`(allow file-read* ${subpaths(visible)})`] : []),
+    ...(above.length ? [`(allow file-read-metadata ${above.map((target) => `(literal ${quote(target)})`).join(' ')})`] : []),
+  ].join('\n');
+}
+
+/** How this machine can confine a command: 'seatbelt' (macOS), or null when it can't. */
+async function detectSandbox() {
+  if (process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec')) return null;
+  const probe = await run('/usr/bin/sandbox-exec', ['-p', seatbeltProfile({ readable: ['/usr/bin'] }), '/usr/bin/true']);
+  return probe.code === 0 ? 'seatbelt' : null;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Settings kept between runs.
 
 export function defaultCacheDir() {
@@ -183,8 +232,8 @@ function loadConfig(cacheDir) {
 // The helper itself.
 
 /**
- * @param {object} options `{cacheDir, jobs, subverso, subversoRev, cloneBase, log}`
- * @returns `{config, allow, link, start, status, fileState, readData, handle}`
+ * @param {object} options `{cacheDir, jobs, subverso, subversoRev, cloneBase, sandbox, log}`
+ * @returns `{config, allow, link, start, status, fileState, readData, handle, sandbox}`
  */
 export function createHelper(options = {}) {
   const cacheDir = path.resolve(options.cacheDir || defaultCacheDir());
@@ -194,6 +243,12 @@ export function createHelper(options = {}) {
   const subverso = options.subverso || DEFAULT_SUBVERSO;
   const subversoRev = options.subversoRev || DEFAULT_SUBVERSO_REV;
   const cloneBase = (options.cloneBase || DEFAULT_CLONE_BASE).replace(/\/*$/, '/');
+  // 'seatbelt' when commands can be confined, 'none' when this system can't, 'off' when asked not to.
+  const sandboxWanted = options.sandbox !== false;
+  let sandboxState = sandboxWanted ? 'checking' : 'off';
+  const sandboxKind = sandboxWanted
+    ? detectSandbox().then((kind) => { sandboxState = kind || 'none'; return kind; })
+    : Promise.resolve(null);
 
   const repoQueues = new Map(); // repo → promise of its last job (one checkout per repository)
   const latestJob = new Map(); // repo@sha → the job last started for that commit
@@ -223,7 +278,13 @@ export function createHelper(options = {}) {
 
   const depsStamp = (root) => sha256(['lean-toolchain', 'lake-manifest.json', 'lakefile.lean', 'lakefile.toml']
     .map((name) => { try { return readFileSync(path.join(root, name), 'utf8'); } catch { return ''; } }).join('\0'));
-  const stampFile = (root) => path.join(root, '.lake', 'lean-lens-deps');
+  // Which dependencies a project's copy was last prepared for. Kept outside the copy, which
+  // the project's own code can write to.
+  const stampFile = (repo, rootDir) => path.join(cacheDir, 'state', `${sha256(`${repo}\0${rootDir === '.' ? '' : rootDir}`).slice(0, 32)}.deps`);
+  const writeStamp = (repo, rootDir, stamp) => {
+    mkdirSync(path.join(cacheDir, 'state'), { recursive: true });
+    writeFileSync(stampFile(repo, rootDir), stamp);
+  };
 
   async function ensureRepo(job) {
     const dir = repoDir(job.repo);
@@ -250,7 +311,7 @@ export function createHelper(options = {}) {
         job.say(`Copying the build in ${root === '.' ? 'the project' : root} (shares disk space where it can)`);
         mkdirSync(path.join(staging, root), { recursive: true });
         await cloneTree(built, path.join(staging, root, '.lake'));
-        writeFileSync(stampFile(path.join(staging, root)), depsStamp(path.join(linked, root)));
+        writeStamp(job.repo, root, depsStamp(path.join(linked, root)));
       }
     } else {
       job.say(`Cloning ${remote}`);
@@ -261,41 +322,66 @@ export function createHelper(options = {}) {
   }
 
   async function checkout(dir, job) {
-    const has = async () => (await run('git', ['-C', dir, 'cat-file', '-e', `${job.sha}^{commit}`])).code === 0;
+    // (No hooks, whatever the copy's `.git` says: this runs outside the sandbox.)
+    const git = ['-C', dir, '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false'];
+    const has = async () => (await run('git', [...git, 'cat-file', '-e', `${job.sha}^{commit}`])).code === 0;
     if (!(await has())) {
       job.say(`Fetching ${job.sha.slice(0, 10)}`);
-      const remotes = (await run('git', ['-C', dir, 'remote'])).stdout.split('\n').filter(Boolean);
-      if (remotes.includes('local')) await run('git', ['-C', dir, 'fetch', '--quiet', 'local']);
-      if (!(await has())) await run('git', ['-C', dir, 'fetch', '--quiet', 'origin', job.sha]);
-      if (!(await has()) && job.pr) await run('git', ['-C', dir, 'fetch', '--quiet', 'origin', `pull/${job.pr}/head`]);
+      const remotes = (await run('git', [...git, 'remote'])).stdout.split('\n').filter(Boolean);
+      if (remotes.includes('local')) await run('git', [...git, 'fetch', '--quiet', 'local']);
+      if (!(await has())) await run('git', [...git, 'fetch', '--quiet', 'origin', job.sha]);
+      if (!(await has()) && job.pr) await run('git', [...git, 'fetch', '--quiet', 'origin', `pull/${job.pr}/head`]);
       if (!(await has())) throw new Error(`Commit ${job.sha.slice(0, 10)} was not found in ${job.repo}`);
     }
-    await must('git', ['-C', dir, 'checkout', '--quiet', '--force', '--detach', job.sha]);
+    await must('git', [...git, 'checkout', '--quiet', '--force', '--detach', job.sha]);
   }
 
-  async function ensureDependencies(root, job) {
-    const stamp = depsStamp(root);
-    try { if (readFileSync(stampFile(root), 'utf8') === stamp) return; } catch { /* not prepared yet */ }
-    let manifest = '';
-    try { manifest = readFileSync(path.join(root, 'lake-manifest.json'), 'utf8'); } catch { /* no dependencies */ }
-    if (usesMathlib(manifest)) {
-      job.say('Downloading the Mathlib cache');
-      const result = await run('lake', ['exe', 'cache', 'get'], { cwd: root, onLine: (line) => job.progress(line) });
-      if (result.code !== 0) job.note(`\`lake exe cache get\` failed: ${tail(result.stderr || result.stdout, 300)}`);
-    }
-    mkdirSync(path.join(root, '.lake'), { recursive: true });
-    writeFileSync(stampFile(root), stamp);
-  }
+  // --- Running a project's code --------------------------------------------------------------
 
-  async function buildImports(root, files, job) {
-    const imports = new Set();
-    for (const file of files) {
-      try { importsOf(readFileSync(path.join(root, file), 'utf8')).forEach((name) => imports.add(name)); } catch { /* reported when extracting */ }
+  const madeDir = (target) => { mkdirSync(target, { recursive: true }); return realOrSame(target); };
+  const mathlibCacheDir = () => madeDir(process.env.MATHLIB_CACHE_DIR ||
+    path.join(process.env.XDG_CACHE_HOME || path.join(homedir(), '.cache'), 'mathlib'));
+  // The real `git`, for Lake's own cloning of dependencies: on macOS `/usr/bin/git` is a stub
+  // that looks its tool up through files the sandbox hides.
+  let gitDirectory = null;
+  const gitDir = async () => {
+    if (gitDirectory === null) {
+      const found = process.platform === 'darwin' ? await run('/usr/bin/xcrun', ['-f', 'git']) : { code: 1 };
+      gitDirectory = found.code === 0 && found.stdout.trim() ? path.dirname(found.stdout.trim()) : '';
     }
-    if (!imports.size) return;
-    job.say(`Building what ${files.length === 1 ? 'the file imports' : `${files.length} files import`}`);
-    const result = await run('lake', ['build', ...[...imports].map((name) => `+${name}`)], { cwd: root, onLine: (line) => job.progress(line) });
-    if (result.code !== 0) job.note(`\`lake build\` of the imports failed: ${tail(result.stderr || result.stdout, 400)}`);
+    return gitDirectory;
+  };
+
+  /**
+   * Run a command that executes a project's code: `lake` (which evaluates the lakefile) or the
+   * extractor (which elaborates a file). Its environment has none of the helper's own
+   * variables, and its home directory is an empty one of the helper's. Where the system has a
+   * sandbox, it can also read only the Lean toolchain and the paths given, write only where
+   * told, and reach the network only when `network` is set.
+   */
+  async function untrusted(command, args, { cwd, toolchain, network = false, readable = [], writable = [], onLine, timeoutMs } = {}) {
+    if (!sandboxWanted) return run(command, args, { cwd, onLine, timeoutMs });
+    const home = madeDir(path.join(cacheDir, 'home'));
+    const temporary = madeDir(path.join(cacheDir, 'tmp'));
+    const env = {
+      PATH: [toolchain && toolchain.bin, await gitDir(), '/usr/bin', '/bin', '/usr/sbin', '/sbin', '/opt/homebrew/bin', '/usr/local/bin'].filter(Boolean).join(path.delimiter),
+      HOME: home,
+      TMPDIR: temporary,
+      LANG: process.env.LANG || 'en_US.UTF-8',
+      GIT_TERMINAL_PROMPT: '0',
+      MATHLIB_CACHE_DIR: process.env.MATHLIB_CACHE_DIR || path.join(process.env.XDG_CACHE_HOME || path.join(homedir(), '.cache'), 'mathlib'),
+    };
+    if ((await sandboxKind) !== 'seatbelt') return run(command, args, { cwd, env, onLine, timeoutMs });
+    const allowed = [home, temporary, ...writable].map(realOrSame);
+    const profile = seatbeltProfile({
+      network,
+      readable: [...(toolchain ? [toolchain.root] : []), ...readable].map(realOrSame),
+      writable: allowed,
+      // A checkout's own `.git` stays as it is: the helper runs `git` there later, outside the
+      // sandbox, and a hook or setting planted now would run then.
+      guarded: allowed.map((target) => path.join(target, '.git')),
+    });
+    return run('/usr/bin/sandbox-exec', ['-p', profile, command, ...args], { cwd, env, onLine, timeoutMs });
   }
 
   /** The Lean version a project pins. */
@@ -307,32 +393,85 @@ export function createHelper(options = {}) {
     }
   }
 
+  /**
+   * Where the project's Lean lives: `{ lake, bin, root }`, the real programs rather than elan's
+   * stand-ins, so they can be run directly. elan only reads the project's `lean-toolchain` here
+   * (and downloads that version if it is missing); nothing of the project is run.
+   */
+  async function resolveToolchain(root, job) {
+    let found = await run('elan', ['which', 'lake'], { cwd: root });
+    if (found.code !== 0 && found.code !== -1) {
+      const name = toolchainOf(root);
+      job.say(`Installing ${name}`);
+      await must('elan', ['toolchain', 'install', name], { onLine: (line) => job.progress(line) });
+      found = await must('elan', ['which', 'lake'], { cwd: root });
+    }
+    // Without elan, whichever `lake` is installed.
+    if (found.code !== 0) found = await must('/usr/bin/which', ['lake']);
+    const lake = realOrSame(found.stdout.trim().split('\n').pop());
+    return { lake, bin: path.dirname(lake), root: path.dirname(path.dirname(lake)) };
+  }
+
+  async function ensureDependencies(root, rootDir, toolchain, job) {
+    const stamp = depsStamp(root);
+    try { if (readFileSync(stampFile(job.repo, rootDir), 'utf8') === stamp) return; } catch { /* not prepared yet */ }
+    let manifest = '';
+    try { manifest = readFileSync(path.join(root, 'lake-manifest.json'), 'utf8'); } catch { /* no dependencies */ }
+    // The one step with network access: Lake clones the packages the manifest lists, and for a
+    // Mathlib project its `cache` tool downloads the prebuilt files.
+    const mathlib = usesMathlib(manifest);
+    job.say(mathlib ? 'Downloading the Mathlib cache' : "Fetching the project's dependencies");
+    const result = await untrusted(toolchain.lake, mathlib ? ['exe', 'cache', 'get'] : ['env', 'true'], {
+      cwd: root, toolchain, network: true, writable: [job.dir, ...(mathlib ? [mathlibCacheDir()] : [])],
+      onLine: (line) => job.progress(line),
+    });
+    if (result.code !== 0) job.note(`\`lake ${mathlib ? 'exe cache get' : 'env'}\` failed: ${tail(result.stderr || result.stdout, 300)}`);
+    writeStamp(job.repo, rootDir, stamp);
+  }
+
+  async function buildImports(root, files, toolchain, job) {
+    const imports = new Set();
+    for (const file of files) {
+      try { importsOf(readFileSync(path.join(root, file), 'utf8')).forEach((name) => imports.add(name)); } catch { /* reported when extracting */ }
+    }
+    if (!imports.size) return;
+    job.say(`Building what ${files.length === 1 ? 'the file imports' : `${files.length} files import`}`);
+    const result = await untrusted(toolchain.lake, ['build', ...[...imports].map((name) => `+${name}`)], {
+      cwd: root, toolchain, writable: [job.dir], onLine: (line) => job.progress(line),
+    });
+    if (result.code !== 0) job.note(`\`lake build\` of the imports failed: ${tail(result.stderr || result.stdout, 400)}`);
+  }
+
   /** The SubVerso extractor for a Lean version, built once and kept. */
-  function ensureExtractor(root, job) {
-    const toolchain = toolchainOf(root);
-    const dir = path.join(cacheDir, 'extractors', `${toolchain.replace(/[^A-Za-z0-9._-]+/g, '_')}-${subversoRev.slice(0, 12)}`);
+  function ensureExtractor(root, toolchain, job) {
+    const name = toolchainOf(root);
+    const dir = path.join(cacheDir, 'extractors', `${name.replace(/[^A-Za-z0-9._-]+/g, '_')}-${subversoRev.slice(0, 12)}`);
     const binary = path.join(dir, '.lake', 'build', 'bin', 'subverso-extract-mod');
-    if (existsSync(binary)) return Promise.resolve(binary);
+    if (existsSync(binary)) return Promise.resolve({ binary, dir });
     if (!extractorBuilds.has(dir)) {
       extractorBuilds.set(dir, (async () => {
-        job.say(`Building the SubVerso extractor for ${toolchain} (once per Lean version)`);
+        job.say(`Building the SubVerso extractor for ${name} (once per Lean version)`);
         rmSync(dir, { recursive: true, force: true });
         mkdirSync(path.dirname(dir), { recursive: true });
         await must('git', ['clone', '--quiet', '--no-checkout', subverso, dir]);
         await must('git', ['-C', dir, 'checkout', '--quiet', subversoRev]);
-        writeFileSync(path.join(dir, 'lean-toolchain'), `${toolchain}\n`);
-        await must('lake', ['build', 'subverso-extract-mod'], { cwd: dir, onLine: (line) => job.progress(line) });
-        if (!existsSync(binary)) throw new Error('SubVerso built, but its extractor is missing');
-        return binary;
+        writeFileSync(path.join(dir, 'lean-toolchain'), `${name}\n`);
+        const built = await untrusted(toolchain.lake, ['build', 'subverso-extract-mod'], {
+          cwd: dir, toolchain, writable: [dir], onLine: (line) => job.progress(line),
+        });
+        if (built.code !== 0 || !existsSync(binary)) {
+          throw new Error(`SubVerso's extractor did not build for ${name}: ${tail(built.stderr || built.stdout, 300) || 'no output'}`);
+        }
+        return { binary, dir };
       })().finally(() => extractorBuilds.delete(dir)));
     }
     return extractorBuilds.get(dir);
   }
 
-  async function lakeEnvironment(root) {
-    const script = 'process.stdout.write(JSON.stringify(process.env))';
-    const result = await must('lake', ['env', process.execPath, '-e', script], { cwd: root });
-    return JSON.parse(result.stdout.slice(result.stdout.indexOf('{')));
+  /** The source roots Lake sets up for the project (`LEAN_SRC_PATH`), for naming modules. */
+  async function sourceRoots(root, toolchain, job) {
+    const result = await untrusted(toolchain.lake, ['env', 'printenv', 'LEAN_SRC_PATH'], { cwd: root, toolchain, writable: [job.dir] });
+    return result.code === 0 ? result.stdout.trim().split('\n').pop() : '';
   }
 
   async function extract(root, file, context, job) {
@@ -341,24 +480,26 @@ export function createHelper(options = {}) {
     const output = path.join(context.workDir, `${sha256(file.repoPath)}.json`);
     try {
       const source = readFileSync(path.join(root, file.path), 'utf8');
-      let moduleName = moduleNameFor(root, context.env.LEAN_SRC_PATH, file.path);
+      // The extractor runs under `lake env`, which gives it the project's modules.
+      let args = ['env', context.extractor.binary];
       let cwd = root;
-      let env = context.env;
+      let moduleName = moduleNameFor(root, context.srcPath, file.path);
       if (!moduleName) {
         // A file outside the project's libraries (a script, a test): elaborated on its own, from
         // its directory, against the project's built modules.
         moduleName = path.basename(file.path, '.lean');
         if (!/^[A-Za-z_][A-Za-z0-9_']*$/.test(moduleName)) throw new Error('This file is not part of a library of its Lake project');
         cwd = path.dirname(path.join(root, file.path));
-        env = { ...context.env };
-        delete env.LEAN_SRC_PATH;
+        args = ['-d', root, 'env', 'env', '-u', 'LEAN_SRC_PATH', context.extractor.binary];
       }
-      const result = await run(context.extractor, [moduleName, output], { cwd, env, timeoutMs: EXTRACT_TIMEOUT_MS });
+      const result = await untrusted(context.toolchain.lake, [...args, moduleName, output], {
+        cwd, toolchain: context.toolchain, readable: [context.extractor.dir], writable: [job.dir, context.workDir], timeoutMs: EXTRACT_TIMEOUT_MS,
+      });
       if (result.code !== 0) throw new Error(`Lean could not process the file: ${tail(result.stderr || result.stdout, 400) || `exit ${result.code}`}`);
       const data = convertModule(JSON.parse(readFileSync(output, 'utf8')), source);
       const target = dataFile(job.repo, job.sha, file.repoPath);
       mkdirSync(path.dirname(target), { recursive: true });
-      writeFileSync(target, JSON.stringify({ ...data, hash: sha256(source), lean: context.toolchain }));
+      writeFileSync(target, JSON.stringify({ ...data, hash: sha256(source), lean: context.name }));
       fileStates.delete(key);
     } catch (error) {
       fileStates.set(key, { state: 'error', error: error.message });
@@ -371,6 +512,7 @@ export function createHelper(options = {}) {
 
   async function runJob(job) {
     const dir = await ensureRepo(job);
+    job.dir = realOrSame(dir);
     await checkout(dir, job);
     // Files grouped by the Lake project they belong to (usually one, at the repository root).
     const groups = new Map();
@@ -387,16 +529,17 @@ export function createHelper(options = {}) {
       if (!groups.has(rootDir)) groups.set(rootDir, []);
       groups.get(rootDir).push({ repoPath, path: rootDir ? repoPath.slice(rootDir.length + 1) : repoPath });
     }
-    const workDir = path.join(tmpdir(), `lean-lens-${randomBytes(6).toString('hex')}`);
+    const workDir = path.join(madeDir(path.join(cacheDir, 'work')), randomBytes(6).toString('hex'));
     mkdirSync(workDir, { recursive: true });
     try {
       for (const [rootDir, files] of groups) {
-        const root = path.join(dir, rootDir);
+        const root = path.join(job.dir, rootDir);
         job.phase = 'preparing';
-        await ensureDependencies(root, job);
-        await buildImports(root, files.map((file) => file.path), job);
-        const extractor = await ensureExtractor(root, job);
-        const context = { extractor, env: await lakeEnvironment(root), workDir, toolchain: toolchainOf(root) };
+        const toolchain = await resolveToolchain(root, job);
+        await ensureDependencies(root, rootDir, toolchain, job);
+        await buildImports(root, files.map((file) => file.path), toolchain, job);
+        const extractor = await ensureExtractor(root, toolchain, job);
+        const context = { extractor, toolchain, workDir, name: toolchainOf(root), srcPath: await sourceRoots(root, toolchain, job) };
         job.phase = 'elaborating';
         job.say(`Elaborating ${files.length} file${files.length === 1 ? '' : 's'}`);
         let next = 0;
@@ -471,7 +614,7 @@ export function createHelper(options = {}) {
     const { pathname, searchParams } = new URL(url, 'http://127.0.0.1');
     const request = body || {};
     if (method === 'GET' && pathname === '/status') {
-      return json(200, { ok: true, name: 'lean-lens-helper', version: HELPER_VERSION, format: DATA_FORMAT_VERSION, allow: config.allow });
+      return json(200, { ok: true, name: 'lean-lens-helper', version: HELPER_VERSION, format: DATA_FORMAT_VERSION, allow: config.allow, sandbox: sandboxState });
     }
     if (method === 'POST' && pathname === '/allow') {
       if (!isRepo(request.repo)) return json(400, { error: 'Bad repository name' });
@@ -498,7 +641,10 @@ export function createHelper(options = {}) {
     return json(404, { error: 'Unknown request' });
   }
 
-  return { cacheDir, config, allow, link, start, status, fileState, readData, handle, poolSize };
+  /** How a project's code is confined: 'seatbelt', 'none' (this system can't) or 'off'. */
+  const sandbox = () => sandboxKind.then(() => sandboxState);
+
+  return { cacheDir, config, allow, link, start, status, fileState, readData, handle, poolSize, sandbox };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -589,6 +735,7 @@ Options
   --subverso URL-or-PATH    where to get SubVerso (default ${DEFAULT_SUBVERSO})
   --subverso-rev REV        SubVerso revision to build
   --clone-base URL          where repositories are cloned from (default ${DEFAULT_CLONE_BASE})
+  --no-sandbox              run a project's code with your own permissions and environment
 `;
 
 async function main() {
@@ -598,12 +745,20 @@ async function main() {
       port: { type: 'string' }, cache: { type: 'string' }, jobs: { type: 'string' },
       allow: { type: 'string', multiple: true }, link: { type: 'string', multiple: true },
       subverso: { type: 'string' }, 'subverso-rev': { type: 'string' }, 'clone-base': { type: 'string' },
-      repo: { type: 'string' }, sha: { type: 'string' }, pr: { type: 'string' },
+      repo: { type: 'string' }, sha: { type: 'string' }, pr: { type: 'string' }, 'no-sandbox': { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
     },
   });
   if (values.help) { console.log(USAGE); return; }
-  const helper = createHelper({ cacheDir: values.cache, jobs: values.jobs, subverso: values.subverso, subversoRev: values['subverso-rev'], cloneBase: values['clone-base'] });
+  const helper = createHelper({
+    cacheDir: values.cache, jobs: values.jobs, subverso: values.subverso, subversoRev: values['subverso-rev'],
+    cloneBase: values['clone-base'], sandbox: !values['no-sandbox'],
+  });
+  const sandboxLine = {
+    seatbelt: "on: the project's code runs without network access and cannot read or change your files",
+    none: 'not available on this system: Lean runs with your permissions',
+    off: 'off (--no-sandbox): Lean runs with your permissions',
+  }[await helper.sandbox()];
   for (const entry of values.link || []) {
     const split = entry.indexOf('=');
     if (split < 1) throw new Error(`--link takes owner/repo=PATH, not ${entry}`);
@@ -617,6 +772,7 @@ async function main() {
       throw new Error('run needs --repo owner/repo, --sha with a full commit hash, and Lean files');
     }
     helper.allow(values.repo);
+    console.log(`Sandbox ${sandboxLine}`);
     helper.start({ repo: values.repo, sha: values.sha, pr: Number(values.pr) || null, paths });
     await new Promise((resolve) => {
       const poll = setInterval(() => {
@@ -642,6 +798,7 @@ async function main() {
   Token    ${helper.config.token}
 
 Paste both into the extension's options, under "Real Lean".
+Sandbox ${sandboxLine}.
 Allowed repositories: ${helper.config.allow.length ? helper.config.allow.join(', ') : 'none yet (allow one from the extension, or with --allow owner/repo)'}
 Kept in: ${helper.cacheDir}
 `);
