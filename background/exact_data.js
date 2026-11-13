@@ -82,19 +82,65 @@
   }
 
   /**
+   * A field in its place. Lean's hover on the `mp` of `Nat.even_add_one.mp` is `Iff.mp`'s
+   * general statement, `a → b`. What it says here follows from the hovers Lean recorded for the
+   * tokens before it: `Nat.even_add_one.mp {n : ℕ} : Even (n + 1) → ¬Even n`.
+   * `chain` is the dotted text up to and including the hovered field, starting at `chainColumn`.
+   * Returns `{ term, signature, from }` or null (no receiver, or it can't be worked out).
+   */
+  function fieldInPlace(data, line, hit, chain, chainColumn) {
+    const terms = scope.LeanTerms;
+    if (!terms || !terms.fieldChainInPlace || !chain || typeof chainColumn !== 'number') return null;
+    if (hit.hover.k !== 'const' || hit.start <= chainColumn) return null;
+    const row = data.lines[line] || [];
+    const text = (part) => chain.slice(part.start - chainColumn, part.end - chainColumn);
+    // The tokens before the hovered one: with a dot after each, they are its receiver.
+    const parts = [];
+    for (let at = chainColumn; at < hit.start;) {
+      let part = null;
+      for (let i = 0; i < row.length; i += 3) {
+        if (row[i] === at) part = { start: row[i], end: row[i + 1], hover: data.hovers[row[i + 2]] };
+      }
+      if (!part || part.end >= hit.start || chain[part.end - chainColumn] !== '.') return null;
+      parts.push(part);
+      at = part.end + 1;
+    }
+    if (!parts.length || parts[parts.length - 1].end + 1 !== hit.start) return null;
+    const first = parts[0].hover;
+    const head = first.k === 'var' ? { name: first.n, type: first.t }
+      : first.k === 'const' ? { name: first.n, signature: first.s } : null;
+    const fields = [...parts.slice(1), hit];
+    if (!head || fields.some((part) => part.hover.k !== 'const')) return null;
+    const placed = terms.fieldChainInPlace(head, fields.map((part) => ({ text: text(part), name: part.hover.n, signature: part.hover.s })));
+    return placed ? Object.assign(placed, { from: first.n }) : null;
+  }
+
+  /**
    * Everything Lean recorded at a position: `{token, goals, messages, lean}`, where `token` is
    * the tooltip's fields for the token there (or null) and `lean` the Lean version used.
+   * With `chain` (the dotted name up to the hovered field, starting at `chainColumn`), a field
+   * shows what it says in its place, above Lean's own hover for it.
    */
-  function describe(data, line, column, endColumn, caret) {
+  function describe(data, line, column, endColumn, caret, chain, chainColumn) {
     const hit = tokenAt(data, line, column, endColumn, caret);
     const point = typeof caret === 'number' ? Math.min(Math.max(caret, column), Math.max(column, (endColumn || column + 1) - 1)) : column;
+    const token = hit ? tokenView(hit.hover) : null;
+    const placed = hit && token ? fieldInPlace(data, line, hit, chain, chainColumn) : null;
+    if (placed) {
+      const field = chain.slice(hit.start - chainColumn, hit.end - chainColumn);
+      Object.assign(token, {
+        display: placed.term,
+        typeSignature: placed.signature,
+        docstring: `Worked out from \`${placed.from}\` and Lean's hover for \`${field}\`:\n\n\`\`\`lean\n${hit.hover.s}\n\`\`\`${hit.hover.d ? `\n\n${hit.hover.d}` : ''}`
+      });
+    }
     return {
-      token: hit ? tokenView(hit.hover) : null,
+      token,
       goals: tacticAt(data, line, hit ? hit.start : point),
       messages: messagesAt(data, line, hit ? hit.start : point),
       lean: data.lean || null
     };
   }
 
-  scope.LeanLensExact = { FORMAT_VERSION, tokenAt, tacticAt, messagesAt, describe };
+  scope.LeanLensExact = { FORMAT_VERSION, tokenAt, tacticAt, messagesAt, fieldInPlace, describe };
 })(typeof self !== 'undefined' ? self : globalThis);

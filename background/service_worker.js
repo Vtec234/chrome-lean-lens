@@ -999,11 +999,39 @@ async function structureField(type, index, rest) {
   return current;
 }
 
+/**
+ * A field's hover in its place: `Nat.even_add_one.mp` shows `Even (n + 1) → ¬Even n` rather than
+ * `Iff.mp`'s general `a → b`, which stays below it. `head` is the receiver chain's first name with
+ * its type (a variable) or its signature (a constant); `fields` the constants after it.
+ */
+function fieldResultInPlace(result, hit, head, fields) {
+  const terms = self.LeanTerms;
+  const bc = self.VersoBinderContext;
+  if (!terms || !terms.fieldChainInPlace || !bc || !bc.leanSignature || !head) return result;
+  const printed = (h) => bc.leanSignature(h.name, h.type);
+  let placed = null;
+  try {
+    placed = terms.fieldChainInPlace(head, fields.map((f) => ({ text: f.text, name: f.hit.name, signature: printed(f.hit) })));
+  } catch (err) {
+    placed = null;
+  }
+  if (!placed) return result;
+  return Object.assign({}, result, {
+    name: placed.term,
+    typeSignature: placed.signature,
+    docstring: `Worked out from \`${head.name}\` and \`${hit.name}\`:\n\n\`\`\`lean\n${result.typeSignature}\n\`\`\`${result.docstring ? `\n\n${result.docstring}` : ''}`
+  });
+}
+
 /** `const.path₁.….field`, typing each step from Loogle signatures. */
 async function resolveReceiverChain(receiver, field, fileRef) {
   if (!receiver || !receiver.const || !field) return null;
   // Track the receiver's full type, so later steps can substitute from it.
   let current = null; // { type, sig }
+  // The chain's first name as Lean would show it, to say what the field is in its place.
+  let head = null;
+  const steps = [];
+  const bc0 = self.VersoBinderContext;
   if (receiver.maybeVariable) {
     // A file-level `variable` first (`hT.out` with `variable [hT : Fact (0 < T)]`).
     const v = fileRef ? await lookupFileVariable(receiver.const, fileRef) : null;
@@ -1011,21 +1039,26 @@ async function resolveReceiverChain(receiver, field, fileRef) {
     current = v
       ? { type: receiver.applied && bc ? bc.conclusionOf(v.rawType) : v.rawType, sig: null }
       : await resultType(await qualifyConstant(receiver.const, fileRef), null);
+    if (v && !receiver.applied) head = { name: receiver.const, type: v.rawType };
   } else {
-    current = await resultType(await qualifyConstant(receiver.const, fileRef), null);
+    const name = await qualifyConstant(receiver.const, fileRef);
+    current = await resultType(name, null);
+    if (current && current.sig && !receiver.applied && bc0 && bc0.leanSignature) head = { name, signature: bc0.leanSignature(name, current.sig) };
   }
   const named = async (ns, f) => (/^\d+$/.test(f) ? await numericFieldName(ns, parseInt(f, 10)) : f);
   for (const step of receiver.path || []) {
     const ns = current && namespaceOfType(current.type, current.sig);
     const name = ns && await named(ns, step);
     if (!name) return null;
+    const stepHit = head ? await loogleExact(`${ns}.${name}`) : null;
+    if (stepHit && stepHit.type) steps.push({ text: step, hit: stepHit }); else head = null;
     current = await resultType(`${ns}.${name}`, current.type);
   }
   const ns = current && namespaceOfType(current.type, current.sig);
   const name = ns && await named(ns, field);
   if (!name) return null;
   const hit = await loogleExact(`${ns}.${name}`);
-  if (hit && hit.type) return hitToResult(hit);
+  if (hit && hit.type) return fieldResultInPlace(hitToResult(hit), hit, head, [...steps, { text: field, hit }]);
   // The project's own type (`Rectangle.y₀`, a field of a structure of the PR).
   const own = projectDeclaration(`${ns}.${name}`, fileRef);
   return own ? Object.assign({}, own) : null;
@@ -1337,7 +1370,7 @@ async function exactHover(request) {
   if (file.state !== 'ready') return Object.assign({}, file, { repo, sha, data: undefined });
   queryStats.leanHits++;
   return Object.assign({ state: 'ready', repo, sha },
-    self.LeanLensExact.describe(file.data, fileRef.line, request.column, request.columnEnd, request.caret));
+    self.LeanLensExact.describe(file.data, fileRef.line, request.column, request.columnEnd, request.caret, request.chain, request.chainColumn));
 }
 
 /** Start Lean on files of a commit. The page only sends this after a click. */

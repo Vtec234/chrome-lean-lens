@@ -49,10 +49,25 @@
    "defines": ["wide"],
    "code": 496},
   {"range":
-   {"start": {"line": 34, "column": 1}, "end": {"line": 34, "column": 1}},
+   {"start": {"line": 35, "column": 1}, "end": {"line": 35, "column": 65}},
+   "kind": "Lean.Parser.Command.declaration",
+   "defines": ["iff_use"],
+   "code": 537},
+  {"range":
+   {"start": {"line": 37, "column": 1}, "end": {"line": 37, "column": 71}},
+   "kind": "Lean.Parser.Command.declaration",
+   "defines": ["and_swap"],
+   "code": 578},
+  {"range":
+   {"start": {"line": 39, "column": 1}, "end": {"line": 39, "column": 83}},
+   "kind": "Lean.Parser.Command.declaration",
+   "defines": ["lemma_use"],
+   "code": 615},
+  {"range":
+   {"start": {"line": 40, "column": 1}, "end": {"line": 40, "column": 1}},
    "kind": "Lean.Parser.Command.eoi",
    "defines": [],
-   "code": 499}],
+   "code": 618}],
  "data":
  {"tokens":
   {"93":
@@ -153,6 +168,26 @@
       "docs":
       "`a + b` computes the sum of `a` and `b`.\nThe meaning of this notation is type-dependent. \n\nConventions for notations in identifiers:\n\n * The recommended spelling of `+` in identifiers is `add`."}},
     "content": "+"},
+   "616": {"kind": "unknown", "content": ""},
+   "613":
+   {"kind":
+    {"const":
+     {"signatureFormat": null,
+      "signature": "Iff.mpr {a b : Prop} (self : a ↔ b) : b → a",
+      "name": ["Iff", "mpr"],
+      "isDef": false,
+      "docs":
+      "Modus ponens for if and only if, reversed. If `a ↔ b` and `b`, then `a`. "}},
+    "content": "mpr"},
+   "611":
+   {"kind":
+    {"const":
+     {"signatureFormat": null,
+      "signature": "Nat.lt_iff_add_one_le {m n : Nat} : m < n ↔ m + 1 ≤ n",
+      "name": ["Nat", "lt_iff_add_one_le"],
+      "isDef": false,
+      "docs": null}},
+    "content": "Nat.lt_iff_add_one_le"},
    "61":
    {"kind":
     {"keyword":
@@ -161,6 +196,155 @@
       "docs":
       "`by tac` constructs a term of the expected type by running the tactic(s) `tac`. "}},
     "content": "by"},
+   "609":
+   {"kind":
+    {"delim":
+     {"occurrence": "Lean.Parser.Command.declValSimple-902",
+      "name": ["Lean", "Parser", "Command", "declValSimple"],
+      "docs": null}},
+    "content": ":="},
+   "607":
+   {"kind":
+    {"operator":
+     {"occurrence": "«term_<_»-896",
+      "name": ["term_<_"],
+      "docs":
+      "The less-than relation: `x < y` \n\nConventions for notations in identifiers:\n\n * The recommended spelling of `<` in identifiers is `lt`."}},
+    "content": "<"},
+   "605":
+   {"kind":
+    {"delim":
+     {"occurrence": "Lean.Parser.Term.typeSpec-894",
+      "name": ["Lean", "Parser", "Term", "typeSpec"],
+      "docs": null}},
+    "content": ":"},
+   "603":
+   {"kind":
+    {"bracket":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-876",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": ")"},
+   "601":
+   {"kind": {"num": {"typeFormat": null, "type": "Nat"}}, "content": "5"},
+   "599":
+   {"kind":
+    {"operator":
+     {"occurrence": "«term_≤_»-881",
+      "name": ["term_≤_"],
+      "docs":
+      "The less-equal relation: `x ≤ y` \n\nConventions for notations in identifiers:\n\n * The recommended spelling of `≤` in identifiers is `le`."}},
+    "content": "≤"},
+   "597":
+   {"kind":
+    {"operator":
+     {"occurrence": "«term_+_»-881",
+      "name": ["term_+_"],
+      "docs":
+      "`a + b` computes the sum of `a` and `b`.\nThe meaning of this notation is type-dependent. \n\nConventions for notations in identifiers:\n\n * The recommended spelling of `+` in identifiers is `add`."}},
+    "content": "+"},
+   "595":
+   {"kind":
+    {"delim":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-876",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": ":"},
+   "593":
+   {"kind":
+    {"var": {"typeFormat": null, "type": "n + 1 ≤ 5", "name": "_uniq.549"}},
+    "content": "h"},
+   "591":
+   {"kind":
+    {"bracket":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-876",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": "("},
+   "589":
+   {"kind":
+    {"bracket":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-866",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": ")"},
+   "587":
+   {"kind":
+    {"delim":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-866",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": ":"},
+   "585":
+   {"kind": {"var": {"typeFormat": null, "type": "Nat", "name": "_uniq.445"}},
+    "content": "n"},
+   "583":
+   {"kind":
+    {"bracket":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-866",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": "("},
+   "581":
+   {"kind":
+    {"const":
+     {"signatureFormat": null,
+      "signature": "lemma_use (n : Nat) (h : n + 1 ≤ 5) : n < 5",
+      "name": ["lemma_use"],
+      "isDef": true,
+      "docs": null}},
+    "content": "lemma_use"},
+   "579":
+   {"kind":
+    {"keyword":
+     {"occurrence": "Lean.Parser.Command.theorem-848",
+      "name": ["Lean", "Parser", "Command", "theorem"],
+      "docs": null}},
+    "content": "theorem"},
+   "576":
+   {"kind":
+    {"anonCtor":
+     {"signatureFormat": null,
+      "signature": "And.intro {a b : Prop} (left : a) (right : b) : a ∧ b",
+      "name": ["And", "intro"],
+      "docs":
+      "`And.intro : a → b → a ∧ b` is the constructor for the And operation. "}},
+    "content": "⟩"},
+   "574":
+   {"kind":
+    {"const":
+     {"signatureFormat": null,
+      "signature": "And.left {a b : Prop} (self : a ∧ b) : a",
+      "name": ["And", "left"],
+      "isDef": false,
+      "docs":
+      "Extract the left conjunct from a conjunction. `h : a ∧ b` then\n`h.left`, also notated as `h.1`, is a proof of `a`. "}},
+    "content": "left"},
+   "572":
+   {"kind":
+    {"anonCtor":
+     {"signatureFormat": null,
+      "signature": "And.intro {a b : Prop} (left : a) (right : b) : a ∧ b",
+      "name": ["And", "intro"],
+      "docs":
+      "`And.intro : a → b → a ∧ b` is the constructor for the And operation. "}},
+    "content": ","},
+   "570":
+   {"kind":
+    {"const":
+     {"signatureFormat": null,
+      "signature": "And.right {a b : Prop} (self : a ∧ b) : b",
+      "name": ["And", "right"],
+      "isDef": false,
+      "docs":
+      "Extract the right conjunct from a conjunction. `h : a ∧ b` then\n`h.right`, also notated as `h.2`, is a proof of `b`. "}},
+    "content": "right"},
    "57":
    {"kind":
     {"const":
@@ -172,7 +356,139 @@
       "docs":
       "`a * b` computes the product of `a` and `b`.\nThe meaning of this notation is type-dependent. \n\nConventions for notations in identifiers:\n\n * The recommended spelling of `*` in identifiers is `mul`."}},
     "content": "*"},
+   "568":
+   {"kind":
+    {"anonCtor":
+     {"signatureFormat": null,
+      "signature": "And.intro {a b : Prop} (left : a) (right : b) : a ∧ b",
+      "name": ["And", "intro"],
+      "docs":
+      "`And.intro : a → b → a ∧ b` is the constructor for the And operation. "}},
+    "content": "⟨"},
+   "566":
+   {"kind":
+    {"delim":
+     {"occurrence": "Lean.Parser.Command.declValSimple-822",
+      "name": ["Lean", "Parser", "Command", "declValSimple"],
+      "docs": null}},
+    "content": ":="},
+   "564":
+   {"kind":
+    {"operator":
+     {"occurrence": "«term_∧_»-814",
+      "name": ["term_∧_"],
+      "docs":
+      "`And a b`, or `a ∧ b`, is the conjunction of propositions. It can be\nconstructed and destructed like a pair: if `ha : a` and `hb : b` then\n`⟨ha, hb⟩ : a ∧ b`, and if `h : a ∧ b` then `h.left : a` and `h.right : b`.\n\n\nConventions for notations in identifiers:\n\n * The recommended spelling of `∧` in identifiers is `and`."}},
+    "content": "∧"},
+   "562":
+   {"kind":
+    {"delim":
+     {"occurrence": "Lean.Parser.Term.typeSpec-812",
+      "name": ["Lean", "Parser", "Term", "typeSpec"],
+      "docs": null}},
+    "content": ":"},
+   "560":
+   {"kind":
+    {"bracket":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-798",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": ")"},
+   "558":
+   {"kind":
+    {"operator":
+     {"occurrence": "«term_∧_»-803",
+      "name": ["term_∧_"],
+      "docs":
+      "`And a b`, or `a ∧ b`, is the conjunction of propositions. It can be\nconstructed and destructed like a pair: if `ha : a` and `hb : b` then\n`⟨ha, hb⟩ : a ∧ b`, and if `h : a ∧ b` then `h.left : a` and `h.right : b`.\n\n\nConventions for notations in identifiers:\n\n * The recommended spelling of `∧` in identifiers is `and`."}},
+    "content": "∧"},
+   "556":
+   {"kind":
+    {"delim":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-798",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": ":"},
+   "554":
+   {"kind": {"var": {"typeFormat": null, "type": "p ∧ q", "name": "_uniq.438"}},
+    "content": "h"},
+   "552":
+   {"kind":
+    {"bracket":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-798",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": "("},
+   "550":
+   {"kind":
+    {"bracket":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-785",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": ")"},
    "55": {"kind": "unknown", "content": "2"},
+   "548":
+   {"kind":
+    {"delim":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-785",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": ":"},
+   "546":
+   {"kind": {"var": {"typeFormat": null, "type": "Prop", "name": "_uniq.436"}},
+    "content": "q"},
+   "544":
+   {"kind": {"var": {"typeFormat": null, "type": "Prop", "name": "_uniq.434"}},
+    "content": "p"},
+   "542":
+   {"kind":
+    {"bracket":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-785",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": "("},
+   "540":
+   {"kind":
+    {"const":
+     {"signatureFormat": null,
+      "signature": "and_swap (p q : Prop) (h : p ∧ q) : q ∧ p",
+      "name": ["and_swap"],
+      "isDef": true,
+      "docs": null}},
+    "content": "and_swap"},
+   "538":
+   {"kind":
+    {"keyword":
+     {"occurrence": "Lean.Parser.Command.theorem-768",
+      "name": ["Lean", "Parser", "Command", "theorem"],
+      "docs": null}},
+    "content": "theorem"},
+   "535":
+   {"kind":
+    {"const":
+     {"signatureFormat": null,
+      "signature": "Iff.mp {a b : Prop} (self : a ↔ b) : a → b",
+      "name": ["Iff", "mp"],
+      "isDef": false,
+      "docs":
+      "Modus ponens for if and only if. If `a ↔ b` and `a`, then `b`. "}},
+    "content": "mp"},
+   "533":
+   {"kind": {"delim": {"occurrence": null, "name": null, "docs": null}},
+    "content": "."},
+   "531":
+   {"kind":
+    {"delim":
+     {"occurrence": "Lean.Parser.Command.declValSimple-756",
+      "name": ["Lean", "Parser", "Command", "declValSimple"],
+      "docs": null}},
+    "content": ":="},
    "53":
    {"kind":
     {"const":
@@ -183,7 +499,121 @@
       "docs":
       "The equality relation. It has one introduction rule, `Eq.refl`.\nWe use `a = b` as notation for `Eq a b`.\nA fundamental property of equality is that it is an equivalence relation.\n```\nvariable (α : Type) (a b c d : α)\nvariable (hab : a = b) (hcb : c = b) (hcd : c = d)\n\nexample : a = d :=\n  Eq.trans (Eq.trans hab (Eq.symm hcb)) hcd\n```\nEquality is much more than an equivalence relation, however. It has the important property that every assertion\nrespects the equivalence, in the sense that we can substitute equal expressions without changing the truth value.\nThat is, given `h1 : a = b` and `h2 : p a`, we can construct a proof for `p b` using substitution: `Eq.subst h1 h2`.\nExample:\n```\nexample (α : Type) (a b : α) (p : α → Prop)\n        (h1 : a = b) (h2 : p a) : p b :=\n  Eq.subst h1 h2\n\nexample (α : Type) (a b : α) (p : α → Prop)\n    (h1 : a = b) (h2 : p a) : p b :=\n  h1 ▸ h2\n```\nThe triangle in the second presentation is a macro built on top of `Eq.subst` and `Eq.symm`, and you can enter it by typing `\\t`.\nFor more information: [Equality](https://lean-lang.org/theorem_proving_in_lean4/quantifiers_and_equality.html#equality)\n\n\nConventions for notations in identifiers:\n\n * The recommended spelling of `=` in identifiers is `eq`."}},
     "content": "="},
-   "497": {"kind": "unknown", "content": ""},
+   "529":
+   {"kind":
+    {"delim":
+     {"occurrence": "Lean.Parser.Term.typeSpec-752",
+      "name": ["Lean", "Parser", "Term", "typeSpec"],
+      "docs": null}},
+    "content": ":"},
+   "527":
+   {"kind":
+    {"bracket":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-743",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": ")"},
+   "525":
+   {"kind":
+    {"delim":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-743",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": ":"},
+   "523":
+   {"kind": {"var": {"typeFormat": null, "type": "p", "name": "_uniq.427"}},
+    "content": "hp"},
+   "521":
+   {"kind":
+    {"bracket":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-743",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": "("},
+   "519":
+   {"kind":
+    {"bracket":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-729",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": ")"},
+   "517":
+   {"kind":
+    {"operator":
+     {"occurrence": "«term_↔_»-734",
+      "name": ["term_↔_"],
+      "docs":
+      "If and only if, or logical bi-implication. `a ↔ b` means that `a` implies `b` and vice versa.\nBy `propext`, this implies that `a` and `b` are equal and hence any expression involving `a`\nis equivalent to the corresponding expression with `b` instead.\n\n\nConventions for notations in identifiers:\n\n * The recommended spelling of `↔` in identifiers is `iff`."}},
+    "content": "↔"},
+   "515":
+   {"kind":
+    {"delim":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-729",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": ":"},
+   "513":
+   {"kind": {"var": {"typeFormat": null, "type": "p ↔ q", "name": "_uniq.425"}},
+    "content": "h"},
+   "511":
+   {"kind":
+    {"bracket":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-729",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": "("},
+   "509":
+   {"kind":
+    {"bracket":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-716",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": ")"},
+   "507":
+   {"kind":
+    {"delim":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-716",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": ":"},
+   "505":
+   {"kind": {"var": {"typeFormat": null, "type": "Prop", "name": "_uniq.423"}},
+    "content": "q"},
+   "503":
+   {"kind": {"var": {"typeFormat": null, "type": "Prop", "name": "_uniq.421"}},
+    "content": "p"},
+   "501":
+   {"kind":
+    {"bracket":
+     {"occurrence": "Lean.Parser.Term.explicitBinder-716",
+      "name": ["Lean", "Parser", "Term", "explicitBinder"],
+      "docs":
+      "Explicit binder, like `(x y : A)` or `(x y)`.\nDefault values can be specified using `(x : A := v)` syntax, and tactics using `(x : A := by tac)`.\n"}},
+    "content": "("},
+   "499":
+   {"kind":
+    {"const":
+     {"signatureFormat": null,
+      "signature": "iff_use (p q : Prop) (h : p ↔ q) (hp : p) : q",
+      "name": ["iff_use"],
+      "isDef": true,
+      "docs": null}},
+    "content": "iff_use"},
+   "497":
+   {"kind":
+    {"keyword":
+     {"occurrence": "Lean.Parser.Command.theorem-700",
+      "name": ["Lean", "Parser", "Command", "theorem"],
+      "docs": null}},
+    "content": "theorem"},
    "492":
    {"kind":
     {"keyword":
@@ -1220,7 +1650,7 @@
    {"kind": {"var": {"typeFormat": null, "type": "Nat", "name": "_uniq.2"}},
     "content": "n"},
    "1": {"kind": "docComment", "content": "/-- Doubles a number. -/"}},
-  "nextKey": 500,
+  "nextKey": 619,
   "messageContents":
   {"99": {"text": "\n"},
    "98": {"text": "` is not explicitly referenced."},
@@ -1560,16 +1990,223 @@
    {"tactics": {"startPos": 112, "info": [60], "endPos": 114, "content": 63}},
    "63": {"seq": {"highlights": [62, 0]}},
    "62": {"token": {"tok": 61}},
+   "618": {"seq": {"highlights": [3, 617, 0]}},
+   "617": {"token": {"tok": 616}},
+   "615":
+   {"seq":
+    {"highlights":
+     [26,
+      580,
+      6,
+      582,
+      6,
+      584,
+      586,
+      6,
+      588,
+      6,
+      16,
+      590,
+      6,
+      592,
+      594,
+      6,
+      596,
+      6,
+      586,
+      6,
+      598,
+      6,
+      415,
+      6,
+      600,
+      6,
+      602,
+      604,
+      6,
+      606,
+      6,
+      586,
+      6,
+      608,
+      6,
+      602,
+      6,
+      610,
+      6,
+      612,
+      534,
+      614,
+      6,
+      594,
+      0]}},
+   "614": {"token": {"tok": 613}},
+   "612": {"token": {"tok": 611}},
+   "610": {"token": {"tok": 609}},
+   "608": {"token": {"tok": 607}},
+   "606": {"token": {"tok": 605}},
+   "604": {"token": {"tok": 603}},
+   "602": {"token": {"tok": 601}},
+   "600": {"token": {"tok": 599}},
    "6": {"text": {"str": " "}},
+   "598": {"token": {"tok": 597}},
+   "596": {"token": {"tok": 595}},
+   "594": {"token": {"tok": 593}},
+   "592": {"token": {"tok": 591}},
+   "590": {"token": {"tok": 589}},
    "59": {"seq": {"highlights": [51, 42, 6, 34, 6, 54, 6, 56, 6, 58, 6, 34]}},
+   "588": {"token": {"tok": 587}},
+   "586": {"token": {"tok": 585}},
+   "584": {"token": {"tok": 583}},
+   "582": {"token": {"tok": 581}},
+   "580": {"token": {"tok": 579}},
    "58": {"token": {"tok": 57}},
+   "578":
+   {"seq":
+    {"highlights":
+     [26,
+      539,
+      6,
+      541,
+      6,
+      543,
+      545,
+      6,
+      547,
+      6,
+      549,
+      6,
+      199,
+      551,
+      6,
+      553,
+      555,
+      6,
+      557,
+      6,
+      545,
+      6,
+      559,
+      6,
+      547,
+      561,
+      6,
+      563,
+      6,
+      547,
+      6,
+      565,
+      6,
+      545,
+      6,
+      567,
+      6,
+      569,
+      555,
+      534,
+      571,
+      573,
+      6,
+      555,
+      534,
+      575,
+      577,
+      0]}},
+   "577": {"token": {"tok": 576}},
+   "575": {"token": {"tok": 574}},
+   "573": {"token": {"tok": 572}},
+   "571": {"token": {"tok": 570}},
+   "569": {"token": {"tok": 568}},
+   "567": {"token": {"tok": 566}},
+   "565": {"token": {"tok": 564}},
+   "563": {"token": {"tok": 562}},
+   "561": {"token": {"tok": 560}},
    "56": {"token": {"tok": 55}},
+   "559": {"token": {"tok": 558}},
+   "557": {"token": {"tok": 556}},
+   "555": {"token": {"tok": 554}},
+   "553": {"token": {"tok": 552}},
+   "551": {"token": {"tok": 550}},
+   "549": {"token": {"tok": 548}},
+   "547": {"token": {"tok": 546}},
+   "545": {"token": {"tok": 544}},
+   "543": {"token": {"tok": 542}},
+   "541": {"token": {"tok": 540}},
    "54": {"token": {"tok": 53}},
+   "539": {"token": {"tok": 538}},
+   "537":
+   {"seq":
+    {"highlights":
+     [26,
+      498,
+      6,
+      500,
+      6,
+      502,
+      504,
+      6,
+      506,
+      6,
+      508,
+      6,
+      199,
+      510,
+      6,
+      512,
+      514,
+      6,
+      516,
+      6,
+      504,
+      6,
+      518,
+      6,
+      506,
+      520,
+      6,
+      522,
+      524,
+      6,
+      526,
+      6,
+      504,
+      528,
+      6,
+      530,
+      6,
+      506,
+      6,
+      532,
+      6,
+      514,
+      534,
+      536,
+      6,
+      524,
+      0]}},
+   "536": {"token": {"tok": 535}},
+   "534": {"token": {"tok": 533}},
+   "532": {"token": {"tok": 531}},
+   "530": {"token": {"tok": 529}},
+   "528": {"token": {"tok": 527}},
+   "526": {"token": {"tok": 525}},
+   "524": {"token": {"tok": 523}},
+   "522": {"token": {"tok": 521}},
+   "520": {"token": {"tok": 519}},
    "52": {"seq": {"highlights": [51, 16, 51]}},
+   "518": {"token": {"tok": 517}},
+   "516": {"token": {"tok": 515}},
+   "514": {"token": {"tok": 513}},
+   "512": {"token": {"tok": 511}},
+   "510": {"token": {"tok": 509}},
    "51": {"text": {"str": ""}},
+   "508": {"token": {"tok": 507}},
+   "506": {"token": {"tok": 505}},
+   "504": {"token": {"tok": 503}},
+   "502": {"token": {"tok": 501}},
+   "500": {"token": {"tok": 499}},
    "50": {"token": {"tok": 49}},
    "5": {"token": {"tok": 4}},
-   "499": {"seq": {"highlights": [3, 498, 0]}},
    "498": {"token": {"tok": 497}},
    "496":
    {"seq":

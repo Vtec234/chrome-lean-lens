@@ -251,6 +251,8 @@
               column: lineRes.subStart - this.markerLength(lineContainer),
               columnEnd: lineRes.subEnd - this.markerLength(lineContainer),
               caret: lineOffset - this.markerLength(lineContainer),
+              // Where the dotted name the hovered field belongs to starts (`h` of `h.mp`).
+              chainColumn: lineRes.start - this.markerLength(lineContainer),
               boundingRect: tokenRange.getBoundingClientRect(),
               textNode: textNode
             };

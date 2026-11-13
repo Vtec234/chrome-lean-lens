@@ -22,7 +22,7 @@
     initDOM() {
       // A root left by an earlier version of the extension is rebuilt, so every part exists.
       const existing = document.getElementById('verso-hover-root');
-      if (existing && existing.querySelector('#verso-helper-bar')) {
+      if (existing && existing.querySelector('#verso-col-state')) {
         this.container = existing;
         return;
       }
@@ -53,18 +53,24 @@
             <span class="verso-module-name" id="verso-module"></span>
           </div>
           <div class="verso-body">
-            <div class="verso-signature-container">
-              <pre class="verso-code-block" id="verso-signature"></pre>
+            <!-- What Lean's run says about this spot: the proof state and its messages. Beside
+                 the definition (on its left) when there is a proof state, below it otherwise. -->
+            <div class="verso-col verso-col-state" id="verso-col-state">
+              <div class="verso-goals verso-hidden" id="verso-goals">
+                <div class="verso-goals-title" id="verso-goals-title"></div>
+                <pre class="verso-code-block verso-goals-block" id="verso-goals-body"></pre>
+              </div>
+              <div class="verso-messages verso-hidden" id="verso-messages"></div>
             </div>
-            <div class="verso-pr-banner verso-hidden" id="verso-pr-banner">
-              <div class="verso-pr-badge">✨ Defined in this PR</div>
-              <button class="verso-pr-jump-btn" id="verso-pr-jump-btn">Jump to definition &rarr;</button>
-            </div>
-            <div class="verso-docstring" id="verso-docstring"></div>
-            <div class="verso-messages verso-hidden" id="verso-messages"></div>
-            <div class="verso-goals verso-hidden" id="verso-goals">
-              <div class="verso-goals-title" id="verso-goals-title"></div>
-              <pre class="verso-code-block verso-goals-block" id="verso-goals-body"></pre>
+            <div class="verso-col verso-col-def" id="verso-col-def">
+              <div class="verso-signature-container">
+                <pre class="verso-code-block" id="verso-signature"></pre>
+              </div>
+              <div class="verso-pr-banner verso-hidden" id="verso-pr-banner">
+                <div class="verso-pr-badge">✨ Defined in this PR</div>
+                <button class="verso-pr-jump-btn" id="verso-pr-jump-btn">Jump to definition &rarr;</button>
+              </div>
+              <div class="verso-docstring" id="verso-docstring"></div>
             </div>
           </div>
           <div class="verso-footer">
@@ -314,6 +320,12 @@
         goalsEl.classList.add('verso-hidden');
       }
 
+      // Two columns when there is a proof state beside a definition: the state on the left, the
+      // definition on the right (one column on a narrow window, or for a proof state alone).
+      const wide = (typeof window !== 'undefined' && window.innerWidth) || 1024;
+      const twoColumns = Boolean(goals) && !(this.currentData && this.currentData.bare) && wide >= 720;
+      this.container.classList.toggle('verso-two-col', twoColumns);
+
       const messages = (extras && extras.messages) || [];
       messagesEl.innerHTML = messages.map((m) => {
         const severity = ['error', 'warning', 'info'].includes(m.severity) ? m.severity : 'info';
@@ -399,7 +411,7 @@
     positionTooltip(rect) {
       if (!rect) return;
       const card = this.container.querySelector('.verso-tooltip-card');
-      const cardWidth = 440;
+      const cardWidth = (card && card.offsetWidth) || 440;
       const viewportWidth = window.innerWidth;
       const viewportHeight = window.innerHeight;
 
@@ -566,6 +578,12 @@
         (m, code) => `\n\n${keep(`<pre class="verso-code-block">${this.highlightLean(code.replace(/\s+$/, ''))}</pre>`)}\n\n`);
       src = src.replace(/`([^`\n]+)`/g, (m, code) => keep(`<code class="verso-inline-code">${esc(code)}</code>`));
       let html = esc(src);
+
+      // (In hard-wrapped Markdown, a list item's indented continuation lines belong to it.)
+      if (opts.softWrap) {
+        html = html.replace(/^([ \t]*[*-][ \t]+.*)((?:\n[ \t]{2,}(?![*-][ \t])\S.*)+)/gm,
+          (m, first, rest) => first + rest.replace(/\n[ \t]+/g, ' '));
+      }
 
       // Bullet lists (`* item`, `- item`, indented or not), each list its own block.
       html = html.replace(/^[ \t]*[*-][ \t]+(.+)$/gm, '<li>$1</li>');

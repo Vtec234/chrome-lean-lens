@@ -2298,6 +2298,66 @@
     return showTerm(substTerm(substTerm(c, inst.sub), back));
   }
 
+  /**
+   * The statement of a field in its place: `recv.field` for `recv : receiverType`, from the
+   * field constant's signature. `Nat.even_add_one.mp` is `Even (n + 1) → ¬Even n`, where the
+   * constant alone (`Iff.mp`) only says `a → b`. Parameters the receiver doesn't fix stay in
+   * the type (`h.trans : b ≤ ?c → a ≤ ?c`). Null when it can't be worked out.
+   */
+  function fieldTypeOf(sig, receiverTerm, receiverType) {
+    const head = typeHead(receiverType, null);
+    if (!head) return null;
+    try {
+      const explicitSlot = peelSignature(sig).binders.some(b => b.explicit && b.type && typeHead(b.type, null) === head);
+      // (A receiver that fills an instance or implicit parameter, as in `Fact.out`, leaves the conclusion.)
+      return (explicitSlot
+        ? applyArgs(sig, [], {}, '', { receiver: { term: receiverTerm, type: receiverType, binders: [] } })
+        : receiverResultType(sig, receiverType)) || null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  /**
+   * A signature as Lean prints it (`Iff.mp.{u} {a b : Prop} (self : a ↔ b) : a → b`) without
+   * its name: `{ binders, type }` (`binders` as written, `type` after the colon), or null.
+   */
+  function signatureParts(name, signature) {
+    let body = String(signature || '').replace(/\s+/g, ' ').trim();
+    if (name && body.startsWith(name)) body = body.slice(name.length);
+    else body = body.replace(/^[^\s:({\[⦃]+/, ''); // a private name prints without its prefix
+    body = body.replace(/^\.\{[^}]*\}/, '').trim();
+    const colon = topColon(body);
+    if (colon === -1) return null;
+    return { body, binders: body.slice(0, colon).trim(), type: body.slice(colon + 1).trim() };
+  }
+
+  /**
+   * A chain of fields in its place: `head.f₁.….fₙ` from the head's hover and each field
+   * constant's signature. `head` is `{ name, type }` (a local) or `{ name, signature }` (a
+   * constant, which must take no explicit argument); `fields` are `{ text, name, signature }`.
+   * Returns `{ term, signature }`, e.g. `Nat.even_add_one.mp {n : ℕ} : Even (n + 1) → ¬Even n`.
+   */
+  function fieldChainInPlace(head, fields) {
+    let term = head.name;
+    let type = head.type || null;
+    let binders = '';
+    if (!type) {
+      const parts = signatureParts(head.name, head.signature);
+      if (!parts || peelSignature(parts.body).binders.some(b => b.explicit)) return null;
+      binders = parts.binders;
+      type = parts.type;
+    }
+    for (const field of fields) {
+      const parts = signatureParts(field.name, field.signature);
+      const next = parts && fieldTypeOf(parts.body, term, type);
+      if (!next) return null;
+      term = `${term}.${field.text}`;
+      type = next;
+    }
+    return { term, signature: `${term}${binders ? ` ${binders}` : ''} : ${type}` };
+  }
+
   /** Head, positional and named arguments of an application `f a (b := c) d`. */
   function appParts(term) {
     const t = (term || '').trim().replace(/^@/, '');
@@ -2331,6 +2391,6 @@
     funLikeCodomain, tupleParts, stripAscriptions, residualParts, BINDER_PRED_OPS, DATA_HEADS, isDataType,
     piOf, BUNDLED_HEADS, isBundledType, bundledDomCod, group, leadBinderText, residualSignature, applyArgs,
     isSignature, leanSignature, annotateCache, annotateCached, leanBinders, displayType, ruleEquationFrom,
-    applicationTypeFrom, receiverResultType, appParts, LOCAL_NAME
+    applicationTypeFrom, receiverResultType, fieldTypeOf, signatureParts, fieldChainInPlace, appParts, LOCAL_NAME
   };
 })();

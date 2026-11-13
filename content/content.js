@@ -721,7 +721,11 @@
     const ctx = window.VersoBinderContext;
     const fileRef = ctx && ctx.fileRefFromDom ? ctx.fileRefFromDom(tokenInfo.textNode) : null;
     if (!settings.enableHelper || !fileRef || typeof tokenInfo.column !== 'number') return Promise.resolve(null);
-    return sendMessageP({ action: 'EXACT_HOVER', fileRef, column: tokenInfo.column, columnEnd: tokenInfo.columnEnd, caret: tokenInfo.caret })
+    return sendMessageP({
+      action: 'EXACT_HOVER', fileRef, column: tokenInfo.column, columnEnd: tokenInfo.columnEnd, caret: tokenInfo.caret,
+      // The dotted name up to the hovered field, so `mp` in `X.mp` can show what it says there.
+      chain: tokenInfo.chainUpToCursor || undefined, chainColumn: tokenInfo.chainColumn
+    })
       .then((res) => (res && res.state && res.state !== 'off' ? Object.assign(res, { fileRef }) : null));
   }
 
@@ -743,7 +747,7 @@
   /** Lean's hover for a token, as a tooltip card. */
   function exactCard(exact) {
     const t = exact.token;
-    const card = { name: t.name, kind: t.kind, typeSignature: t.typeSignature, docstring: t.docstring, source: 'lean', lean: exact.lean };
+    const card = { name: t.display || t.name, kind: t.kind, typeSignature: t.typeSignature, docstring: t.docstring, source: 'lean', lean: exact.lean };
     if (t.kind !== 'const') return card;
     // A declaration of this pull request or project: say which kind, and where it is.
     const pr = settings.enablePRScanner && window.LeanPRScanner ? window.LeanPRScanner.declarations.get(t.name) : null;

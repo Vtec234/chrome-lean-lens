@@ -31,3 +31,9 @@ example : (1 : Nat) = 2 := by
 
 theorem wide (𝕜 : Nat) (h𝕜 : 𝕜 = 𝕜) : 𝕜 + 0 = 𝕜 := by
   simp
+
+theorem iff_use (p q : Prop) (h : p ↔ q) (hp : p) : q := h.mp hp
+
+theorem and_swap (p q : Prop) (h : p ∧ q) : q ∧ p := ⟨h.right, h.left⟩
+
+theorem lemma_use (n : Nat) (h : n + 1 ≤ 5) : n < 5 := Nat.lt_iff_add_one_le.mpr h

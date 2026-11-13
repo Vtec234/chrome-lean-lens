@@ -1512,6 +1512,49 @@ console.log("22. Testing real Lean data (the local helper)...");
     // Columns count UTF-16 units: `𝕜` is two.
     assert.strictEqual(at(32, 'h𝕜').token.typeSignature, 'h𝕜 : 𝕜 = 𝕜');
     assert.strictEqual(at(32, 'by').goals.goals.join('|'), '𝕜 : Nat\nh𝕜 : 𝕜 = 𝕜\n⊢ 𝕜 + 0 = 𝕜');
+    // A field in its place. Lean's hover on `mp` alone is `Iff.mp`'s general statement; with the
+    // hover of what comes before the dot, the tooltip says what it is here, and keeps Lean's below.
+    const field = (line, chain, word) => {
+      const start = col(line, chain);
+      const c = start + chain.length - word.length;
+      return exact.describe(data, line, c, c + word.length, c + 1, chain, start).token;
+    };
+    const mp = field(35, 'h.mp', 'mp');
+    assert.strictEqual(mp.typeSignature, 'h.mp : p → q');
+    assert.strictEqual(mp.display, 'h.mp');
+    assert.strictEqual(mp.name, 'Iff.mp', 'the constant is still the one the docs link to');
+    assert(mp.docstring.includes('```lean\nIff.mp {a b : Prop} (self : a ↔ b) : a → b\n```'), mp.docstring);
+    assert(mp.docstring.startsWith("Worked out from `h` and Lean's hover for `mp`:"), mp.docstring);
+    assert.strictEqual(field(37, 'h.right', 'right').typeSignature, 'h.right : q');
+    assert.strictEqual(field(37, 'h.left', 'left').typeSignature, 'h.left : p');
+    // On a lemma, its own parameters stay in front, as in the lemma's hover.
+    const mpr = field(39, 'Nat.lt_iff_add_one_le.mpr', 'mpr');
+    assert.strictEqual(mpr.typeSignature, 'Nat.lt_iff_add_one_le.mpr {m n : Nat} : m + 1 ≤ n → m < n');
+    assert.strictEqual(mpr.display, 'Nat.lt_iff_add_one_le.mpr');
+    // The lemma itself, and a field hovered without its chain, show Lean's hover unchanged.
+    assert.strictEqual(field(39, 'Nat.lt_iff_add_one_le', 'Nat.lt_iff_add_one_le').typeSignature, 'Nat.lt_iff_add_one_le {m n : Nat} : m < n ↔ m + 1 ≤ n');
+    assert.strictEqual(at(35, 'mp').token.typeSignature, 'Iff.mp {a b : Prop} (self : a ↔ b) : a → b');
+    // The same from signatures alone (what the estimate uses, with Loogle's).
+    const terms = context.LeanTerms;
+    assert.strictEqual(terms.fieldTypeOf('{a b : Prop} (self : a ↔ b) : a → b', 'Nat.even_add_one', 'Even (n + 1) ↔ ¬Even n'), 'Even (n + 1) → ¬Even n');
+    assert.strictEqual(terms.fieldTypeOf('{p : Prop} [self : Fact p] : p', 'hT', 'Fact (0 < T)'), '0 < T', 'a receiver that is an instance argument');
+    assert.strictEqual(terms.fieldTypeOf('{α : Type u_1} [LE α] {a b c : α} (h₁ : a ≤ b) (h₂ : b ≤ c) : a ≤ c', 'h', 'x ≤ y + 1'), 'y + 1 ≤ ?c → x ≤ ?c');
+    assert.strictEqual(terms.fieldTypeOf('{a b : Prop} (self : a ↔ b) : a → b', 'h', 'ℕ'), null, 'not a field of that type');
+    assert.strictEqual(terms.fieldChainInPlace({ name: 'hT', type: 'Fact (0 < T)' }, [
+      { text: 'out', name: 'Fact.out', signature: 'Fact.out {p : Prop} [self : Fact p] : p' },
+      { text: 'le', name: 'LT.lt.le', signature: 'LT.lt.le.{u_1} {α : Type u_1} [Preorder α] {a b : α} (h : a < b) : a ≤ b' }]).signature, 'hT.out.le : 0 ≤ T');
+    assert.strictEqual(terms.fieldChainInPlace({ name: 'foo', signature: 'foo (h : p) : a ↔ b' }, [{ text: 'mp', name: 'Iff.mp', signature: 'Iff.mp {a b : Prop} (self : a ↔ b) : a → b' }]), null,
+      'a constant that takes an argument first');
+    const estimate = context.fieldResultInPlace(
+      { name: 'Iff.mp', typeSignature: 'Iff.mp {a b : Prop} (self : a ↔ b) : a → b', docstring: 'Modus ponens.', sourceUrl: 'u' },
+      { name: 'Iff.mp', type: '{a b : Prop} (self : a ↔ b) : a → b' },
+      { name: 'Nat.even_add_one', signature: 'Nat.even_add_one {n : ℕ} : Even (n + 1) ↔ ¬Even n' },
+      [{ text: 'mp', hit: { name: 'Iff.mp', type: '{a b : Prop} (self : a ↔ b) : a → b' } }]);
+    assert.strictEqual(estimate.typeSignature, 'Nat.even_add_one.mp {n : ℕ} : Even (n + 1) → ¬Even n');
+    assert.strictEqual(estimate.name, 'Nat.even_add_one.mp');
+    assert.strictEqual(estimate.sourceUrl, 'u');
+    assert(estimate.docstring.includes('Iff.mp {a b : Prop} (self : a ↔ b) : a → b') && estimate.docstring.endsWith('Modus ponens.'), estimate.docstring);
+
     // Output that doesn't rebuild the source is refused rather than shown at the wrong place.
     assert.throws(() => convertModule(sampleModule, sampleSource.replace('double', 'triple')), /does not match the source/);
 
@@ -1691,7 +1734,14 @@ console.log("22. Testing real Lean data (the local helper)...");
     assert.strictEqual(last.extras.goals.tactic, 'unfold double');
     assert.strictEqual(sentMessages.filter((m) => m.action === 'EXACT_HOVER').length, 1);
     assert.strictEqual(sentMessages.find((m) => m.action === 'EXACT_HOVER').column, 2);
+    assert.strictEqual(sentMessages.find((m) => m.action === 'EXACT_HOVER').chain, 'double', 'the dotted name goes along');
     assert(!sentMessages.some((m) => m.action === 'LOOKUP_TOKEN'), 'no estimate is looked up');
+    // A field shown in its place: the card is titled by the chain.
+    exactAnswer = Object.assign({}, exactAnswer, { token: { name: 'Iff.mp', display: 'h.mp', kind: 'const', typeSignature: 'h.mp : p → q', docstring: 'd' } });
+    last = await hoverToken('mp', { chainUpToCursor: 'h.mp', chainColumn: 2, column: 4, columnEnd: 6, caret: 5 });
+    assert.strictEqual(last.card.name, 'h.mp');
+    assert(last.card.sourceUrl.endsWith('find/?pattern=Iff.mp#doc'), last.card.sourceUrl);
+    assert.strictEqual(JSON.stringify([sentMessages[0].chain, sentMessages[0].chainColumn]), JSON.stringify(['h.mp', 2]));
     // A keyword Lean has no docs for: the proof state alone; with no state either, nothing.
     exactAnswer = Object.assign({}, exactAnswer, { token: null, goals: { at: true, tactic: 'by', goals: ['n : Nat\n⊢ double n = 2 * n'] } });
     last = await hoverToken('by', { isKeyword: true });
@@ -1769,17 +1819,29 @@ console.log("22. Testing real Lean data (the local helper)...");
     assert(parts['#verso-messages'].innerHTML.includes('verso-message-error') && parts['#verso-messages'].innerHTML.includes('unsolved &lt;goals&gt;'));
     assert.strictEqual(parts['#verso-footer-source'].textContent, 'Lean 4.35.0 · run on this machine');
     assert(parts['#verso-helper-bar'].classList.contains('verso-hidden'), 'no status row on Lean\'s own card');
+    // A definition with a proof state is two columns (the state on the left); a proof state
+    // alone, or a definition alone, is one.
+    assert(!view.container.classList.contains('verso-two-col'), 'a proof state alone');
+    view.show({ name: 'double', kind: 'const', source: 'lean', typeSignature: 'double (n : Nat) : Nat', docstring: 'Doubles a number.' }, null, null,
+      { goals: afterUnfold, messages: [], helper: { state: 'ready' } });
+    assert(view.container.classList.contains('verso-two-col'), 'a definition with a proof state');
     view.show({ name: 'simp', kind: 'tactic', source: 'builtin', typeSignature: 'simp', docstring: 'd' }, null, null,
       { goals: null, messages: [], helper: { state: 'missing', run: () => {} } });
     assert.strictEqual(parts['#verso-helper-text'].textContent, 'Estimated. Lean has not run on this file.');
     assert.strictEqual(parts['#verso-helper-btn'].textContent, 'Run Lean');
     assert(!parts['#verso-helper-btn'].classList.contains('verso-hidden'));
     assert(parts['#verso-goals'].classList.contains('verso-hidden'));
+    assert(!view.container.classList.contains('verso-two-col'), 'a definition alone');
     view.setExtras({ goals: { at: false, tactic: 'omega', goals: [] }, messages: [], helper: { state: 'pending', phase: 'elaborating', message: 'Elaborating 3 files', done: 1, total: 3 } });
     assert.strictEqual(parts['#verso-helper-text'].textContent, 'Lean is running: Elaborating 3 files (1/3)');
     assert(parts['#verso-helper-btn'].classList.contains('verso-hidden'));
     assert(parts['#verso-goals-body'].innerHTML.includes('No goals'));
     assert.strictEqual(view.helperStatus({ state: 'ready' }, true).text, "Estimated: Lean's data has no hover for this spot.");
+    // Lean's docstrings are hard-wrapped Markdown: line ends are spaces, also inside a list item.
+    const wrapped = view.renderMarkdown('The `simp` tactic uses lemmas\nto simplify. Variants:\n- `simp` simplifies using\n  tagged lemmas.\n- `simp [h]` uses `h`\n  too.\n\nMore.', { softWrap: true });
+    assert.strictEqual(wrapped, '<p>The <code class="verso-inline-code">simp</code> tactic uses lemmas to simplify. Variants:</p>' +
+      '<ul><li><code class="verso-inline-code">simp</code> simplifies using tagged lemmas.</li><li><code class="verso-inline-code">simp [h]</code> uses <code class="verso-inline-code">h</code> too.</li></ul><p>More.</p>');
+    assert(view.renderMarkdown('one\ntwo').includes('one<br>two'), 'other docstrings keep their line breaks');
     assert.strictEqual(view.helperStatus({ state: 'ready' }, false), null);
     assert.strictEqual(view.helperStatus({ state: 'not_allowed', repo: 'o/r' }, true).button, 'Allow and run');
     assert.strictEqual(view.helperStatus({ state: 'off' }, true), null);

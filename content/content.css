@@ -258,6 +258,59 @@ body.dark-mode .verso-hover-container,
   /* Shrinks (and scrolls) when the card is limited to the room beside the hovered code. */
   flex: 1 1 auto;
   min-height: 0;
+  /* One column: the definition, then what Lean's run adds (its messages, a lone proof state). */
+  display: flex;
+  flex-direction: column;
+}
+
+.verso-col {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.verso-col-def { order: 1; }
+.verso-col-state { order: 2; }
+
+/* Two columns, for a hover with a proof state: the state on the left, the definition on the
+   right. The card is wider, and each column scrolls on its own. */
+.verso-hover-container.verso-two-col {
+  width: min(900px, calc(100vw - 24px));
+  max-width: min(900px, calc(100vw - 24px));
+}
+
+.verso-two-col .verso-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  padding: 0;
+  overflow: hidden;
+}
+
+.verso-two-col .verso-col {
+  padding: 10px 12px;
+  max-height: 380px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.verso-two-col .verso-col-state {
+  order: 1;
+  border-right: 1px solid var(--verso-border, #30363d);
+}
+
+.verso-two-col .verso-col-def { order: 2; }
+
+.verso-two-col .verso-ident-title {
+  max-width: 700px;
+}
+
+.verso-two-col .verso-goals,
+.verso-two-col .verso-messages:first-child .verso-message:first-child {
+  margin-top: 0;
+}
+
+.verso-two-col .verso-goals-block {
+  max-height: none;
 }
 
 /* Signature Code Block */
