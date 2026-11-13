@@ -465,8 +465,24 @@
       docstring: `Evidence that a proposition \`p\` is algorithmically decidable as either definitely true or definitely false, enabling \`if p then ... else ...\`.`,
       sourceUrl: "https://leanprover-community.github.io/mathlib4_docs/Init/Prelude.html#Decidable",
       source: "builtin"
+    },
+    // === TERM SYNTAX AND COMMANDS ===
+    "mod_cast": {
+      name: "mod_cast",
+      kind: "syntax",
+      module: "Lean.Elab.Tactic.NormCast",
+      typeSignature: "mod_cast e",
+      docstring: "Term syntax: normalizes the casts (`↑`) in the expected type and in the type of `e`, as `norm_cast` does, and then uses `e` (like `exact_mod_cast e` in tactic mode)."
+    },
+    "guard_msgs": {
+      name: "#guard_msgs",
+      kind: "command",
+      module: "Lean.Elab.GuardMsgs",
+      typeSignature: "#guard_msgs (drop? info|warning|error|all)? in command",
+      docstring: "Runs the command after `in` and checks that the messages it logs are exactly the ones written in the doc comment before `#guard_msgs` (`/-- info: … -/`); a mismatch is an error. Used for tests."
     }
   };
+  Object.setPrototypeOf(LEAN_BUILTINS, null); // looked up by words from the source: no `constructor`, `toString`, … from Object
 
   window.VersoBuiltins = {
     get(token) {

@@ -21,6 +21,10 @@
     "nonrec", "unsafe", "macro_rules", "deriving", "to"
   ]);
 
+  // Notations written with characters an identifier can't contain, looked up as one token
+  // (Mathlib's scoped notations for constants, longest first: `ℝ≥0∞` before `ℝ≥0`).
+  const SYMBOL_NOTATIONS = ["ℕ∪{∞}", "log⁺", "ℝ≥0∞", "d⁄dX", "ℝ≥0", "𝕔𝔻", "𝓕⁻", "∂L", "∂R", "𝒅ₕ", "D∃", "𝒟ᵒ", "𝓝ˢ", "Ω^", "∇", "𝐞", "𝔻", "𝓕", "𝟭", "𝒮", "∡", "∠", "𝑳", "𝑹", "𝒅", "𝕋", "𝒟", "𝓞", "𝓟", "𝔠", "∞", "𝓝", "𝓤"];
+
   class LeanTokenizer {
     /**
      * Check if a character is part of a Lean identifier.
@@ -36,6 +40,14 @@
      */
     static extractTokenFromLine(lineText, offset) {
       if (!lineText || offset < 0 || offset > lineText.length) return null;
+      // Notation spelled with characters names can't hold (`d⁄dX`): one token.
+      for (const nt of SYMBOL_NOTATIONS) {
+        for (let at = lineText.indexOf(nt); at !== -1 && at <= offset; at = lineText.indexOf(nt, at + 1)) {
+          if (offset < at + nt.length) {
+            return { token: nt, subToken: nt, fullChain: nt, chainUpToCursor: nt, isKeyword: false, start: at, end: at + nt.length, subStart: at, subEnd: at + nt.length };
+          }
+        }
+      }
 
       let idx = offset;
       if (idx >= lineText.length || (!this.isIdentChar(lineText[idx]) && lineText[idx] !== '.')) {
@@ -232,6 +244,7 @@
               isKeyword: lineRes.isKeyword,
               tacticPosition: this.isTacticPosition(fullLineText.slice(0, lineRes.start)),
               linePrefix: fullLineText.slice(this.markerLength(lineContainer), lineRes.start),
+              tokenText: fullLineText.slice(lineRes.start, lineRes.end),
               lineSuffix: fullLineText.slice(lineRes.end),
               boundingRect: tokenRange.getBoundingClientRect(),
               textNode: textNode
@@ -395,6 +408,7 @@
           isKeyword: res.isKeyword,
           tacticPosition: this.isTacticPosition(text.slice(0, res.start)),
           linePrefix: text.slice(0, res.start),
+          tokenText: text.slice(res.start, res.end),
           lineSuffix: text.slice(res.end),
           boundingRect: rect,
           textNode: textNode

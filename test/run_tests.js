@@ -259,7 +259,9 @@ console.log("   ✓ Dynamic Resolution verified: accurately resolves unqualified
 
 // 6. Receiver type inference for dot notation
 console.log("6. Testing receiver type inference (binder_context)...");
+loadScript('content/lean_terms.js');
 loadScript('content/binder_context.js');
+loadScript('content/term_hover.js');
 const bc = context.VersoBinderContext;
 assert(bc, "VersoBinderContext should be defined");
 
@@ -824,7 +826,8 @@ const sampleRequests = {
   TEST_LOCAL_SERVER: { url: 'http://127.0.0.1:9' },
   FILE_VARIABLE: { name: 'hT', fileRef: null },
   FILE_INSTANCES: { fileRef: null },
-  NOTATION_DOC: { name: '«term_+_»' }
+  NOTATION_DOC: { name: '«term_+_»' },
+  VERSO_REGIONS: { fileRef: null }
 };
 // Handlers run concurrently; the worker logs failures as "[Lean Lens] message handler failed: ACTION …".
 const realWarn = console.warn;
@@ -1251,6 +1254,175 @@ console.log("20. Testing semilinear maps, universes and Lean's binder printing (
   assert.strictEqual(sort('Sort 0'), 'Prop');
 }
 console.log("   ✓ PR 45819 cases verified.\n");
+
+// 21. seewoo5/DifferentProofs (closed PRs): Verso blueprint chapters, structure fields, unused
+//     instances, and words that are also Object's properties. Expected signatures are Lean's
+//     hovers on the project's own files (lean-lsp).
+console.log("21. Testing cases from sweeping DifferentProofs PRs...");
+{
+  const PR = context.LeanPRScanner, bc = context.VersoBinderContext;
+  // A Verso document is prose from `#doc` on, except its ```lean blocks.
+  const chapter = ['import VersoManual', 'open Verso.Genre Manual', '', '#doc (Manual) "Tiling a Rectangle" =>', '',
+    'theorem of Wagon: a tiling by rectangles with an integer side', '```lean', 'example : 1 = 1 := rfl', '```',
+    ':::theorem "thm:x" (lean := "IntegerRectangleTheorem, IntegerRectangle.intWidth_of_forall")', ':::'].join('\n');
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(PR.versoRegions(chapter))), { docLine: 4, fences: [[7, 9]] });
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(PR.versoRegions('theorem foo : True := trivial'))), { docLine: 0, fences: [] });
+  assert.strictEqual(PR.scanSource(chapter, 'Chapter.lean').length, 0, 'nothing is declared in prose');
+
+  // Structure fields are projections: `S.f {params} (self : S params) : T`. The section
+  // variables a structure doesn't use (`[Fintype ι]`) are left out, as by a `def`.
+  const links = [
+    'namespace IntegerRectangle', '', 'structure Rectangle where', '  /-- Left edge. -/', '  x₀ : ℝ', '  /-- Right edge. -/', '  x₁ : ℝ', '',
+    'variable {ι : Type} [Fintype ι] {R : Rectangle} {T : ι → Rectangle}', '',
+    'def Blocked (T : ι → Rectangle) (c y : ℝ) : Prop :=', '  ∃ i, (T i).x₀ < c ∧ c < (T i).x₁', '',
+    'structure Link (R : Rectangle) (T : ι → Rectangle) where', '  /-- The abscissa of the link. -/', '  c : ℝ', '  lo : ℝ', '  hi : ℝ',
+    '  lo_lt_hi : lo < hi', '  free : ∀ y, lo < y → y < hi → ¬ Blocked T c y', '',
+    'noncomputable def area (T : ι → Rectangle) : ℝ := ∑ i, ((T i).x₁ - (T i).x₀)', '',
+    'variable [Nonempty ι]', '', 'def some (T : ι → Rectangle) : Rectangle := T (Classical.arbitrary ι)',
+    'def someEdge (T : ι → Rectangle) : ℝ := (some T).x₀', '', 'end IntegerRectangle'].join('\n');
+  const sig = (name) => { const d = PR.scanSource(links, 'Defs.lean').find(x => x.name === name); return d && d.typeSignature; };
+  assert.strictEqual(sig('IntegerRectangle.Rectangle'), 'IntegerRectangle.Rectangle : Type');
+  assert.strictEqual(sig('IntegerRectangle.Rectangle.x₀'), 'IntegerRectangle.Rectangle.x₀ (self : Rectangle) : ℝ');
+  assert.strictEqual(PR.scanSource(links, 'Defs.lean').find(x => x.name === 'IntegerRectangle.Rectangle.x₀').docstring, 'Left edge.');
+  assert.strictEqual(sig('IntegerRectangle.Blocked'), 'IntegerRectangle.Blocked {ι : Type} (T : ι → Rectangle) (c y : ℝ) : Prop', 'no unused `[Fintype ι]`');
+  assert.strictEqual(sig('IntegerRectangle.Link'), 'IntegerRectangle.Link {ι : Type} (R : Rectangle) (T : ι → Rectangle) : Type', "the structure's own `R`, `T` shadow the variables");
+  assert.strictEqual(sig('IntegerRectangle.Link.c'), 'IntegerRectangle.Link.c {ι : Type} {R : Rectangle} {T : ι → Rectangle} (self : Link R T) : ℝ');
+  assert.strictEqual(sig('IntegerRectangle.Link.lo_lt_hi'), 'IntegerRectangle.Link.lo_lt_hi {ι : Type} {R : Rectangle} {T : ι → Rectangle} (self : Link R T) : self.lo < self.hi');
+  assert.strictEqual(sig('IntegerRectangle.Link.free'),
+    'IntegerRectangle.Link.free {ι : Type} {R : Rectangle} {T : ι → Rectangle} (self : Link R T) (y : ℝ) : self.lo < y → y < self.hi → ¬Blocked T self.c y',
+    '`y` has the type of `lo`, the other side of `<`; a leading `∀` is a parameter');
+  assert.strictEqual(sig('IntegerRectangle.area'), 'IntegerRectangle.area {ι : Type} [Fintype ι] (T : ι → Rectangle) : ℝ', '`∑ i, …` uses `[Fintype ι]`');
+  assert.strictEqual(sig('IntegerRectangle.some'), 'IntegerRectangle.some {ι : Type} [Nonempty ι] (T : ι → Rectangle) : Rectangle');
+  assert.strictEqual(sig('IntegerRectangle.someEdge'), 'IntegerRectangle.someEdge {ι : Type} [Nonempty ι] (T : ι → Rectangle) : ℝ', 'through `some`, which takes it');
+  // `Prop where` on its own (indented) line.
+  const strip = ['structure Strip (R : Rectangle) (a b : ℝ) :', '    Prop where', '  /-- Inside `R`. -/', '  mem : ∀ y, a < y → y ≤ b → R.x₀ ≤ y'].join('\n');
+  assert.strictEqual(PR.scanSource(strip, 'S.lean').pop().typeSignature, 'Strip.mem {R : Rectangle} {a b : ℝ} (self : Strip R a b) (y : ℝ) : a < y → y ≤ b → R.x₀ ≤ y');
+  // A constant without parameters types its arguments (Lean: `a_ge_two (n : ℕ) : 2 ≤ a n`).
+  assert.strictEqual(PR.scanSource('def a : ℕ → ℕ\n  | 0 => 2\n  | n + 1 => a n + 1\nlemma a_ge_two : ∀ n, 2 ≤ a n := by\n  sorry', 'S.lean').pop().typeSignature, 'a_ge_two (n : ℕ) : 2 ≤ a n');
+  // A theorem takes every instance on its variables.
+  const withTheorem = links.replace('\nend IntegerRectangle', '\ntheorem t (T : ι → Rectangle) : T = T := rfl\nend IntegerRectangle');
+  assert.strictEqual(PR.scanSource(withTheorem, 'Defs.lean').pop().typeSignature,
+    'IntegerRectangle.t {ι : Type} [Fintype ι] [Nonempty ι] (T : ι → Rectangle) : T = T');
+  // Lean's signature printer: leading named `∀`s are parameters, same-kind same-type binders one
+  // group, a name bound twice `n✝` (checked against Lean's hovers on probes).
+  const sigCases = [
+    ['(lo hi : ℝ) : ∀ y, lo < y → y < hi', 'foo (lo hi y : ℝ) : lo < y → y < hi'],
+    ['(a : ℕ) (b : ℕ) : a + b = b + a', 'foo (a b : ℕ) : a + b = b + a'],
+    ['(s : Set ℕ) : ∀ t : Set ℕ, t ⊆ s → t ⊆ s', 'foo (s t : Set ℕ) : t ⊆ s → t ⊆ s'],
+    ['(s : Finset ℕ) : ∀ x ∈ s, x ∈ s', 'foo (s : Finset ℕ) (x : ℕ) : x ∈ s → x ∈ s'],
+    ['(n : ℕ) : ∀ n : ℕ, n = n', 'foo (n n✝ : ℕ) : n✝ = n✝'],
+    [': ∀ (a : ℕ) {b : ℕ}, a + b = b + a', 'foo (a : ℕ) {b : ℕ} : a + b = b + a'],
+    [': ∀ {k l n : ℕ}, P k n → P l n → k = l', 'foo {k l n : ℕ} : P k n → P l n → k = l'],
+    ['{T : ι → R} : ∀ i, (T i).Nondegenerate', 'foo {T : ι → R} (i : ι) : (T i).Nondegenerate'],
+    // An unknown binder type stays in the type; so does a non-dependent arrow.
+    [': ∀ n, 0 < n → Nat.Prime n', 'foo : ∀ n, 0 < n → Nat.Prime n'],
+    // `∃` binders print without types (Lean: `harmonic_unbounded (M : ℝ) : ∃ n, …`).
+    [': ∀ M : ℕ, ∃ n : ℕ, n > M', 'foo (M : ℕ) : ∃ n, n > M'],
+    // Ascriptions as elaborated (Lean: `(hmem : (x, y) ∈ …)`); a numeral's stays.
+    ['{x y : ℝ} (n : ℕ) (hmem : ((x, y) : ℝ × ℝ) ∈ S) (h : (n : ℝ) < x) : (2 : ℝ) ≤ x', 'foo {x y : ℝ} (n : ℕ) (hmem : (x, y) ∈ S) (h : ↑n < x) : (2 : ℝ) ≤ x'],
+    ['(s : Set ℕ) : ∃ x ∈ s, ∃ (y : ℕ), x < y', 'foo (s : Set ℕ) : ∃ x ∈ s, ∃ y, x < y'],
+    ['{T : ι → R} (hT : P T) : ∀ i, (T i).x₀ = 0 → Q (some i, true)', 'foo {T : ι → R} (hT : P T) (i : ι) : (T i).x₀ = 0 → Q (some i, true)'],
+    ['(f : ℕ → ℕ) : ℕ → ℕ', 'foo (f : ℕ → ℕ) : ℕ → ℕ'],
+    ['[Fintype ι] [DecidableEq ι] (a : ι) : a = a', 'foo [Fintype ι] [DecidableEq ι] (a : ι) : a = a']
+  ];
+  for (const [s, want] of sigCases) assert.strictEqual(bc.leanSignature('foo', s), want, s);
+  // `∀ t ∈ S p` with a file's `S (p : ℕ) : Finset (ℕ × ℕ × ℕ)` (Lean: `(t : ℕ × ℕ × ℕ) : t ∈ S p → …`).
+  const zagier = ['def S (p : ℕ) : Finset (ℕ × ℕ × ℕ) := ∅', 'def invol (t : ℕ × ℕ × ℕ) : ℕ × ℕ × ℕ := t',
+    'lemma invol_mem {p : ℕ} (hp : p.Prime) (hp4 : p % 4 = 1) : ∀ t ∈ S p, invol t ∈ S p := by', '  sorry'].join('\n');
+  assert.strictEqual(PR.scanSource(zagier, 'Zagier.lean').pop().typeSignature,
+    'invol_mem {p : ℕ} (hp : Nat.Prime p) (hp4 : p % 4 = 1) (t : ℕ × ℕ × ℕ) : t ∈ S p → invol t ∈ S p', 'and `@[pp_nodot]` `Nat.Prime`, as Lean prints it');
+  assert.strictEqual(bc.leanSignature('foo', '(x : ℝ) (n : ℕ) : x.exp ≠ 0 ∧ ¬n.Prime ∧ (n.log 2 = 0)'),
+    'foo (x : ℝ) (n : ℕ) : Real.exp x ≠ 0 ∧ ¬Nat.Prime n ∧ n.log 2 = 0', 'an applied `n.log 2` keeps its dot');
+
+  // Scoped notations by the file's opens (Lean's hovers: `cexp` is `Complex.exp (z : ℂ) : ℂ`
+  // with `open Complex`, `I` is `unitInterval : Set ℝ` with `open unitInterval`).
+  const scopedFile = ['open Complex', 'open scoped unitInterval', 'theorem foo : cexp 0 = 1 := by', '  sorry',
+    'namespace PowerSeries', 'theorem bar (x : I) : d⁄dX = d⁄dX := rfl', 'end PowerSeries', 'theorem baz : I = I := rfl'].join('\n');
+  const target = (tok, line) => { const t = context.notationTarget(tok, scopedFile, line); return t && t[0]; };
+  assert.strictEqual(target('cexp', 3), 'Complex.exp');
+  assert.strictEqual(target('rexp', 3), null, 'no `open Real`');
+  assert.strictEqual(target('I', 6), 'unitInterval', '`open scoped` brings notation');
+  assert.strictEqual(target('d⁄dX', 6), 'PowerSeries.derivative', 'in its own namespace');
+  assert.strictEqual(target('d⁄dX', 8), null, 'outside it');
+  // Several notations for one token: the latest `open` decides (`π`: `Real.pi` with `open Real`).
+  assert.strictEqual(context.notationTarget('π', 'open Nat.Prime\nopen Real\ntheorem t : π = π := rfl', 3)[0], 'Real.pi');
+  assert.strictEqual(context.notationTarget('π', 'open Real\nopen Nat.Prime\ntheorem t : π = π := rfl', 3)[0], 'Nat.primeCounting');
+  assert.strictEqual(tokenizer.extractTokenFromLine('  ∀ x : ℝ≥0∞, x ≤ ∞', 9).token, 'ℝ≥0∞', 'the longest notation');
+  assert.strictEqual(tokenizer.extractTokenFromLine('  Tendsto f (𝓝 x) l', 14).token, '𝓝', 'a notation outside the BMP');
+  assert(!JSON.stringify(context.scopeAt(scopedFile, 3)).includes('unitInterval'), '`open scoped` still brings no names');
+  const dTok = tokenizer.extractTokenFromLine('  (d⁄dX ℤ g * x)', 5);
+  assert.strictEqual(dTok && dTok.token, 'd⁄dX', '`d⁄dX` is one token');
+  assert.strictEqual(tokenizer.extractTokenFromLine('  (d⁄dX ℤ g * x)', 10).token, 'g');
+
+  // Field notation on a set-builder or an ascription: `hfin : {p : ℕ | p.Prime}.Finite` gives
+  // `hfin.toFinset` = `Set.Finite.toFinset`.
+  assert.strictEqual(bc.typeHead('{p : ℕ | p.Prime}.Finite', null), 'Set.Finite');
+  assert.strictEqual(bc.typeHead('(S : Set ℕ).Finite', null), 'Set.Finite');
+  assert.strictEqual(bc.typeHead('((cantorNF b o).map Prod.fst).SortedGT', null), 'SortedGT', 'untyped term: the field alone');
+
+  // Subtype binders: `{d // corner T d = p}` binds `d` (its type from its use).
+  const sub = 'theorem foo (T : ι → R) (p : ℤ × ℤ) : Nat.card {d // corner T d = p} = Nat.card {i : ι // H i} := by';
+  assert.strictEqual(JSON.stringify(bc.localVariableInfo('d', sub).inferNeeded.use), '{"fn":"corner","k":1}');
+  assert.strictEqual(bc.localVariableInfo('i', sub).typeSignature, 'i : ι');
+  // A trailing `fun` argument with more to follow (Lean: `(f fun i ↦ g i + 1) = f fun i ↦ g i`).
+  assert.strictEqual(bc.leanSignature('foo', '(f : (ℕ → ℕ) → ℕ) : f (fun i => g i + 1) = f fun i => g i'), 'foo (f : (ℕ → ℕ) → ℕ) : (f fun i => g i + 1) = f fun i => g i');
+  // A dependent arrow inside `×` keeps its parentheses; a binder's type keeps its own binders.
+  assert.strictEqual(bc.leanSignature('foo', '{s : ι → Type*} (p : FreeAddMonoid (R × ((i : ι) → s i))) : ∀ f : Π i, s i, φ (0, f) = 0'),
+    'foo {s : ι → Type*} (p : FreeAddMonoid (R × ((i : ι) → s i))) (f : (i : ι) → s i) : φ (0, f) = 0');
+  // Notation with its parenthesis right after a name stays as written.
+  assert.strictEqual(bc.leanSignature('fourier', '{T : ℝ} (n : ℤ) : C(AddCircle T, ℂ)'), 'fourier {T : ℝ} (n : ℤ) : C(AddCircle T, ℂ)');
+  assert.strictEqual(bc.leanSignature('foo', '(γ : SL(2, ℤ)) : f (a, b) = 0'), 'foo (γ : SL(2, ℤ)) : f (a, b) = 0');
+  // `intro` on `Injective (fun g ↦ …)` (Lean: `h : (fun g ↦ f g + 1) a = (fun g ↦ f g + 1) b`).
+  const inj = 'example (f : ℕ → ℕ) : Function.Injective (fun g : ℕ => f g + 1) := by\n  intro a b h';
+  assert.strictEqual(bc.localVariableInfo('h', inj).typeSignature, 'h : (fun g : ℕ => f g + 1) a = (fun g : ℕ => f g + 1) b');
+
+  // Tactic names that are also Object's properties (`constructor`) are tactics, not `Object`.
+  const tdocs2 = context.parseTacticDocs('<div id="Lean.Parser.Tactic.constructor"><div id="userName-constructor"><h2>constructor</h2>' +
+    '<p>applies the first matching constructor</p><dl></dl></div></div>');
+  assert.strictEqual(typeof tdocs2.constructor, 'object', '`constructor` is parsed');
+  assert(tdocs2.constructor.doc.includes('first matching constructor'));
+  assert.strictEqual(context.VersoBuiltins.get('toString'), null, 'no builtin from Object.prototype');
+
+  // The content script: `constructor` is looked up as itself; Verso prose has no hovers.
+  const cctx = {
+    console, setTimeout, clearTimeout, location: { pathname: '/seewoo5/DifferentProofs/pull/40/changes' },
+    document: { addEventListener: () => {}, getElementById: () => null, querySelectorAll: () => [], body: {} },
+    Node: { ELEMENT_NODE: 1, TEXT_NODE: 3 }, MutationObserver: function () { this.observe = () => {}; },
+    chrome: { runtime: { sendMessage: () => {}, onMessage: { addListener: () => {} }, lastError: null }, storage: { local: { get: (k, cb) => cb({}), set: () => {} } } }
+  };
+  cctx.window = cctx; cctx.self = cctx; cctx.addEventListener = () => {};
+  vm.createContext(cctx);
+  for (const f of ['content/builtins_db.js', 'content/lean_tokenizer.js', 'content/lean_terms.js', 'content/binder_context.js', 'content/term_hover.js', 'content/pr_scanner.js', 'content/content.js']) {
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '..', f), 'utf8'), cctx);
+  }
+  const CI = cctx.VersoContentInternals, cbc = cctx.VersoBinderContext;
+  cbc.contextFromDom = () => 'theorem foo : P ∧ Q := by\n  constructor';
+  const lc = CI.lookupContext({ token: 'constructor', subToken: 'constructor', chainUpToCursor: 'constructor', linePrefix: '  ', lineSuffix: '', textNode: {} });
+  assert.strictEqual(lc.queryToken, 'constructor', 'not `NOTATION_ALIASES.constructor`');
+  // `exact .inl h` in a proof is `Or.inl`.
+  assert.strictEqual(CI.lookupContext({ token: 'inl', subToken: 'inl', chainUpToCursor: 'inl', linePrefix: '  · exact .', lineSuffix: ' h', textNode: {} }).queryToken, 'Or.inl');
+  // Below `#doc`, a word is prose, a name in `(lean := "…")` a declaration; read from the file.
+  let asked = 0;
+  cctx.chrome.runtime.sendMessage = (msg, cb) => { if (msg.action === 'VERSO_REGIONS') { asked++; cb(cctx.LeanPRScanner.versoRegions(chapter)); } else cb(null); };
+  cbc.versoAbove = () => null;
+  const at = (line, linePrefix) => { cbc.fileRefFromDom = () => ({ owner: 'o', repo: 'r', sha: 's', side: 'right', path: 'Chapter.lean', line }); return CI.versoState({ textNode: {}, linePrefix }); };
+  const first = at(6, 'theorem of ');
+  assert(first && typeof first.then === 'function', 'the first hover waits for the file');
+  asyncChecks.push(first.then((state) => {
+    assert.strictEqual(state, 'prose');
+    assert.strictEqual(at(6, 'theorem of '), 'prose', 'then known at once');
+    assert.strictEqual(at(4, '#'), 'prose', 'the `#doc` line itself');
+    assert.strictEqual(at(2, 'open '), null, 'Lean code before `#doc`');
+    assert.strictEqual(at(8, 'example : '), null, 'a ```lean block');
+    assert.strictEqual(at(10, ':::theorem "thm:x" (lean := "IntegerRectangleTheorem, '), 'name');
+    assert.strictEqual(asked, 1, 'the file is read once');
+    // A `#doc` line in view settles it without the file.
+    cbc.versoAbove = () => 'prose';
+    cbc.fileRefFromDom = () => null;
+    assert.strictEqual(CI.versoState({ textNode: {}, linePrefix: 'The first ' }), 'prose');
+  }));
+}
+console.log("   ✓ DifferentProofs cases verified.\n");
 
 Promise.all(asyncChecks).then(() => {
   console.log("   ✓ Rewrite replay verified.\n");

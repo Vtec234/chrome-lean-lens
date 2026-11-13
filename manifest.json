@@ -34,7 +34,9 @@
       "js": [
         "content/builtins_db.js",
         "content/lean_tokenizer.js",
+        "content/lean_terms.js",
         "content/binder_context.js",
+        "content/term_hover.js",
         "content/pr_scanner.js",
         "content/tooltip_view.js",
         "content/content.js"

@@ -129,14 +129,31 @@
     const fields = (tokenInfo.chainUpToCursor || '').split('.').filter(Boolean);
     if (!ctx || fields.length === 0) return null;
     const isLocal = (name) => Boolean(ctx.findBinderType(name, contextText));
+    // Bound here with a written or inferred type (`intro ι _ R T` with the goal's binders).
+    const boundType = (name) => ctx.findBinderType(name, contextText) || ctx.localType(name, contextText);
+    const isBound = (name) => isLocal(name) || Boolean(ctx.localType(name, contextText));
     const resolveVar = (v) => {
       const vt = ctx.findBinderType(v, contextText);
       return vt ? ctx.typeHead(vt, null) : null;
     };
     // With the receiver's namespace `ns` known, `ns.f₁` is a constant whose type gives the
     // next namespace; with only a constant known, its type gives the first one.
+    // `(hsides i).imp` with `def HasIntegerSide … : Prop := … ∨ …` of the PR: no
+    // `HasIntegerSide.imp`, so Lean unfolds the definition and finds `Or.imp`.
+    const unfolded = (ns, field) => {
+      const scanner = window.LeanPRScanner;
+      const def = scanner && scanner.find(ns);
+      if (!def || !def.value || scanner.find(`${ns}.${field}`)) return null;
+      const head = ctx.typeHead(def.value, null);
+      return head && head !== ns ? { token: `${head}.${field}` } : null;
+    };
     const finish = (ns, constName, rest) => {
-      if (ns && rest.length === 1) return { token: `${ns}.${rest[0]}` };
+      if (ns && rest.length === 1) {
+        const out = { token: `${ns}.${rest[0]}` };
+        const alt = unfolded(ns, rest[0]);
+        if (alt) out.alt = alt;
+        return out;
+      }
       if (ns) {
         constName = `${ns}.${rest[0]}`;
         rest = rest.slice(1);
@@ -180,13 +197,24 @@
       }
       if (head) {
         const segs = head.split('.');
-        if (segs.length === 1 && isLocal(head)) {
+        const headType = segs.length === 1 ? boundType(head) : null;
+        if (headType) {
           // `(h a b).field`: the conclusion of h's type, after its arguments.
-          const ns = ctx.typeHead(ctx.conclusionOf(ctx.findBinderType(head, contextText)), resolveVar);
+          const ns = ctx.typeHead(ctx.conclusionOf(headType), resolveVar);
           return ns ? finish(ns, null, fields) : null;
         }
-        // A declaration from this PR (not in Loogle yet): use its signature here.
+        // Bound here (`intro … T …`) with a type we can't tell: still not a constant `T`.
+        if (segs.length === 1 && ctx.findUntypedBinder(head, contextText)) return null;
+        // A declaration from this PR (not in Loogle yet): use its signature here. But a short
+        // capitalised name not bound here (`T` in `(T i).y₀`) is likely a section `variable`,
+        // unless this file declares it: the worker reads the file's variables first.
         const prDecl = window.LeanPRScanner && window.LeanPRScanner.find(head);
+        if (segs.length === 1 && /^[A-Z][\w']?$/.test(head) && !ctx.findUntypedBinder(head, contextText)) {
+          const here = ctx.fileRefFromDom(tokenInfo.textNode);
+          if (!prDecl || !here || prDecl.filePath !== here.path) {
+            return { chain: { const: head, path: fields.slice(0, -1), maybeVariable: true, applied: true }, field: fields[fields.length - 1] };
+          }
+        }
         if (prDecl && prDecl.typeSignature) {
           const sig = declSig(prDecl);
           const sigVar = (v) => {
@@ -220,21 +248,21 @@
     }
 
     // `h.f₁.….field` with three or more segments: type each step in turn.
-    if (fields.length >= 3 && isLocal(fields[0])) {
+    if (fields.length >= 3 && isBound(fields[0])) {
       const ns = ctx.inferReceiverNamespace(fields[0], contextText);
       return ns ? finish(ns, null, fields.slice(1)) : null;
     }
     // `x.f₁.….field` where `x` isn't bound here: a file-level `variable` (`hT.out`) or a
     // lowercase constant (`one_div_pos.mpr`). The worker tries both.
     // Two-segment `E.foo` with a bound `E` (uppercase locals are common: `E K L : Type*`).
-    if (fields.length === 2 && isLocal(fields[0]) && !/^[a-z_α-ω]/.test(fields[0])) {
+    if (fields.length === 2 && isBound(fields[0]) && !/^[a-z_α-ω]/.test(fields[0])) {
       const ns = ctx.inferReceiverNamespace(fields[0], contextText);
       return ns ? { token: `${ns}.${fields[1]}` } : null;
     }
     // A constant declared in the PR or project (`enormAt_X.trans_lt`): its statement's head.
     // Not for namespaces (`CNF.zero_right` is itself declared) or aliases (no written type).
     const scanner = window.LeanPRScanner;
-    if (fields.length >= 2 && !isLocal(fields[0]) && /^[a-z_]/.test(fields[0]) && scanner && !scanner.declarations.has(fields.join('.'))) {
+    if (fields.length >= 2 && !isBound(fields[0]) && /^[a-z_]/.test(fields[0]) && scanner && !scanner.declarations.has(fields.join('.'))) {
       const prHead = scanner.declarations.get(fields[0]);
       if (prHead && prHead.typeSignature && prHead.kind !== 'alias') {
         const sig = declSig(prHead);
@@ -245,8 +273,22 @@
         if (ns) return finish(ns, null, fields.slice(1));
       }
     }
+    // `Rectangle.mem_toSet.mp`: a PR constant `Rectangle.mem_toSet` (its namespace written out),
+    // then fields of its type.
+    if (fields.length >= 3 && /^[A-Z]/.test(fields[0]) && !isBound(fields[0]) && scanner && !scanner.declarations.has(fields.join('.'))) {
+      for (let k = fields.length - 1; k >= 2; k--) {
+        const prConst = scanner.find(fields.slice(0, k).join('.'));
+        if (!prConst || !prConst.typeSignature || prConst.kind === 'alias') continue;
+        const sig = declSig(prConst);
+        const ns = ctx.typeHead(ctx.conclusionOf(sig), (v) => {
+          const vt = ctx.findBinderType(v, sig);
+          return vt ? ctx.typeHead(vt, null) : null;
+        });
+        if (ns) return finish(ns, null, fields.slice(k));
+      }
+    }
     // Short capitalised names (`E.algebraMap_apply`) may be `variable`s, like lowercase ones.
-    if (fields.length >= 2 && (/^[a-z_α-ω]/.test(fields[0]) || /^[A-Z][\w']?$/.test(fields[0])) && !isLocal(fields[0])) {
+    if (fields.length >= 2 && (/^[a-z_α-ω]/.test(fields[0]) || /^[A-Z][\w']?$/.test(fields[0])) && !isBound(fields[0])) {
       return {
         chain: { const: fields[0], path: fields.slice(1, -1), maybeVariable: true },
         field: fields[fields.length - 1]
@@ -257,8 +299,13 @@
 
   // Notation that names a constant.
   const NOTATION_ALIASES = {
-    'ℝ': 'Real', 'ℂ': 'Complex', 'ℕ': 'Nat', 'ℤ': 'Int', 'ℚ': 'Rat', 'π': 'Real.pi', "''": 'Set.image'
+    'ℝ': 'Real', 'ℂ': 'Complex', 'ℕ': 'Nat', 'ℤ': 'Int', 'ℚ': 'Rat', 'π': 'Real.pi', "''": 'Set.image',
+    // `a ≡ b [MOD n]` and friends.
+    MOD: 'Nat.ModEq', ZMOD: 'Int.ModEq', PMOD: 'AddCommGroup.ModEq', SMOD: 'SModEq',
+    // `Option`'s constructors, exported to the root.
+    some: 'Option.some', none: 'Option.none'
   };
+  Object.setPrototypeOf(NOTATION_ALIASES, null); // looked up by words from the source: no `constructor`, `toString`, … from Object
 
   /**
    * Surrounding declaration text, the typed token for dot notation, and (for bare
@@ -287,8 +334,8 @@
       if (out.local) return out;
       const linePrefix = tokenInfo.linePrefix || '';
       const lineSuffix = tokenInfo.lineSuffix || '';
-      // Names on an `open … in` / `open scoped …` line are namespaces (possibly notation-only).
-      if (/^\s*open\b/.test(linePrefix)) {
+      // Names on an `open … in` / `open scoped …` / `namespace` line are namespaces (possibly notation-only).
+      if (/^\s*(?:open|namespace)\b/.test(linePrefix)) {
         const ns = tokenInfo.fullChain || chain;
         out.local = {
           name: chain, kind: 'namespace', source: 'local_var',
@@ -312,6 +359,13 @@
           out.fileRef = ctx.fileRefFromDom(tokenInfo.textNode);
           return out;
         }
+      }
+      // `exact .inl h` in a proof: the goal is a proposition, so `.inl` / `.inr` are `Or`'s (a
+      // `Sum` is data, built in term mode).
+      if ((chain === 'inl' || chain === 'inr') && /(^|[\s(⟨,])\.$/.test(linePrefix) && /\bby\b/.test(out.contextText)) {
+        out.queryToken = `Or.${chain}`;
+        out.fileRef = ctx.fileRefFromDom(tokenInfo.textNode);
+        return out;
       }
       // `section Foo` / `end Foo` labels and universe names (`Type u`, `Sort (max u v)`).
       if (/^\s*(?:(?:noncomputable|public|private)\s+)*(?:section|end)\s+$/.test(linePrefix) ||
@@ -352,7 +406,13 @@
           out.namedArg = { fn, arg: chain };
         }
       }
-      if (!chain.includes('.') && NOTATION_ALIASES[chain]) {
+      // `SL(2, ℤ)`, `GL(n, R)`: the matrix groups (notation in `MatrixGroups`).
+      if ((chain === 'SL' || chain === 'GL') && /^\(/.test(lineSuffix)) {
+        out.queryToken = chain === 'SL' ? 'Matrix.SpecialLinearGroup' : 'Matrix.GeneralLinearGroup';
+        return out;
+      }
+      // (Unless the PR declares a name so: `def some …` of a project.)
+      if (!chain.includes('.') && NOTATION_ALIASES[chain] && !(window.LeanPRScanner && window.LeanPRScanner.find(chain))) {
         out.queryToken = NOTATION_ALIASES[chain];
         out.fileRef = ctx.fileRefFromDom(tokenInfo.textNode);
         return out;
@@ -373,6 +433,20 @@
       // Fall back to the plain token.
     }
     return out;
+  }
+
+  /** A namespace the PR's declarations live in, as a tooltip listing a few of them; or null. */
+  function projectNamespace(pr, name) {
+    const members = [];
+    for (const d of pr.declarations.values()) {
+      if (d.name && d.name.startsWith(name + '.') && !members.includes(d.name)) members.push(d.name);
+      if (members.length >= 6) break;
+    }
+    if (!members.length) return null;
+    return {
+      name, kind: 'namespace', source: 'pr_diff', typeSignature: `namespace ${name}`,
+      docstring: `A namespace of this project. Some of its declarations:\n\n${members.map(m => `- \`${m}\``).join('\n')}`
+    };
   }
 
   /** `chrome.runtime.sendMessage` as a promise (resolves to null on failure). */
@@ -484,11 +558,84 @@
   }
 
   /** Inside an attribute list `@[simp, deprecated (since := …)]`? */
-  function isInAttribute(tokenInfo) {
-    const prefix = tokenInfo.linePrefix || '';
+  /** Is an `@[` attribute still open at the end of `prefix`? */
+  function attributeOpen(prefix) {
     const open = prefix.lastIndexOf('@[');
-    return open !== -1 && prefix.indexOf(']', open) === -1;
+    if (open === -1) return false;
+    let depth = 0;
+    for (let k = open + 1; k < prefix.length; k++) {
+      if (prefix[k] === '[') depth++;
+      else if (prefix[k] === ']' && --depth === 0) return false;
+    }
+    return depth > 0;
   }
+  // Inside an attribute, also one written over several lines (`@[blueprint` then its options):
+  // read from the statement the line belongs to (`tokenInfo.statementPrefix` when given).
+  function isInAttribute(tokenInfo) {
+    if (attributeOpen(tokenInfo.linePrefix || '')) return true;
+    let prefix = tokenInfo.statementPrefix;
+    if (prefix === undefined) {
+      const ctx = window.VersoBinderContext;
+      if (!ctx || !ctx.statementAround || !tokenInfo.textNode || !/^\s/.test(tokenInfo.linePrefix || '')) return false;
+      let st = null;
+      try { st = ctx.statementAround(tokenInfo.textNode, (tokenInfo.linePrefix || '') + (tokenInfo.tokenText || tokenInfo.token || '') + (tokenInfo.lineSuffix || '')); } catch (err) { st = null; }
+      prefix = st && st.text ? st.text.slice(0, (st.lineStart || 0) + (tokenInfo.linePrefix || '').length) : '';
+    }
+    return attributeOpen(prefix || '');
+  }
+  // Inside a string literal (`"thm:inf-primes"`): GitHub marks strings `.pl-s`; else an odd
+  // number of quotes before the word on its line.
+  function isInString(tokenInfo) {
+    const node = tokenInfo.textNode;
+    const el = node && (node.nodeType === 1 ? node : node.parentElement);
+    if (el && el.closest && el.closest('.pl-s, .pl-pds')) return true;
+    return (((tokenInfo.linePrefix || '').replace(/\\./g, '').match(/"/g) || []).length) % 2 === 1;
+  }
+
+  // --- Verso documents ---
+  // After `#doc (Manual) "Title" =>` (a blueprint chapter) a file is prose to its end: its words
+  // aren't Lean names. Hovers stay on in ```lean blocks and on the names of `(lean := "A, B")`.
+  const versoRegionCache = new Map(); // file at a revision → regions | null | Promise
+  function versoRegionsFor(fileRef) {
+    const key = `${fileRef.owner}/${fileRef.repo}@${fileRef.sha || fileRef.side}:${fileRef.path}`;
+    if (!versoRegionCache.has(key)) {
+      if (versoRegionCache.size > 200) versoRegionCache.delete(versoRegionCache.keys().next().value);
+      versoRegionCache.set(key, sendMessageP({ action: 'VERSO_REGIONS', fileRef }).then((r) => {
+        versoRegionCache.set(key, r || null);
+        return r || null;
+      }));
+    }
+    return versoRegionCache.get(key);
+  }
+  /** In a `(lean := "A, B")` string: declaration names. */
+  function inLeanNames(tokenInfo) {
+    return /\(lean\s*:=\s*"[^"]*$/.test(tokenInfo.linePrefix || '');
+  }
+  /**
+   * Where the hovered word is in a Verso document: 'prose' (no hover), 'name' (in
+   * `(lean := "…")`), null (Lean code), or a promise of one while the file is being read.
+   */
+  function versoState(tokenInfo) {
+    const ctx = window.VersoBinderContext;
+    if (!ctx || !tokenInfo.textNode) return null;
+    const of = (where) => (where === 'prose' ? (inLeanNames(tokenInfo) ? 'name' : 'prose') : null);
+    const fileRef = ctx.fileRefFromDom(tokenInfo.textNode);
+    if (!fileRef) {
+      // Not a PR file (a file view): a `#doc` line in view decides. (On a PR page the file's
+      // regions are read once instead of scanning the page's lines on every mouse move.)
+      let seen = null;
+      try { seen = ctx.versoAbove ? ctx.versoAbove(tokenInfo.textNode) : null; } catch (err) { seen = null; }
+      return seen ? of(seen) : null;
+    }
+    if (!/\.lean$/.test(fileRef.path)) return null;
+    const classify = (r) => {
+      if (!r || !r.docLine || fileRef.line < r.docLine) return null; // (the `#doc` line too is no code)
+      return of((r.fences || []).some(([a, b]) => fileRef.line > a && fileRef.line < b) ? 'code' : 'prose');
+    };
+    const regions = versoRegionsFor(fileRef);
+    return regions && typeof regions.then === 'function' ? regions.then(classify) : classify(regions);
+  }
+  const isPromise = (v) => Boolean(v) && typeof v.then === 'function';
 
   /**
    * The type of the term around a gap, like Lean's hover on the space in `f x` (`f x : β`).
@@ -539,9 +686,21 @@
    * Resolve and display hover definition.
    */
   function triggerHoverLookup(tokenInfo) {
+    // A Verso document's prose (known once the file has been read): no hover.
+    if (isPromise(tokenInfo.verso)) {
+      tokenInfo.verso.then((state) => {
+        tokenInfo.verso = state;
+        if (state === 'prose' || (state !== 'name' && isInString(tokenInfo))) return;
+        if (lastHoveredToken === tokenInfo.token) triggerHoverLookup(tokenInfo);
+      });
+      return;
+    }
     if (tokenInfo.kind === 'term') { triggerTermLookup(tokenInfo); return; }
     const { token, subToken, boundingRect, shade } = tokenInfo;
-    const lookup = lookupContext(tokenInfo);
+    // A name in `(lean := "…")` is a declaration's full name, read as written.
+    const lookup = tokenInfo.verso === 'name'
+      ? { queryToken: tokenInfo.fullChain || tokenInfo.token, fileRef: null, contextText: '', local: null, receiver: null, namedArg: null, structField: null, skip: false, alt: null }
+      : lookupContext(tokenInfo);
     if (lookup.skip) return;
 
     // 0. Local variables shadow everything else: show their type.
@@ -567,6 +726,12 @@
         (lookup.queryToken === token || !lookup.queryToken.includes('.') ? pr.find(token) || (subToken ? pr.find(subToken) : null) : null);
       if (prDecl) {
         window.VersoTooltipView.show(prDecl, boundingRect, shade);
+        return;
+      }
+      // A namespace of the project (`IntegerRectangle` in `_root_.IntegerRectangle.IsTiling.normalized`).
+      const ns = /^[A-Z][\w'.]*$/.test(lookup.queryToken) && !projectIndex ? projectNamespace(pr, lookup.queryToken) : null;
+      if (ns) {
+        window.VersoTooltipView.show(ns, boundingRect, shade);
         return;
       }
       // The PR's files are still being read: try again once they are.
@@ -695,7 +860,13 @@
 
     // 4. Extract Lean token at cursor
     let tokenInfo = window.LeanTokenizer.resolveTokenFromEvent(e);
-    if (tokenInfo && (isInProse(tokenInfo) || isInAttribute(tokenInfo))) tokenInfo = null;
+    if (tokenInfo) {
+      // (A word in a string is hovered only as a name in a Verso `(lean := "…")`.)
+      const verso = versoState(tokenInfo);
+      const names = (verso === 'name' || isPromise(verso)) && tokenInfo.kind !== 'term' && inLeanNames(tokenInfo);
+      if (verso === 'prose' || isInProse(tokenInfo) || (isInString(tokenInfo) && !names) || isInAttribute(tokenInfo)) tokenInfo = null;
+      else tokenInfo.verso = verso;
+    }
     if (!tokenInfo || !tokenInfo.token || tokenInfo.isKeyword) {
       if (hoverTimer) {
         clearTimeout(hoverTimer);
@@ -779,7 +950,7 @@
   });
 
   // Exposed for the test suite.
-  window.VersoContentInternals = { receiverFor, lookupContext, isInProse, isInAttribute, refineLocal, triggerTermLookup };
+  window.VersoContentInternals = { receiverFor, lookupContext, isInProse, isInAttribute, isInString, refineLocal, triggerTermLookup, versoState, inLeanNames };
 
   // Startup
   loadSettings();

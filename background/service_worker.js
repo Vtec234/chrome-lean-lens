@@ -5,7 +5,7 @@
 
 // Shared binder parsing (also used by the content script).
 if (typeof importScripts === 'function') {
-  try { importScripts('../content/binder_context.js', '../content/pr_scanner.js'); } catch (err) { /* lookups still work without them */ }
+  try { importScripts('../content/lean_terms.js', '../content/binder_context.js', '../content/pr_scanner.js'); } catch (err) { /* lookups still work without them */ }
 }
 
 const SETTINGS_KEY = "lean_lens_settings";
@@ -305,12 +305,12 @@ function docHtmlToMarkdown(html) {
 
 /** Parse tactics.html into { name: { doc, module, anchor } } (first entry per name wins). */
 function parseTacticDocs(html) {
-  const docs = {};
+  const docs = Object.create(null);
   const re = /<div id="([^"]+)"><div id="userName-[^"]*"><h2>([\s\S]*?)<\/h2>([\s\S]*?)<dl>([\s\S]*?)<\/dl>/g;
   let m;
   while ((m = re.exec(html)) !== null) {
     const name = decodeEntities(m[2].replace(/<[^>]+>/g, '')).trim();
-    if (!/^[A-Za-z_][\w'!?]*$/.test(name) || docs[name]) continue;
+    if (!/^[A-Za-z_][\w'!?]*$/.test(name) || docs[name]) continue; // (`docs` has no prototype: `constructor` is a tactic)
     const mod = (m[4].match(/Defined in module:<\/dt><dd><a[^>]*>([^<]+)<\/a>/) || [])[1] || '';
     docs[name] = { doc: docHtmlToMarkdown(m[3]), module: mod.trim(), anchor: decodeEntities(m[1]) };
   }
@@ -347,7 +347,7 @@ async function notationDoc(name) {
     });
   }
   const docs = await notationDocsPromise;
-  const entry = docs[name];
+  const entry = ownEntry(docs, name);
   if (entry && Date.now() - entry.timestamp < TACTIC_CACHE_MS) return entry.doc;
   const hits = await queryLoogleRaw(name);
   if (hits === undefined) return entry ? entry.doc : null; // offline: keep what we had
@@ -357,10 +357,20 @@ async function notationDoc(name) {
   return docs[name].doc;
 }
 
+// Heads Lean unfolds for generalized field notation when the field isn't found under them.
+const UNFOLD_HEADS = { 'GE.ge': 'LE.le', 'GT.gt': 'LT.lt', 'HasSuperset.Superset': 'HasSubset.Subset', 'HasSSuperset.SSuperset': 'HasSSubset.SSubset' };
+Object.setPrototypeOf(UNFOLD_HEADS, null); // looked up by words from the source: no `constructor`, `toString`, … from Object
+
+/** `table[key]` if it's the table's own entry (tables read back from storage have Object's prototype). */
+function ownEntry(table, key) {
+  return table && Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+}
+
 async function lookupTactic(token) {
   if (!token || token.includes('.')) return null;
   const docs = await getTacticDocs();
-  const entry = docs && docs[token];
+  // `choose!`, `simp?`: variants documented under the tactic's name.
+  const entry = docs && (ownEntry(docs, token) || ownEntry(docs, token.replace(/[!?]+$/, '')));
   if (!entry) return null;
   return {
     name: token,
@@ -401,7 +411,8 @@ function parseOpen(body) {
   let m;
   while ((m = re.exec(body)) !== null) {
     const word = m[1];
-    if (word === 'scoped') return result; // only notations/instances, no names
+    // `open scoped X`: only X's notations and instances, no names (kept for `notationScopeAt`).
+    if (word === 'scoped') return parseOpen(body.slice(re.lastIndex)).map(o => Object.assign(o, { scoped: true }));
     if (word === 'hiding' || word === 'renaming' || word === '→' || word === 'in') break;
     result.push({ ns: word, only: m[2] ? m[2].trim().split(/\s+/) : null });
   }
@@ -420,11 +431,12 @@ function prefixesOf(ns) {
  * the declaration's own namespace, the current `namespace` chain, then `open`s
  * (innermost scope and latest `open` first). Each entry: { ns, only }.
  */
-function scopeAt(text, line) {
+function scopeAt(text, line, withScoped = false) {
   const { frames, declNs, declOpenIn } = walkScope(text, line);
   const ordered = [];
   const seen = new Set();
-  const add = (ns, only = null, origin = 'open') => {
+  const add = (ns, only = null, origin = 'open', scoped = false) => {
+    if (scoped && !withScoped) return;
     const key = ns + '|' + (only ? only.join(',') : '');
     if (seen.has(key)) return;
     seen.add(key);
@@ -434,11 +446,116 @@ function scopeAt(text, line) {
   const cur = frames.filter(f => f.kind === 'namespace').map(f => f.name).join('.');
   if (cur) prefixesOf(cur).forEach(ns => add(ns, null, 'namespace'));
   // Later `open` commands first; names within one command keep source order.
-  declOpenIn.forEach(o => add(o.ns, o.only));
+  declOpenIn.forEach(o => add(o.ns, o.only, 'open', o.scoped));
   for (let f = frames.length - 1; f >= 0; f--) {
-    frames[f].opens.slice().reverse().forEach(group => group.forEach(o => add(o.ns, o.only)));
+    frames[f].opens.slice().reverse().forEach(group => group.forEach(o => add(o.ns, o.only, 'open', o.scoped)));
   }
   return ordered;
+}
+
+// Scoped notations, in force where their namespace is open (or is the current one): token →
+// [[namespace, constant as written, namespace it was declared in]]. Generated from Mathlib's
+// `scoped[NS] notation "t" => c` (a single constant). `I` without `open unitInterval` is a
+// constant (`Complex.I` with `open Complex`).
+const SCOPED_NOTATIONS = {
+  "AffineSpace": [["Affine", "AddTorsor", ""]],
+  "D": [["Derivative", "normalizedDerivOfComplex", "Derivative"]],
+  "D∃": [["Dioph", "Dioph.vec_ex1_dioph", "Dioph"]],
+  "I": [["unitInterval", "unitInterval", ""]],
+  "L": [["LSeries.notation", "LSeries", ""]],
+  "cexp": [["Complex", "Complex.exp", "Complex"]],
+  "d⁄dX": [["PowerSeries", "derivative", "PowerSeries"]],
+  "log⁺": [["Real", "posLog", "Real"]],
+  "rexp": [["Real", "Real.exp", "Real"]],
+  "Δ": [["Laplacian", "Laplacian.laplacian", "Laplacian"], ["CategoryTheory.Bicategory", "Comonad.comul", "CategoryTheory.Bicategory"], ["CategoryTheory.ComonObj", "ComonObj.comul", "CategoryTheory.ComonObj"]],
+  "Ι": [["Interval", "Set.uIoc", "Set"]],
+  "Λ": [["ArithmeticFunction", "ArithmeticFunction.vonMangoldt", "ArithmeticFunction.to"]],
+  "Ω": [["ArithmeticFunction.Omega", "ArithmeticFunction.cardFactors", "ArithmeticFunction"], ["Topology.Homotopy", "LoopSpace", ""]],
+  "Ω^": [["Topology.Homotopy", "GenLoop", ""]],
+  "α_": [["CategoryTheory.Bicategory", "Bicategory.associator", "CategoryTheory.Bicategory"], ["CategoryTheory.Limits.CatCospanTransform", "CatCospanTransform.associator", "CategoryTheory.Limits.CatCospanTransform"], ["CategoryTheory.MonoidalCategory", "MonoidalCategoryStruct.associator", "CategoryTheory.MonoidalCategory"]],
+  "γ": [["CategoryTheory.MonObj", "ModObj.smul", "CategoryTheory.ModObj"]],
+  "δ": [["CategoryTheory.AddMonObj", "AddModObj.vadd", "CategoryTheory.AddModObj"], ["LSeries.notation", "delta", ""], ["RingTheory.LinearMap", "CoalgebraStruct.comul", ""]],
+  "ε": [["DualNumber", "DualNumber.eps", ""], ["Hyperreal", "Hyperreal.epsilon", "Hyperreal"], ["CategoryTheory.Bicategory", "Comonad.counit", "CategoryTheory.Bicategory"], ["CategoryTheory.ComonObj", "ComonObj.counit", "CategoryTheory.ComonObj"], ["RingTheory.LinearMap", "CoalgebraStruct.counit", ""]],
+  "ζ": [["CategoryTheory.AddMonObj", "AddMonObj.zero", "CategoryTheory.AddMonObj"], ["ArithmeticFunction.zeta", "ArithmeticFunction.zeta", "ArithmeticFunction"]],
+  "η": [["CategoryTheory.MonObj", "MonObj.one", "CategoryTheory.MonObj"], ["ModularForm", "eta", "ModularForm"], ["OrderType", "OrderType.eta", "OrderType"]],
+  "θ": [["Chebyshev", "Chebyshev.theta", "Chebyshev"], ["OrderType", "OrderType.theta", "OrderType"]],
+  "ι": [["CategoryTheory.MonObj", "GrpObj.inv", "CategoryTheory.MonObj"]],
+  "λ": [["ArithmeticFunction.carmichael", "ArithmeticFunction.carmichael", "ArithmeticFunction"]],
+  "λ_": [["CategoryTheory.Bicategory", "Bicategory.leftUnitor", "CategoryTheory.Bicategory"], ["CategoryTheory.Limits.CatCospanTransform", "CatCospanTransform.leftUnitor", "CategoryTheory.Limits.CatCospanTransform"], ["CategoryTheory.MonoidalCategory", "MonoidalCategoryStruct.leftUnitor", "CategoryTheory.MonoidalCategory"]],
+  "μ": [["CategoryTheory.MonObj", "MonObj.mul", "CategoryTheory.MonObj"], ["ArithmeticFunction.Moebius", "ArithmeticFunction.moebius", "ArithmeticFunction"]],
+  "π": [["FundamentalGroupoid", "FundamentalGroupoid.fundamentalGroupoidFunctor", "FundamentalGroupoid"], ["Real", "Real.pi", "Real"], ["Nat.Prime", "Nat.primeCounting", "Nat"]],
+  "π'": [["Nat.Prime", "Nat.primeCounting'", "Nat"]],
+  "π_": [["Topology", "HomotopyGroup.Pi", ""]],
+  "πₓ": [["FundamentalGroupoid", "FundamentalGroupoid.fundamentalGroupoidFunctor.obj", "FundamentalGroupoid"]],
+  "πₘ": [["FundamentalGroupoid", "FundamentalGroupoid.fundamentalGroupoidFunctor.map", "FundamentalGroupoid"]],
+  "ρ_": [["CategoryTheory.Bicategory", "Bicategory.rightUnitor", "CategoryTheory.Bicategory"], ["CategoryTheory.Limits.CatCospanTransform", "CatCospanTransform.rightUnitor", "CategoryTheory.Limits.CatCospanTransform"], ["CategoryTheory.MonoidalCategory", "MonoidalCategoryStruct.rightUnitor", "CategoryTheory.MonoidalCategory"]],
+  "σ": [["CategoryTheory.AddMonObj", "AddMonObj.add", "CategoryTheory.AddMonObj"], ["ArithmeticFunction.sigma", "ArithmeticFunction.sigma", "ArithmeticFunction"], ["unitInterval", "unitInterval.symm", "unitInterval"]],
+  "φ": [["Nat", "Nat.totient", "Nat"], ["goldenRatio", "Real.goldenRatio", "Real"]],
+  "ψ": [["Chebyshev", "Chebyshev.psi", "Chebyshev"], ["goldenRatio", "Real.goldenConj", "Real"]],
+  "ω": [["QuadraticAlgebra", "omega", "QuadraticAlgebra"], ["Hyperreal", "Hyperreal.omega", "Hyperreal"], ["omegaLimit", "omegaLimit", ""], ["ArithmeticFunction.omega", "ArithmeticFunction.cardDistinctFactors", "ArithmeticFunction"], ["OrderType", "OrderType.omega0", "OrderType"], ["Ordinal", "Ordinal.omega0", "Ordinal"]],
+  "ℍ": [["UpperHalfPlane", "UpperHalfPlane", ""]],
+  "ℑ": [["ComplexStarModule", "imaginaryPart", ""]],
+  "ℕ∪{∞}": [["LightProfinite", "NatUnionInfty", "LightProfinite"]],
+  "ℙ": [["LinearAlgebra.Projectivization", "Projectivization", ""], ["ProbabilityTheory", "MeasureTheory.MeasureSpace.volume", ""]],
+  "ℛ": [["Coalgebra", "Coalgebra.Repr.arbitrary", ""]],
+  "ℜ": [["ComplexStarModule", "realPart", ""]],
+  "ℝ≥0": [["NNReal", "NNReal", "NNReal"]],
+  "ℝ≥0∞": [["ENNReal", "ENNReal", ""]],
+  "ℵ₀": [["Cardinal", "Cardinal.aleph0", "Cardinal"]],
+  "∂L": [["CategoryTheory.Distributive", "leftDistrib", "CategoryTheory.Distributive"]],
+  "∂R": [["CategoryTheory.Distributive", "rightDistrib", "CategoryTheory.Distributive"]],
+  "∇": [["Gradient", "gradient", ""]],
+  "∞": [["OnePoint", "OnePoint.infty", "OnePoint"]],
+  "∠": [["EuclideanGeometry", "EuclideanGeometry.angle", "EuclideanGeometry"]],
+  "∡": [["EuclideanGeometry", "EuclideanGeometry.oangle", "EuclideanGeometry"]],
+  "𝐞": [["FourierTransform", "Real.fourierChar", "Real"]],
+  "𝑳": [["LieGroup", "smoothLeftMul", ""]],
+  "𝑹": [["LieGroup", "smoothRightMul", ""]],
+  "𝒅": [["Manifold", "fdifferential", ""]],
+  "𝒅ₕ": [["Manifold", "hfdifferential", ""]],
+  "𝒟": [["Modular", "ModularGroup.fd", "ModularGroup"]],
+  "𝒟ᵒ": [["Modular", "ModularGroup.fdo", "ModularGroup"]],
+  "𝒮": [["CategoryTheory.HopfObj", "HopfObj.antipode", "CategoryTheory.HopfObj"]],
+  "𝓕": [["FourierTransform", "fourier", "FourierTransform"], ["ZMod", "dft", "ZMod"]],
+  "𝓕⁻": [["FourierTransform", "fourierInv", "FourierTransform"]],
+  "𝓝": [["Topology", "nhds", ""]],
+  "𝓝ˢ": [["Topology", "nhdsSet", ""]],
+  "𝓞": [["NumberField", "NumberField.RingOfIntegers", "NumberField"]],
+  "𝓟": [["Filter", "Filter.principal", "Filter"]],
+  "𝓤": [["Uniformity", "uniformity", ""]],
+  "𝔠": [["Cardinal", "Cardinal.continuum", "Cardinal"]],
+  "𝔻": [["Complex.UnitDisc", "Complex.UnitDisc", "Complex"]],
+  "𝕋": [["HeckeCosetModule", "HeckeRing", ""]],
+  "𝕔𝔻": [["Complex.UnitDisc", "Complex.UnitClosedDisc", "Complex"]],
+  "𝟭": [["CategoryTheory.BasedFunctor", "BasedFunctor.id", "CategoryTheory.BasedFunctor"]]
+};
+Object.setPrototypeOf(SCOPED_NOTATIONS, null);
+
+/**
+ * The notation `token` in force at `line` of `text` (the latest `open` of its namespace wins):
+ * the names its constant may have, most likely first, or null.
+ */
+function notationTarget(token, text, line) {
+  const options = SCOPED_NOTATIONS[token];
+  if (!options || !text || !line) return null;
+  for (const s of scopeAt(text, line, true)) {
+    if (s.only) continue;
+    const hit = options.find(([ns]) => ns === s.ns);
+    if (!hit) continue;
+    const [, constant, declaredIn] = hit;
+    return declaredIn && !constant.startsWith(declaredIn + '.') ? [`${declaredIn}.${constant}`, constant] : [constant];
+  }
+  return null;
+}
+
+/** The constant a scoped notation stands for at `fileRef`'s line: its lookup result, or null. */
+async function scopedNotation(token, fileRef) {
+  if (!SCOPED_NOTATIONS[token] || !fileRef || !fileRef.line) return null;
+  for (const constant of notationTarget(token, await getFileText(fileRef), fileRef.line) || []) {
+    const hit = await loogleExact(constant);
+    if (hit && hit.type) return hitToResult(hit);
+  }
+  return null;
 }
 
 /**
@@ -449,8 +566,20 @@ function variablesAt(text, line) {
   return frames.flatMap(f => f.variables);
 }
 
-/** Walk a Lean file up to `line`, tracking namespace/section frames, opens and variables. */
+/** Walk a Lean file up to `line`, tracking namespace/section frames, opens and variables (cached). */
+const walkScopeCache = new Map(); // file text → Map(line → walk)
 function walkScope(text, line) {
+  let perText = walkScopeCache.get(text);
+  if (!perText) {
+    perText = new Map();
+    walkScopeCache.set(text, perText);
+    if (walkScopeCache.size > 4) walkScopeCache.delete(walkScopeCache.keys().next().value);
+  }
+  if (!perText.has(line)) perText.set(line, walkScopeUncached(text, line));
+  return perText.get(line);
+}
+
+function walkScopeUncached(text, line) {
   const lines = text.split('\n');
   const frames = [{ kind: 'root', name: '', opens: [], variables: [] }];
   const state = { depth: 0 };
@@ -599,6 +728,22 @@ function importsOf(text) {
  * page (GitHub collapses large diffs). Outside Mathlib, also the project files they import,
  * following imports within the repository (Loogle only knows Mathlib).
  */
+// Packages a project imports that aren't in its repository (their files aren't fetched).
+const EXTERNAL_ROOTS = new Set(['Mathlib', 'Batteries', 'Std', 'Lean', 'Init', 'Lake', 'Aesop', 'Qq', 'ProofWidgets',
+  'Plausible', 'LeanSearchClient', 'ImportGraph', 'Verso', 'VersoManual', 'VersoBlog', 'VersoBlueprint', 'SubVerso',
+  'MD4Lean', 'Cli', 'Duper', 'Auto', 'LeanCopilot', 'Canonical', 'Hammer', 'Archive', 'Counterexamples']);
+
+// The declarations last read from a PR's files (per revision), for receivers of the
+// project's own types (`(T i).y₀` with `variable {T : ι → Rectangle}`: `Rectangle.y₀`).
+const projectIndexCache = new Map(); // `owner/repo@sha` → declarations
+
+/** A declaration of the project named `name` (or `….name`), at `fileRef`'s revision; or null. */
+function projectDeclaration(name, fileRef) {
+  const list = fileRef && projectIndexCache.get(`${fileRef.owner}/${fileRef.repo}@${fileRef.sha}`);
+  if (!list) return null;
+  return list.find(d => d.name === name) || list.find(d => d.name.endsWith('.' + name)) || null;
+}
+
 async function projectDeclarations({ owner, repo, pr, sha, paths }) {
   const scanner = self.LeanPRScanner;
   if (!scanner || !paths || !paths.length) return [];
@@ -629,13 +774,20 @@ async function projectDeclarations({ owner, repo, pr, sha, paths }) {
         decls.push(Object.assign(d, { inPR: changed.has(p), repo: `${owner}/${repo}`, sha }));
       }
       if (isMathlib) return;
+      // The repository's own modules: also those outside the PR's folders (a blueprint chapter
+      // `DifferentProofsBlueprint/…` imports `DifferentProofs.…`).
       for (const mod of importsOf(text)) {
-        if (!roots.has(mod.split('.')[0])) continue;
+        const root = mod.split('.')[0];
+        if (!roots.has(root) && EXTERNAL_ROOTS.has(root)) continue;
         const fp = mod.replace(/\./g, '/') + '.lean';
         if (!seen.has(fp) && !queue.includes(fp)) queue.push(fp);
       }
     });
   }
+  const key = `${owner}/${repo}@${sha}`;
+  projectIndexCache.delete(key);
+  projectIndexCache.set(key, decls);
+  if (projectIndexCache.size > 4) projectIndexCache.delete(projectIndexCache.keys().next().value);
   return decls;
 }
 
@@ -844,6 +996,7 @@ const NUMERIC_FIELDS = {
   'Iff': ['mp', 'mpr'], 'And': ['left', 'right'], 'Prod': ['fst', 'snd'], 'PProd': ['fst', 'snd'],
   'Sigma': ['fst', 'snd'], 'PSigma': ['fst', 'snd'], 'Subtype': ['val', 'property']
 };
+Object.setPrototypeOf(NUMERIC_FIELDS, null);
 
 /** Name of field number `n` of structure `ns` (from the table, or `ns.mk`'s explicit binders). */
 /** Fields of structure `ns` in order, from `ns.mk`'s explicit parameters: [{ name, type }]. */
@@ -905,7 +1058,10 @@ async function resolveReceiverChain(receiver, field, fileRef) {
   const name = ns && await named(ns, field);
   if (!name) return null;
   const hit = await loogleExact(`${ns}.${name}`);
-  return hit && hit.type ? hitToResult(hit) : null;
+  if (hit && hit.type) return hitToResult(hit);
+  // The project's own type (`Rectangle.y₀`, a field of a structure of the PR).
+  const own = projectDeclaration(`${ns}.${name}`, fileRef);
+  return own ? Object.assign({}, own) : null;
 }
 
 /** `Foo` in `Foo.bar` when `Foo` is only a namespace: a short tooltip listing a few members. */
@@ -952,7 +1108,7 @@ async function applicationType(term, fileRef) {
   let conclusion = bc.conclusionOf(hit.type);
   if (!conclusion) return null;
   const explicitNames = signatureBinders(hit.type).filter(b => b.explicit).flatMap(b => b.names);
-  const named = {};
+  const named = Object.create(null);
   const positional = [];
   for (const a of bc.splitApp(term).slice(1)) {
     const nm = a.match(/^\(\s*([\w'\u0370-\u03FF\u2080-\u209C]+)\s*:=\s*([\s\S]+)\)$/);
@@ -1048,6 +1204,8 @@ async function handleLookupToken(token, subToken, fileRef, contextText, tacticPo
   if (fileRef && token && !token.includes('.')) {
     const variable = await lookupFileVariable(token, fileRef);
     if (variable) return variable;
+    const notation = await scopedNotation(token, fileRef);
+    if (notation) return notation;
     // One-letter lowercase names are locals; uppercase ones can be constants (`X`, `C`, `I`).
     if (token.length <= 1 && !/^[A-Z]$/.test(token)) return null;
     const settings = await getSettings();
@@ -1095,6 +1253,14 @@ async function handleLookupToken(token, subToken, fileRef, contextText, tacticPo
     if (!loogleResult || loogleResult.ambiguous) {
       // Tactics aren't declarations, so Loogle can't find them.
       loogleResult = (await lookupTactic(token)) || loogleResult;
+    }
+    if ((!loogleResult || loogleResult.ambiguous) && token.includes('.')) {
+      // `h.trans` with `h : a ≥ b`: without `GE.ge.trans`, Lean unfolds `≥` to `≤` (`LE.le.trans`).
+      const unfolded = Object.entries(UNFOLD_HEADS).find(([from]) => token.startsWith(from + '.'));
+      if (unfolded) {
+        const hit = await loogleExact(unfolded[1] + token.slice(unfolded[0].length));
+        if (hit && hit.type) loogleResult = hitToResult(hit);
+      }
     }
     if ((!loogleResult || loogleResult.ambiguous) && token.includes('.') && fileRef) {
       // `Tendsto.sub` from a type head written unqualified (`open Filter`): qualify it in scope.
@@ -1182,6 +1348,11 @@ const MESSAGE_HANDLERS = {
     const scanner = self.LeanPRScanner;
     if (!text || !scanner || !scanner.variablesAt) return { instances: [] };
     return { instances: scanner.variablesAt(text, request.fileRef.line).filter(v => v.bi === '[' && v.type).map(v => v.type) };
+  },
+  // Where a Verso document (`#doc … =>`) starts in a file, and its ```lean blocks.
+  VERSO_REGIONS: async (request) => {
+    const text = request.fileRef ? await getFileText(request.fileRef) : null;
+    return text && self.LeanPRScanner && self.LeanPRScanner.versoRegions ? self.LeanPRScanner.versoRegions(text) : null;
   },
   STRUCTURE_FIELD: async (request) => {
     const f = await structureField(request.type, request.index, request.rest);
