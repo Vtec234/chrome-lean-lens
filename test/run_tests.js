@@ -1677,6 +1677,37 @@ console.log("22. Testing real Lean data (the local helper)...");
       const viaLink = spawnSync(process.execPath, [path.join(root, 'linked-helper', 'lean-lens-helper.mjs'), '--help'], { encoding: 'utf8' });
       assert(viaLink.stdout.includes('Lean Lens helper'), `the helper said nothing: ${viaLink.stderr}`);
 
+      // Its port taken: it says by what, and what to do about it.
+      {
+        const { spawn } = require('child_process');
+        const helperFile = path.join(helperDir, 'lean-lens-helper.mjs');
+        const freePort = () => new Promise((resolve) => {
+          const probe = require('net').createServer();
+          probe.listen(0, '127.0.0.1', () => { const { port } = probe.address(); probe.close(() => resolve(port)); });
+        });
+        const taken = require('net').createServer();
+        await new Promise((resolve) => taken.listen(0, '127.0.0.1', resolve));
+        const byOther = spawnSync(process.execPath, [helperFile, '--port', String(taken.address().port), '--cache', path.join(root, 'cache-port')], { encoding: 'utf8' });
+        taken.close();
+        assert(/Port \d+ is in use by another program/.test(byOther.stderr) && byOther.status === 1, byOther.stderr);
+        const port = await freePort();
+        const first = spawn(process.execPath, [helperFile, '--port', String(port), '--cache', path.join(root, 'cache-port')], { stdio: ['ignore', 'pipe', 'ignore'] });
+        try {
+          await new Promise((resolve, reject) => {
+            let said = '';
+            first.stdout.on('data', (chunk) => { said += chunk; if (said.includes('helper is running')) resolve(); });
+            first.on('close', () => reject(new Error(`the helper did not start: ${said}`)));
+          });
+          const second = spawnSync(process.execPath, [helperFile, '--port', String(port), '--cache', path.join(root, 'cache-port')], { encoding: 'utf8' });
+          assert(/A Lean Lens helper is already running on port \d+\. Stop that one first/.test(second.stderr), second.stderr);
+          const elsewhere = spawnSync(process.execPath, [helperFile, '--port', String(port), '--cache', path.join(root, 'cache-port-2')], { encoding: 'utf8' });
+          assert(/A Lean Lens helper is already running/.test(elsewhere.stderr), `also one with other settings: ${elsewhere.stderr}`);
+        } finally {
+          first.kill('SIGTERM');
+          await new Promise((resolve) => first.on('close', resolve));
+        }
+      }
+
       // The Lean version a project pins goes to elan, outside the sandbox: a plain file naming a
       // version, never a link to some other file.
       const project = path.join(root, 'project');

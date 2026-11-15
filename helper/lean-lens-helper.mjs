@@ -1268,7 +1268,16 @@ async function main() {
   }
 
   const port = Number(values.port) || DEFAULT_PORT;
-  const server = await serve(helper, port);
+  const server = await serve(helper, port).catch(async (error) => {
+    if (error.code !== 'EADDRINUSE') throw error;
+    // Who has the port? A helper started earlier answers, to this one's token when they share
+    // their settings and with its own refusal when they don't.
+    const other = await fetch(`http://127.0.0.1:${port}/status`, { headers: { 'X-Lean-Lens-Token': helper.config.token }, signal: AbortSignal.timeout(2000) })
+      .then((response) => response.json()).catch(() => null);
+    throw new Error(other && (other.name === 'lean-lens-helper' || /helper token/.test(other.error || ''))
+      ? `A Lean Lens helper is already running on port ${port}. Stop that one first (Ctrl-C in its terminal), then start this one: two cannot share the address the extension talks to.`
+      : `Port ${port} is in use by another program. Start the helper on another port with --port, and put the new address in the extension's options.`);
+  });
   stop = () => {
     console.log(`\nStopping.${helper.remote
       ? (helper.keepCodespaces ? '' : ' Stopping the codespaces that were used; the results stay here.')
