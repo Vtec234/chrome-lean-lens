@@ -1774,6 +1774,23 @@ console.log("22. Testing real Lean data (the local helper)...");
       assert(fs.existsSync(path.join(cache2, 'repos', 'o', 'kept')), '--keep-builds removes nothing');
       assert.throws(() => helper.createHelper({ cacheDir: cache2, tidyMinutes: -1, log: () => {} }), /number of minutes/);
 
+      // A copy that cannot be removed (here: a folder that may not be changed) does not keep the
+      // helper from starting. It says so, and the next start tries again.
+      if (process.getuid && process.getuid() !== 0) {
+        fakeCopy(cache2, 'o/stuck', gone);
+        const stuck = path.join(cache2, 'repos', 'o', 'stuck', '.git');
+        fs.chmodSync(stuck, 0o555);
+        const complaints = [];
+        try {
+          helper.createHelper({ cacheDir: cache2, log: (message) => complaints.push(message) });
+          assert(complaints.some((message) => message.includes('The copy of o/stuck could not be removed now')), complaints.join('\n'));
+        } finally {
+          fs.chmodSync(stuck, 0o755);
+        }
+        helper.createHelper({ cacheDir: cache2, log: () => {} });
+        assert(!fs.existsSync(path.join(cache2, 'repos', 'o', 'stuck')), 'gone at the next start');
+      }
+
       // `clean`: everything but the settings and the results; with `results`, those too.
       fs.mkdirSync(path.join(cache2, 'extractors', 'x'), { recursive: true });
       fs.writeFileSync(path.join(cache2, 'extractors', 'x', 'subverso-extract-mod'), 'binary');

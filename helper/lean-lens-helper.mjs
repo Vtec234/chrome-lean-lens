@@ -127,6 +127,11 @@ const entries = (dir) => { try { return readdirSync(dir); } catch { return []; }
 /** Whether there is anything but empty folders at a path. */
 const holdsFiles = (target) => !isRealDir(target) || entries(target).some((name) => holdsFiles(path.join(target, name)));
 const realOrSame = (target) => { try { return realpathSync(target); } catch { return path.resolve(target); } };
+// How a folder is removed with all that is in it (`rmSync(folder, GONE)`; a link is removed
+// itself, never what it points to). A program still writing there, such as one that a stopped
+// helper left running, makes removal fail with "directory not empty": it is tried again for a
+// few seconds.
+const GONE = { recursive: true, force: true, maxRetries: 12, retryDelay: 150 };
 
 /**
  * One of the helper's own folders, made if it is missing, by its real path. Anything else at
@@ -254,7 +259,7 @@ async function cloneTree(from, to) {
   for (const [command, args] of attempts) {
     last = await run(command, args);
     if (last.code === 0) return;
-    rmSync(to, { recursive: true, force: true });
+    rmSync(to, GONE);
   }
   throw new Error(`Could not copy ${from}: ${tail(last.stderr)}`);
 }
@@ -435,7 +440,7 @@ export async function cleanCache(cacheDir, { results = false, force = false, bui
   for (const [target, what] of [...parts, ...(results ? [[path.join(dir, 'data'), 'results of earlier runs']] : [])]) {
     if (!kind(target)) continue;
     const bytes = holdsFiles(target) ? await sizeOf(target) : 0;
-    rmSync(target, { recursive: true, force: true });
+    rmSync(target, GONE);
     if (!bytes) continue; // an empty folder: gone, and not worth a mention
     const same = removed.find((entry) => entry.what === what);
     if (same) same.bytes += bytes; else removed.push({ what, bytes });
@@ -541,9 +546,9 @@ export function createHelper(options = {}) {
   function forgetCopy(repo, why) {
     const dir = repoDir(repo);
     if (why && kind(dir)) log(`Removing the copy of ${repo} and its build (${why}). The results stay.`);
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, GONE);
     try { rmdirSync(path.dirname(dir)); } catch { /* other repositories of that owner are there */ }
-    rmSync(stateDirOf(buildsDir, repo), { recursive: true, force: true });
+    rmSync(stateDirOf(buildsDir, repo), GONE);
     owned.delete(repo);
   }
 
@@ -557,7 +562,7 @@ export function createHelper(options = {}) {
       try { renameSync(dir, aside); } catch { aside = null; }
     }
     forgetCopy(repo);
-    if (aside) await rm(aside, { recursive: true, force: true });
+    if (aside) await rm(aside, GONE);
   }
 
   /** Once nothing is queued for a repository: remove its copy when it stays unused. */
@@ -583,17 +588,22 @@ export function createHelper(options = {}) {
 
   /** At start: remove what earlier helpers left and no running helper is using. */
   function sweep() {
+    // What cannot be removed now (a program still at work there) is left for the next start: it
+    // must not keep this helper from starting.
+    const attempt = (what, act) => {
+      try { act(); } catch (error) { log(`${what} could not be removed now (${error.code || error.message}); the next start tries again`); }
+    };
     for (const name of entries(workRoot)) {
-      if (!alive(Number.parseInt(name, 10))) rmSync(path.join(workRoot, name), { recursive: true, force: true });
+      if (!alive(Number.parseInt(name, 10))) attempt('A scratch folder', () => rmSync(path.join(workRoot, name), GONE));
     }
     // Scratch folders of earlier versions, which kept them between runs.
-    for (const name of ['home', 'tmp']) rmSync(path.join(cacheDir, name), { recursive: true, force: true });
+    for (const name of ['home', 'tmp']) attempt('A scratch folder', () => rmSync(path.join(cacheDir, name), GONE));
     if (keepBuilds) return;
     const repos = path.join(buildsDir, 'repos');
     for (const owner of entries(repos)) {
       for (const name of entries(path.join(repos, owner))) {
         const repo = `${owner}/${name}`;
-        if (isRepo(repo) && ownerIn(stateDirOf(buildsDir, repo)) === null) forgetCopy(repo, 'no running helper is using it');
+        if (isRepo(repo) && ownerIn(stateDirOf(buildsDir, repo)) === null) attempt(`The copy of ${repo}`, () => forgetCopy(repo, 'no running helper is using it'));
       }
       try { rmdirSync(path.join(repos, owner)); } catch { /* still in use */ }
     }
@@ -605,9 +615,10 @@ export function createHelper(options = {}) {
     tidyTimers.clear();
     stopCommands();
     if (remote) remote.shutdown();
-    if (!keepBuilds) for (const repo of [...owned]) forgetCopy(repo, 'the helper is stopping');
+    // (Whatever cannot be removed now, the next helper removes when it starts.)
+    if (!keepBuilds) for (const repo of [...owned]) { try { forgetCopy(repo, 'the helper is stopping'); } catch { /* next start */ } }
     for (const name of entries(workRoot)) {
-      if (name.startsWith(`${process.pid}-`)) rmSync(path.join(workRoot, name), { recursive: true, force: true });
+      if (name.startsWith(`${process.pid}-`)) { try { rmSync(path.join(workRoot, name), GONE); } catch { /* next start */ } }
     }
   }
 
@@ -792,7 +803,7 @@ export function createHelper(options = {}) {
         onLine: (line) => job.progress(line),
       });
     } finally {
-      if (downloads) rmSync(downloads, { recursive: true, force: true });
+      if (downloads) rmSync(downloads, GONE);
     }
     if (result.code !== 0) {
       const why = tail(result.stderr || result.stdout, 300) || `exit ${result.code}`;
@@ -827,7 +838,7 @@ export function createHelper(options = {}) {
     if (!extractorBuilds.has(dir)) {
       extractorBuilds.set(dir, (async () => {
         job.say(`Building the SubVerso extractor for ${name} (once per Lean version)`);
-        rmSync(dir, { recursive: true, force: true });
+        rmSync(dir, GONE);
         mkdirSync(path.dirname(dir), { recursive: true });
         await must('git', ['clone', '--quiet', '--no-checkout', subverso, dir]);
         await must('git', ['-C', dir, 'checkout', '--quiet', subversoRev]);
@@ -942,7 +953,7 @@ export function createHelper(options = {}) {
         await Promise.all(Array.from({ length: Math.min(poolSize, files.length) }, worker));
       }
     } finally {
-      rmSync(workDir, { recursive: true, force: true });
+      rmSync(workDir, GONE);
     }
   }
 
