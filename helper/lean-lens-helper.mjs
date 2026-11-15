@@ -8,15 +8,23 @@
 //
 //   node lean-lens-helper.mjs [--port 5326] [--allow owner/repo] [--link owner/repo=/checkout]
 //   node lean-lens-helper.mjs run --repo owner/repo --sha <commit> [--pr N] File.lean …
+//   node lean-lens-helper.mjs clean [--all]
 //
 // Elaborating a Lean file runs the code in it. The helper therefore only works on repositories
 // you have allowed, only when asked with its token, and never on its own initiative. On macOS
 // that code runs in a sandbox: no network, no access to your files (see `seatbeltProfile`).
+//
+// Only the results stay on disk. A repository's copy and its build (about 10 GB when it uses
+// Mathlib) are removed once they have gone unused for a while, and when the helper stops.
 
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, rmdirSync,
+  statfsSync, writeFileSync,
+} from 'node:fs';
+import { rm } from 'node:fs/promises';
 import { availableParallelism, homedir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -33,6 +41,10 @@ const DEFAULT_CLONE_BASE = 'https://github.com/';
 const DEFAULT_SUBVERSO_REV = '892d6dc520270b5fb8c1291dd1b131e8c16255ed';
 const EXTRACT_TIMEOUT_MS = 20 * 60 * 1000;
 const MAX_BODY_BYTES = 1024 * 1024;
+// How long a repository's copy and build stay after its last run.
+const DEFAULT_TIDY_MINUTES = 30;
+// Mathlib's build takes about 10 GB unpacked. Less free space than this and it is not fetched.
+const MATHLIB_ROOM_BYTES = 12e9;
 
 // ---------------------------------------------------------------------------------------------
 // Checks on what a request names. Everything here ends up in a path or a command's arguments.
@@ -104,9 +116,89 @@ export function usesMathlib(manifestText) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Files and folders.
+
+/** What is at a path, without following a link there: its `lstat`, or null when nothing is. */
+const kind = (target) => { try { return lstatSync(target); } catch { return null; } };
+/** Whether a path is a folder itself, not a link to one. */
+const isRealDir = (target) => { const stat = kind(target); return Boolean(stat && stat.isDirectory()); };
+const entries = (dir) => { try { return readdirSync(dir); } catch { return []; } };
+/** Whether there is anything but empty folders at a path. */
+const holdsFiles = (target) => !isRealDir(target) || entries(target).some((name) => holdsFiles(path.join(target, name)));
+const realOrSame = (target) => { try { return realpathSync(target); } catch { return path.resolve(target); } };
+
+/**
+ * One of the helper's own folders, made if it is missing, by its real path. Anything else at
+ * that place, a link above all, is removed first: these are the folders the sandbox opens to a
+ * project's code, so they have to be the helper's own and nowhere else.
+ */
+function ownDir(target) {
+  const stat = kind(target);
+  if (stat && !stat.isDirectory()) rmSync(target, { force: true });
+  mkdirSync(target, { recursive: true });
+  return realOrSame(target);
+}
+
+/**
+ * The Lean version a project pins. The file has to be a plain file that names a version: its
+ * content goes to elan, outside the sandbox, and a project could have a link to another file
+ * there.
+ */
+export function toolchainOf(root) {
+  const stat = kind(path.join(root, 'lean-toolchain'));
+  if (!stat) throw new Error('This project has no lean-toolchain file, so its Lean version is unknown');
+  const name = stat.isFile() ? readFileSync(path.join(root, 'lean-toolchain'), 'utf8').trim() : '';
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/:-]{0,119}$/.test(name)) throw new Error("This project's lean-toolchain file does not name a Lean version");
+  return name;
+}
+
+export function formatBytes(bytes) {
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+  if (bytes >= 1e6) return `${Math.round(bytes / 1e6)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1e3))} KB`;
+}
+
+/** Free space on the disk a folder is on, in bytes, or null when the system doesn't say. */
+function freeBytes(dir) {
+  try {
+    const disk = statfsSync(dir);
+    return Number(disk.bavail) * Number(disk.bsize);
+  } catch {
+    return null;
+  }
+}
+
+/** Whether a process with this id is running. */
+function alive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM'; // it exists, and belongs to someone else
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Running commands.
 
 const tail = (text, n = 600) => (text.length > n ? `…${text.slice(-n)}` : text).trim();
+
+// Commands in flight, so they can be stopped when the helper stops.
+const runningCommands = new Set();
+
+/** Stop a command and the programs it started in turn (each command is its own process group). */
+function stopCommand(child) {
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+  }
+}
+
+export function stopCommands() {
+  for (const child of runningCommands) stopCommand(child);
+}
 
 /** Run a command (never through a shell). Resolves to `{code, stdout, stderr}`. */
 function run(command, args, { cwd, env, onLine, timeoutMs } = {}) {
@@ -115,7 +207,9 @@ function run(command, args, { cwd, env, onLine, timeoutMs } = {}) {
       cwd,
       env: env || { ...process.env, GIT_TERMINAL_PROMPT: '0' },
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true, // its own process group: see `stopCommand`
     });
+    runningCommands.add(child);
     const kept = { stdout: '', stderr: '' };
     const feed = (which) => (chunk) => {
       const text = chunk.toString('utf8');
@@ -124,12 +218,14 @@ function run(command, args, { cwd, env, onLine, timeoutMs } = {}) {
     };
     child.stdout.on('data', feed('stdout'));
     child.stderr.on('data', feed('stderr'));
-    const timer = timeoutMs ? setTimeout(() => child.kill('SIGKILL'), timeoutMs) : null;
-    child.on('error', (error) => { if (timer) clearTimeout(timer); resolve({ code: -1, stdout: kept.stdout, stderr: error.message }); });
-    child.on('close', (code, signal) => {
+    const timer = timeoutMs ? setTimeout(() => stopCommand(child), timeoutMs) : null;
+    const settle = (result) => {
       if (timer) clearTimeout(timer);
-      resolve({ code: code === null ? -1 : code, signal, stdout: kept.stdout, stderr: kept.stderr });
-    });
+      runningCommands.delete(child);
+      resolve(result);
+    };
+    child.on('error', (error) => settle({ code: -1, stdout: kept.stdout, stderr: error.message }));
+    child.on('close', (code, signal) => settle({ code: code === null ? -1 : code, signal, stdout: kept.stdout, stderr: kept.stderr }));
   });
 }
 
@@ -155,12 +251,21 @@ async function cloneTree(from, to) {
   throw new Error(`Could not copy ${from}: ${tail(last.stderr)}`);
 }
 
+/**
+ * What a folder takes on disk, in bytes, as `du` counts it. Files that share their blocks with
+ * others (the copy of a linked checkout's build) are counted in full, so this can be far more
+ * than deleting the folder gives back.
+ */
+async function sizeOf(target) {
+  const result = await run('du', ['-sk', target]);
+  const kilobytes = Number.parseInt(result.stdout, 10);
+  return Number.isFinite(kilobytes) ? kilobytes * 1024 : 0;
+}
+
 // ---------------------------------------------------------------------------------------------
 // The sandbox. `lake` evaluates a project's lakefile and elaborating a file runs the code in it,
 // so both run where they can do little: no network except while fetching dependencies, no
 // writing outside the project's copy, and no reading of the user's own files.
-
-const realOrSame = (target) => { try { return realpathSync(target); } catch { return path.resolve(target); } };
 
 function ancestorsOf(target) {
   const out = [];
@@ -171,13 +276,14 @@ function ancestorsOf(target) {
 /**
  * A macOS sandbox profile (for `sandbox-exec`). Under it a command can read system files and
  * the `readable` and `writable` paths, but nothing else under the home directories, mounted
- * volumes or the temporary directories; it can write only to the `writable` paths, except the
- * `guarded` ones inside them; and it has no network unless `network` is set. It also cannot
+ * volumes or the temporary directories; it can write only inside the `writable` folders, except
+ * the `guarded` ones in them; and it has no network unless `network` is set. It also cannot
  * send Apple events to other applications.
  */
 export function seatbeltProfile({ network = false, readable = [], writable = [], guarded = [], home = homedir() } = {}) {
   const quote = (target) => `"${target.replace(/[\\"]/g, '\\$&')}"`;
   const subpaths = (targets) => targets.map((target) => `(subpath ${quote(target)})`).join(' ');
+  const literals = (targets) => targets.map((target) => `(literal ${quote(target)})`).join(' ');
   const visible = [...new Set([...readable, ...writable])];
   const above = [...new Set(visible.flatMap(ancestorsOf))];
   const hidden = [...new Set(['/Users', '/Volumes', '/private/tmp', '/private/var/folders', '/private/var/root', realOrSame(home)])];
@@ -188,11 +294,15 @@ export function seatbeltProfile({ network = false, readable = [], writable = [],
     ...(network ? [] : ['(deny network*)']),
     '(deny file-write*)',
     `(allow file-write* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/dtracehelper") (literal "/dev/tty") (regex #"^/dev/fd/") (regex #"^/dev/ttys[0-9]+")${writable.length ? ` ${subpaths(writable)}` : ''})`,
+    // A writable folder itself stays what and where it is. Otherwise the code inside could move
+    // it away, or put a link to some other place there, and the helper would later take that
+    // place for its own: open it to the sandbox, or run `git` in it.
+    ...(writable.length ? [`(deny file-write* ${literals(writable)})`] : []),
     ...(guarded.length ? [`(deny file-write* ${subpaths(guarded)})`] : []),
     `(deny file-read* ${subpaths(hidden)})`,
     // (An `allow` with no path would allow everything, so these lines need at least one.)
     ...(visible.length ? [`(allow file-read* ${subpaths(visible)})`] : []),
-    ...(above.length ? [`(allow file-read-metadata ${above.map((target) => `(literal ${quote(target)})`).join(' ')})`] : []),
+    ...(above.length ? [`(allow file-read-metadata ${literals(above)})`] : []),
   ].join('\n');
 }
 
@@ -204,7 +314,7 @@ async function detectSandbox() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Settings kept between runs.
+// What is kept between runs: settings, results, and for a while a repository's copy.
 
 export function defaultCacheDir() {
   if (process.env.LEAN_LENS_CACHE) return process.env.LEAN_LENS_CACHE;
@@ -219,6 +329,8 @@ function loadConfig(cacheDir) {
   if (typeof config.token !== 'string' || config.token.length < 20) config.token = randomBytes(24).toString('base64url');
   if (!Array.isArray(config.allow)) config.allow = [];
   if (!config.links || typeof config.links !== 'object') config.links = {};
+  // Lean versions the helper installed itself, so `clean` can take them away again.
+  if (!Array.isArray(config.toolchains)) config.toolchains = [];
   const save = () => {
     mkdirSync(cacheDir, { recursive: true });
     writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
@@ -228,12 +340,74 @@ function loadConfig(cacheDir) {
   return { config, save };
 }
 
+// What the helper notes about a repository's copy. Kept outside the copy, which the project's
+// own code can write to.
+const stateDirOf = (cacheDir, repo) => path.join(cacheDir, 'state', sha256(repo).slice(0, 32));
+
+/** The running helper that is using the copy noted in a state folder (its process id), or null. */
+function ownerIn(stateDir) {
+  try {
+    const pid = Number.parseInt(readFileSync(path.join(stateDir, 'owner'), 'utf8'), 10);
+    return alive(pid) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+// The folders in the cache, and what to call them. Everything but the settings and the results.
+const CACHE_PARTS = [
+  ['repos', 'copies of repositories with their builds'],
+  ['extractors', 'SubVerso extractors'],
+  ['work', 'scratch files'], ['state', 'scratch files'], ['home', 'scratch files'], ['tmp', 'scratch files'],
+];
+
+/**
+ * Remove what the helper keeps on disk: the copies of repositories with their builds, the
+ * SubVerso extractors, scratch files, and the Lean versions it installed itself. The settings
+ * stay, and so do the results of earlier runs unless `results` is set.
+ * Resolves to `{removed: [{what, bytes}], bytes, freed, toolchains}`: `bytes` is what `du`
+ * counted, `freed` how much free space the disk gained (or null when the system doesn't say).
+ */
+export async function cleanCache(cacheDir, { results = false, force = false } = {}) {
+  const dir = path.resolve(cacheDir || defaultCacheDir());
+  const { config, save } = loadConfig(dir);
+  const users = [...new Set(entries(path.join(dir, 'state')).map((name) => ownerIn(path.join(dir, 'state', name))))]
+    .filter((pid) => pid !== null && pid !== process.pid);
+  if (users.length && !force) {
+    throw new Error(`A helper is running and using these files (process ${users.join(', ')}). Stop it first, which removes the builds, or pass --force.`);
+  }
+  const before = freeBytes(dir);
+  const removed = [];
+  for (const [name, what] of [...CACHE_PARTS, ...(results ? [['data', 'results of earlier runs']] : [])]) {
+    const target = path.join(dir, name);
+    if (!kind(target)) continue;
+    const bytes = holdsFiles(target) ? await sizeOf(target) : 0;
+    rmSync(target, { recursive: true, force: true });
+    if (!bytes) continue; // an empty folder: gone, and not worth a mention
+    const same = removed.find((entry) => entry.what === what);
+    if (same) same.bytes += bytes; else removed.push({ what, bytes });
+  }
+  const toolchains = [];
+  for (const name of config.toolchains) {
+    if ((await run('elan', ['toolchain', 'uninstall', name])).code === 0) toolchains.push(name);
+  }
+  config.toolchains = [];
+  save();
+  const after = freeBytes(dir);
+  return {
+    dir, removed, toolchains,
+    bytes: removed.reduce((sum, entry) => sum + entry.bytes, 0),
+    freed: before === null || after === null ? null : Math.max(0, after - before),
+  };
+}
+
 // ---------------------------------------------------------------------------------------------
 // The helper itself.
 
 /**
- * @param {object} options `{cacheDir, jobs, subverso, subversoRev, cloneBase, sandbox, log}`
- * @returns `{config, allow, link, start, status, fileState, readData, handle, sandbox}`
+ * @param {object} options `{cacheDir, jobs, subverso, subversoRev, cloneBase, sandbox,
+ *   keepBuilds, tidyMinutes, log}`
+ * @returns `{config, allow, link, start, status, fileState, readData, handle, sandbox, idle, shutdown}`
  */
 export function createHelper(options = {}) {
   const cacheDir = path.resolve(options.cacheDir || defaultCacheDir());
@@ -243,11 +417,14 @@ export function createHelper(options = {}) {
   const subverso = options.subverso || DEFAULT_SUBVERSO;
   const subversoRev = options.subversoRev || DEFAULT_SUBVERSO_REV;
   const cloneBase = (options.cloneBase || DEFAULT_CLONE_BASE).replace(/\/*$/, '/');
+  const keepBuilds = Boolean(options.keepBuilds);
+  const tidyMinutes = options.tidyMinutes === undefined ? DEFAULT_TIDY_MINUTES : Number(options.tidyMinutes);
+  if (!Number.isFinite(tidyMinutes) || tidyMinutes < 0) throw new Error('The time to keep a build is a number of minutes, 0 or more');
   // 'seatbelt' when commands can be confined, 'none' when this system can't, 'off' when asked not to.
   const sandboxWanted = options.sandbox !== false;
   let sandboxState = sandboxWanted ? 'checking' : 'off';
   const sandboxKind = sandboxWanted
-    ? detectSandbox().then((kind) => { sandboxState = kind || 'none'; return kind; })
+    ? detectSandbox().then((found) => { sandboxState = found || 'none'; return found; })
     : Promise.resolve(null);
 
   const repoQueues = new Map(); // repo → promise of its last job (one checkout per repository)
@@ -256,6 +433,10 @@ export function createHelper(options = {}) {
   const extractorBuilds = new Map(); // directory → promise of the extractor binary
 
   const repoDir = (repo) => path.join(cacheDir, 'repos', ...repo.split('/'));
+  // Scratch folders, one per run, named after this process so that a later helper can tell
+  // which ones were left behind.
+  const workRoot = path.join(cacheDir, 'work');
+  const scratchDir = (label) => ownDir(path.join(workRoot, `${process.pid}-${label}`));
   // Results are kept by data format, so a newer helper never serves an older format.
   const dataFile = (repo, sha, file) => path.join(cacheDir, 'data', `v${DATA_FORMAT_VERSION}`, ...repo.split('/'), sha, `${file}.json`);
   const fileKey = (repo, sha, file) => `${repo}@${sha}:${file}`;
@@ -274,25 +455,123 @@ export function createHelper(options = {}) {
     save();
   }
 
+  // --- Keeping little on disk ----------------------------------------------------------------
+  // A repository's copy holds its build: about 10 GB when it uses Mathlib. It is only needed to
+  // run Lean again, so it goes once it has not been used for a while, and when the helper
+  // stops. What stays is the results, some hundred kilobytes for each Lean file.
+
+  const active = new Map(); // repo → runs queued or under way
+  const tidyTimers = new Map(); // repo → the timer that will remove its copy
+  const owned = new Set(); // repositories whose copy this helper is using
+
+  /** Note that this helper is the one using a repository's copy. */
+  function claim(repo) {
+    mkdirSync(stateDirOf(cacheDir, repo), { recursive: true });
+    writeFileSync(path.join(stateDirOf(cacheDir, repo), 'owner'), `${process.pid}\n`);
+    owned.add(repo);
+  }
+
+  /** Remove a repository's copy with its build, and what was noted about it. */
+  function forgetCopy(repo, why) {
+    const dir = repoDir(repo);
+    if (why && kind(dir)) log(`Removing the copy of ${repo} and its build (${why}). The results stay.`);
+    rmSync(dir, { recursive: true, force: true });
+    try { rmdirSync(path.dirname(dir)); } catch { /* other repositories of that owner are there */ }
+    rmSync(stateDirOf(cacheDir, repo), { recursive: true, force: true });
+    owned.delete(repo);
+  }
+
+  /** The same without holding up requests: the copy is moved aside at once, then deleted. */
+  async function discardCopy(repo, why) {
+    const dir = repoDir(repo);
+    let aside = null;
+    if (kind(dir)) {
+      log(`Removing the copy of ${repo} and its build (${why}). The results stay.`);
+      aside = path.join(scratchDir('gone'), randomBytes(6).toString('hex'));
+      try { renameSync(dir, aside); } catch { aside = null; }
+    }
+    forgetCopy(repo);
+    if (aside) await rm(aside, { recursive: true, force: true });
+  }
+
+  /** Once nothing is queued for a repository: remove its copy when it stays unused. */
+  function tidyWhenIdle(repo) {
+    clearTimeout(tidyTimers.get(repo));
+    tidyTimers.delete(repo);
+    if (keepBuilds) return;
+    const why = tidyMinutes ? `not used for ${tidyMinutes} minute${tidyMinutes === 1 ? '' : 's'}` : 'its run is over';
+    const discard = () => {
+      tidyTimers.delete(repo);
+      // Queued like a run, so a run started meanwhile waits for it and then makes a fresh copy.
+      const previous = repoQueues.get(repo) || Promise.resolve();
+      repoQueues.set(repo, previous
+        .then(() => (active.get(repo) ? null : discardCopy(repo, why)))
+        .catch((error) => log(`The copy of ${repo} could not be removed: ${error.message}`)));
+    };
+    if (tidyMinutes === 0) { discard(); return; }
+    const timer = setTimeout(discard, tidyMinutes * 60 * 1000);
+    timer.unref();
+    tidyTimers.set(repo, timer);
+  }
+
+  /** At start: remove what earlier helpers left and no running helper is using. */
+  function sweep() {
+    for (const name of entries(workRoot)) {
+      if (!alive(Number.parseInt(name, 10))) rmSync(path.join(workRoot, name), { recursive: true, force: true });
+    }
+    // Scratch folders of earlier versions, which kept them between runs.
+    for (const name of ['home', 'tmp']) rmSync(path.join(cacheDir, name), { recursive: true, force: true });
+    if (keepBuilds) return;
+    const repos = path.join(cacheDir, 'repos');
+    for (const owner of entries(repos)) {
+      for (const name of entries(path.join(repos, owner))) {
+        const repo = `${owner}/${name}`;
+        if (isRepo(repo) && ownerIn(stateDirOf(cacheDir, repo)) === null) forgetCopy(repo, 'no running helper is using it');
+      }
+      try { rmdirSync(path.join(repos, owner)); } catch { /* still in use */ }
+    }
+  }
+
+  /** Stop what is running, and remove what only a running helper needs. */
+  function shutdown() {
+    for (const timer of tidyTimers.values()) clearTimeout(timer);
+    tidyTimers.clear();
+    stopCommands();
+    if (!keepBuilds) for (const repo of [...owned]) forgetCopy(repo, 'the helper is stopping');
+    for (const name of entries(workRoot)) {
+      if (name.startsWith(`${process.pid}-`)) rmSync(path.join(workRoot, name), { recursive: true, force: true });
+    }
+  }
+
+  /** Resolves once nothing is queued or running. */
+  async function idle() {
+    for (;;) {
+      const pending = [...repoQueues.values()];
+      await Promise.all(pending);
+      const now = [...repoQueues.values()];
+      if (now.length === pending.length && now.every((promise, i) => promise === pending[i])) return;
+    }
+  }
+
   // --- Preparing a checkout ------------------------------------------------------------------
 
   const depsStamp = (root) => sha256(['lean-toolchain', 'lake-manifest.json', 'lakefile.lean', 'lakefile.toml']
     .map((name) => { try { return readFileSync(path.join(root, name), 'utf8'); } catch { return ''; } }).join('\0'));
-  // Which dependencies a project's copy was last prepared for. Kept outside the copy, which
-  // the project's own code can write to.
-  const stampFile = (repo, rootDir) => path.join(cacheDir, 'state', `${sha256(`${repo}\0${rootDir === '.' ? '' : rootDir}`).slice(0, 32)}.deps`);
+  // Which dependencies a project's copy was last prepared for.
+  const stampFile = (repo, rootDir) => path.join(stateDirOf(cacheDir, repo), `${sha256(rootDir === '.' ? '' : rootDir).slice(0, 32)}.deps`);
   const writeStamp = (repo, rootDir, stamp) => {
-    mkdirSync(path.join(cacheDir, 'state'), { recursive: true });
+    mkdirSync(stateDirOf(cacheDir, repo), { recursive: true });
     writeFileSync(stampFile(repo, rootDir), stamp);
   };
 
-  async function ensureRepo(job) {
+  async function ensureRepo(job, workDir) {
     const dir = repoDir(job.repo);
-    if (existsSync(path.join(dir, '.git'))) return dir;
+    if (isRealDir(dir) && isRealDir(path.join(dir, '.git'))) { claim(job.repo); return dir; }
+    // Nothing usable is there (or something else is, where the copy should be): start again.
+    forgetCopy(job.repo);
+    claim(job.repo);
     // Built in a staging directory, so an interrupted first run is not taken for a finished one.
-    const staging = `${dir}.partial`;
-    rmSync(dir, { recursive: true, force: true });
-    rmSync(staging, { recursive: true, force: true });
+    const staging = path.join(workDir, 'clone');
     mkdirSync(path.dirname(dir), { recursive: true });
     const linked = config.links[job.repo];
     const remote = `${cloneBase}${job.repo}.git`;
@@ -338,9 +617,6 @@ export function createHelper(options = {}) {
 
   // --- Running a project's code --------------------------------------------------------------
 
-  const madeDir = (target) => { mkdirSync(target, { recursive: true }); return realOrSame(target); };
-  const mathlibCacheDir = () => madeDir(process.env.MATHLIB_CACHE_DIR ||
-    path.join(process.env.XDG_CACHE_HOME || path.join(homedir(), '.cache'), 'mathlib'));
   // The real `git`, for Lake's own cloning of dependencies: on macOS `/usr/bin/git` is a stub
   // that looks its tool up through files the sandbox hides.
   let gitDirectory = null;
@@ -355,21 +631,24 @@ export function createHelper(options = {}) {
   /**
    * Run a command that executes a project's code: `lake` (which evaluates the lakefile) or the
    * extractor (which elaborates a file). Its environment has none of the helper's own
-   * variables, and its home directory is an empty one of the helper's. Where the system has a
-   * sandbox, it can also read only the Lean toolchain and the paths given, write only where
-   * told, and reach the network only when `network` is set.
+   * variables, and its home and temporary directories are empty ones in `scratch`, a folder of
+   * the run that goes when the run is over. Where the system has a sandbox, it can also read
+   * only the Lean toolchain and the paths given, write only where told, and reach the network
+   * only when `network` is set.
    */
-  async function untrusted(command, args, { cwd, toolchain, network = false, readable = [], writable = [], onLine, timeoutMs } = {}) {
-    if (!sandboxWanted) return run(command, args, { cwd, onLine, timeoutMs });
-    const home = madeDir(path.join(cacheDir, 'home'));
-    const temporary = madeDir(path.join(cacheDir, 'tmp'));
+  async function untrusted(command, args, { cwd, toolchain, scratch, network = false, readable = [], writable = [], env: extra = {}, onLine, timeoutMs } = {}) {
+    if (!sandboxWanted) {
+      return run(command, args, { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...extra }, onLine, timeoutMs });
+    }
+    const home = ownDir(path.join(scratch, 'home'));
+    const temporary = ownDir(path.join(scratch, 'tmp'));
     const env = {
       PATH: [toolchain && toolchain.bin, await gitDir(), '/usr/bin', '/bin', '/usr/sbin', '/sbin', '/opt/homebrew/bin', '/usr/local/bin'].filter(Boolean).join(path.delimiter),
       HOME: home,
       TMPDIR: temporary,
       LANG: process.env.LANG || 'en_US.UTF-8',
       GIT_TERMINAL_PROMPT: '0',
-      MATHLIB_CACHE_DIR: process.env.MATHLIB_CACHE_DIR || path.join(process.env.XDG_CACHE_HOME || path.join(homedir(), '.cache'), 'mathlib'),
+      ...extra,
     };
     if ((await sandboxKind) !== 'seatbelt') return run(command, args, { cwd, env, onLine, timeoutMs });
     const allowed = [home, temporary, ...writable].map(realOrSame);
@@ -384,26 +663,18 @@ export function createHelper(options = {}) {
     return run('/usr/bin/sandbox-exec', ['-p', profile, command, ...args], { cwd, env, onLine, timeoutMs });
   }
 
-  /** The Lean version a project pins. */
-  function toolchainOf(root) {
-    try {
-      return readFileSync(path.join(root, 'lean-toolchain'), 'utf8').trim();
-    } catch {
-      throw new Error('This project has no lean-toolchain file, so its Lean version is unknown');
-    }
-  }
-
   /**
    * Where the project's Lean lives: `{ lake, bin, root }`, the real programs rather than elan's
    * stand-ins, so they can be run directly. elan only reads the project's `lean-toolchain` here
    * (and downloads that version if it is missing); nothing of the project is run.
    */
   async function resolveToolchain(root, job) {
+    const name = toolchainOf(root);
     let found = await run('elan', ['which', 'lake'], { cwd: root });
     if (found.code !== 0 && found.code !== -1) {
-      const name = toolchainOf(root);
-      job.say(`Installing ${name}`);
+      job.say(`Installing ${name} (about 3 GB)`);
       await must('elan', ['toolchain', 'install', name], { onLine: (line) => job.progress(line) });
+      if (!config.toolchains.includes(name)) { config.toolchains.push(name); save(); }
       found = await must('elan', ['which', 'lake'], { cwd: root });
     }
     // Without elan, whichever `lake` is installed.
@@ -412,24 +683,49 @@ export function createHelper(options = {}) {
     return { lake, bin: path.dirname(lake), root: path.dirname(path.dirname(lake)) };
   }
 
-  async function ensureDependencies(root, rootDir, toolchain, job) {
+  /** Whether Mathlib's prebuilt files are there (in a project that uses Mathlib, or is it). */
+  const mathlibIsBuilt = (root) => [root, path.join(root, '.lake', 'packages', 'mathlib')].some((dir) =>
+    ['lib/lean', 'lib'].some((lib) => existsSync(path.join(dir, '.lake', 'build', lib, 'Mathlib', 'Init.olean'))));
+
+  async function ensureDependencies(root, rootDir, toolchain, job, workDir) {
     const stamp = depsStamp(root);
     try { if (readFileSync(stampFile(job.repo, rootDir), 'utf8') === stamp) return; } catch { /* not prepared yet */ }
     let manifest = '';
     try { manifest = readFileSync(path.join(root, 'lake-manifest.json'), 'utf8'); } catch { /* no dependencies */ }
-    // The one step with network access: Lake clones the packages the manifest lists, and for a
-    // Mathlib project its `cache` tool downloads the prebuilt files.
     const mathlib = usesMathlib(manifest);
-    job.say(mathlib ? 'Downloading the Mathlib cache' : "Fetching the project's dependencies");
-    const result = await untrusted(toolchain.lake, mathlib ? ['exe', 'cache', 'get'] : ['env', 'true'], {
-      cwd: root, toolchain, network: true, writable: [job.dir, ...(mathlib ? [mathlibCacheDir()] : [])],
-      onLine: (line) => job.progress(line),
-    });
-    if (result.code !== 0) job.note(`\`lake ${mathlib ? 'exe cache get' : 'env'}\` failed: ${tail(result.stderr || result.stdout, 300)}`);
+    const free = freeBytes(root);
+    if (mathlib && free !== null && free < MATHLIB_ROOM_BYTES) {
+      throw new Error(`Mathlib's build takes about 10 GB of disk space while it is in use, and ${formatBytes(free)} is free`);
+    }
+    // The one step with network access: Lake clones the packages the manifest lists, and for a
+    // Mathlib project its `cache` tool downloads the prebuilt files. Those downloads go to a
+    // folder of this run, not to the user's own Mathlib cache: other projects read that one, so
+    // this project's code must not be able to write there. They are only needed for unpacking.
+    const downloads = mathlib ? ownDir(path.join(workDir, 'mathlib')) : null;
+    job.say(mathlib ? "Downloading Mathlib's build (about 10 GB on disk)" : "Fetching the project's dependencies");
+    let result;
+    try {
+      result = await untrusted(toolchain.lake, mathlib ? ['exe', 'cache', 'get'] : ['env', 'true'], {
+        cwd: root, toolchain, scratch: path.join(workDir, 'project'), network: true,
+        writable: [job.dir, ...(downloads ? [downloads] : [])],
+        env: downloads ? { MATHLIB_CACHE_DIR: downloads } : {},
+        onLine: (line) => job.progress(line),
+      });
+    } finally {
+      if (downloads) rmSync(downloads, { recursive: true, force: true });
+    }
+    if (result.code !== 0) {
+      const why = tail(result.stderr || result.stdout, 300) || `exit ${result.code}`;
+      // Without Mathlib's prebuilt files, building the imports would compile Mathlib: hours.
+      if (!mathlib) throw new Error(`The project's dependencies could not be fetched: ${why}`);
+      if (!mathlibIsBuilt(root)) throw new Error(`Mathlib's build could not be downloaded: ${why}`);
+      job.note(`\`lake exe cache get\` did not get everything: ${why}`);
+      return; // and it is tried again on the next run
+    }
     writeStamp(job.repo, rootDir, stamp);
   }
 
-  async function buildImports(root, files, toolchain, job) {
+  async function buildImports(root, files, toolchain, job, scratch) {
     const imports = new Set();
     for (const file of files) {
       try { importsOf(readFileSync(path.join(root, file), 'utf8')).forEach((name) => imports.add(name)); } catch { /* reported when extracting */ }
@@ -437,13 +733,13 @@ export function createHelper(options = {}) {
     if (!imports.size) return;
     job.say(`Building what ${files.length === 1 ? 'the file imports' : `${files.length} files import`}`);
     const result = await untrusted(toolchain.lake, ['build', ...[...imports].map((name) => `+${name}`)], {
-      cwd: root, toolchain, writable: [job.dir], onLine: (line) => job.progress(line),
+      cwd: root, toolchain, scratch, writable: [job.dir], onLine: (line) => job.progress(line),
     });
     if (result.code !== 0) job.note(`\`lake build\` of the imports failed: ${tail(result.stderr || result.stdout, 400)}`);
   }
 
   /** The SubVerso extractor for a Lean version, built once and kept. */
-  function ensureExtractor(root, toolchain, job) {
+  function ensureExtractor(root, toolchain, job, workDir) {
     const name = toolchainOf(root);
     const dir = path.join(cacheDir, 'extractors', `${name.replace(/[^A-Za-z0-9._-]+/g, '_')}-${subversoRev.slice(0, 12)}`);
     const binary = path.join(dir, '.lake', 'build', 'bin', 'subverso-extract-mod');
@@ -456,8 +752,9 @@ export function createHelper(options = {}) {
         await must('git', ['clone', '--quiet', '--no-checkout', subverso, dir]);
         await must('git', ['-C', dir, 'checkout', '--quiet', subversoRev]);
         writeFileSync(path.join(dir, 'lean-toolchain'), `${name}\n`);
+        // (Scratch folders of its own: nothing the project's code left behind is in reach.)
         const built = await untrusted(toolchain.lake, ['build', 'subverso-extract-mod'], {
-          cwd: dir, toolchain, writable: [dir], onLine: (line) => job.progress(line),
+          cwd: dir, toolchain, scratch: path.join(workDir, 'extractor'), writable: [dir], onLine: (line) => job.progress(line),
         });
         if (built.code !== 0 || !existsSync(binary)) {
           throw new Error(`SubVerso's extractor did not build for ${name}: ${tail(built.stderr || built.stdout, 300) || 'no output'}`);
@@ -469,15 +766,15 @@ export function createHelper(options = {}) {
   }
 
   /** The source roots Lake sets up for the project (`LEAN_SRC_PATH`), for naming modules. */
-  async function sourceRoots(root, toolchain, job) {
-    const result = await untrusted(toolchain.lake, ['env', 'printenv', 'LEAN_SRC_PATH'], { cwd: root, toolchain, writable: [job.dir] });
+  async function sourceRoots(root, toolchain, job, scratch) {
+    const result = await untrusted(toolchain.lake, ['env', 'printenv', 'LEAN_SRC_PATH'], { cwd: root, toolchain, scratch, writable: [job.dir] });
     return result.code === 0 ? result.stdout.trim().split('\n').pop() : '';
   }
 
   async function extract(root, file, context, job) {
     const key = fileKey(job.repo, job.sha, file.repoPath);
     fileStates.set(key, { state: 'running' });
-    const output = path.join(context.workDir, `${sha256(file.repoPath)}.json`);
+    const output = path.join(context.out, `${sha256(file.repoPath)}.json`);
     try {
       const source = readFileSync(path.join(root, file.path), 'utf8');
       // The extractor runs under `lake env`, which gives it the project's modules.
@@ -493,9 +790,12 @@ export function createHelper(options = {}) {
         args = ['-d', root, 'env', 'env', '-u', 'LEAN_SRC_PATH', context.extractor.binary];
       }
       const result = await untrusted(context.toolchain.lake, [...args, moduleName, output], {
-        cwd, toolchain: context.toolchain, readable: [context.extractor.dir], writable: [job.dir, context.workDir], timeoutMs: EXTRACT_TIMEOUT_MS,
+        cwd, toolchain: context.toolchain, scratch: context.scratch, readable: [context.extractor.dir], writable: [job.dir, context.out], timeoutMs: EXTRACT_TIMEOUT_MS,
       });
       if (result.code !== 0) throw new Error(`Lean could not process the file: ${tail(result.stderr || result.stdout, 400) || `exit ${result.code}`}`);
+      // (The project's code can write in that folder: only a plain file is read.)
+      const written = kind(output);
+      if (!written || !written.isFile()) throw new Error('Lean wrote no output for the file');
       const data = convertModule(JSON.parse(readFileSync(output, 'utf8')), source);
       const target = dataFile(job.repo, job.sha, file.repoPath);
       mkdirSync(path.dirname(target), { recursive: true });
@@ -511,35 +811,36 @@ export function createHelper(options = {}) {
   }
 
   async function runJob(job) {
-    const dir = await ensureRepo(job);
-    job.dir = realOrSame(dir);
-    await checkout(dir, job);
-    // Files grouped by the Lake project they belong to (usually one, at the repository root).
-    const groups = new Map();
-    for (const repoPath of job.paths) {
-      const rootDir = existsSync(path.join(dir, repoPath)) ? lakeRootFor(dir, repoPath) : null;
-      if (rootDir === null) {
-        fileStates.set(fileKey(job.repo, job.sha, repoPath), {
-          state: 'error',
-          error: existsSync(path.join(dir, repoPath)) ? 'This file is not inside a Lake project' : 'This file does not exist at that commit',
-        });
-        job.done += 1;
-        continue;
-      }
-      if (!groups.has(rootDir)) groups.set(rootDir, []);
-      groups.get(rootDir).push({ repoPath, path: rootDir ? repoPath.slice(rootDir.length + 1) : repoPath });
-    }
-    const workDir = path.join(madeDir(path.join(cacheDir, 'work')), randomBytes(6).toString('hex'));
-    mkdirSync(workDir, { recursive: true });
+    const workDir = scratchDir(randomBytes(6).toString('hex'));
     try {
+      const dir = await ensureRepo(job, workDir);
+      job.dir = realOrSame(dir);
+      await checkout(dir, job);
+      // Files grouped by the Lake project they belong to (usually one, at the repository root).
+      const groups = new Map();
+      for (const repoPath of job.paths) {
+        const rootDir = existsSync(path.join(dir, repoPath)) ? lakeRootFor(dir, repoPath) : null;
+        if (rootDir === null) {
+          fileStates.set(fileKey(job.repo, job.sha, repoPath), {
+            state: 'error',
+            error: existsSync(path.join(dir, repoPath)) ? 'This file is not inside a Lake project' : 'This file does not exist at that commit',
+          });
+          job.done += 1;
+          continue;
+        }
+        if (!groups.has(rootDir)) groups.set(rootDir, []);
+        groups.get(rootDir).push({ repoPath, path: rootDir ? repoPath.slice(rootDir.length + 1) : repoPath });
+      }
+      const scratch = path.join(workDir, 'project');
+      const out = ownDir(path.join(workDir, 'out'));
       for (const [rootDir, files] of groups) {
         const root = path.join(job.dir, rootDir);
         job.phase = 'preparing';
         const toolchain = await resolveToolchain(root, job);
-        await ensureDependencies(root, rootDir, toolchain, job);
-        await buildImports(root, files.map((file) => file.path), toolchain, job);
-        const extractor = await ensureExtractor(root, toolchain, job);
-        const context = { extractor, toolchain, workDir, name: toolchainOf(root), srcPath: await sourceRoots(root, toolchain, job) };
+        await ensureDependencies(root, rootDir, toolchain, job, workDir);
+        await buildImports(root, files.map((file) => file.path), toolchain, job, scratch);
+        const extractor = await ensureExtractor(root, toolchain, job, workDir);
+        const context = { extractor, toolchain, scratch, out, name: toolchainOf(root), srcPath: await sourceRoots(root, toolchain, job, scratch) };
         job.phase = 'elaborating';
         job.say(`Elaborating ${files.length} file${files.length === 1 ? '' : 's'}`);
         let next = 0;
@@ -568,6 +869,9 @@ export function createHelper(options = {}) {
       };
       todo.forEach((file) => fileStates.set(fileKey(repo, sha, file), { state: 'queued' }));
       latestJob.set(`${repo}@${sha}`, job);
+      active.set(repo, (active.get(repo) || 0) + 1);
+      clearTimeout(tidyTimers.get(repo));
+      tidyTimers.delete(repo);
       const previous = repoQueues.get(repo) || Promise.resolve();
       const current = previous.then(() => runJob(job)).then(
         () => { job.phase = 'done'; job.say(`Done (${todo.length} file${todo.length === 1 ? '' : 's'})`); },
@@ -581,7 +885,11 @@ export function createHelper(options = {}) {
             if (state && state.state !== 'error') fileStates.set(key, { state: 'error', error: error.message });
           }
         },
-      ).finally(() => { job.finished = true; });
+      ).finally(() => {
+        job.finished = true;
+        active.set(repo, active.get(repo) - 1);
+        if (!active.get(repo)) tidyWhenIdle(repo);
+      });
       repoQueues.set(repo, current);
       job.promise = current;
     }
@@ -644,7 +952,8 @@ export function createHelper(options = {}) {
   /** How a project's code is confined: 'seatbelt', 'none' (this system can't) or 'off'. */
   const sandbox = () => sandboxKind.then(() => sandboxState);
 
-  return { cacheDir, config, allow, link, start, status, fileState, readData, handle, poolSize, sandbox };
+  sweep();
+  return { cacheDir, config, allow, link, start, status, fileState, readData, handle, poolSize, sandbox, keepBuilds, tidyMinutes, idle, shutdown };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -724,12 +1033,18 @@ const USAGE = `Lean Lens helper: real Lean hovers and proof states for the exten
   node lean-lens-helper.mjs [options]                  start the helper
   node lean-lens-helper.mjs run --repo owner/repo --sha COMMIT [--pr N] File.lean …
                                                        elaborate files once, without the extension
+  node lean-lens-helper.mjs clean [--all]              remove what the helper keeps on disk
+                                                       (--all: the results of earlier runs too)
 
 Options
   --port N                  port on 127.0.0.1 (default ${DEFAULT_PORT})
   --allow owner/repo        allow a repository (remembered; can be repeated)
   --link owner/repo=PATH    start from your existing checkout of a repository, so its commits
                             and its build are reused instead of downloaded (remembered)
+  --keep-builds             keep each repository's copy and build between runs (about 10 GB for
+                            a project that uses Mathlib). Without it they are removed after
+                            --tidy-after minutes without a run, and when the helper stops
+  --tidy-after MINUTES      how long an unused build stays (default ${DEFAULT_TIDY_MINUTES}; 0: until its run is over)
   --cache DIR               where clones, builds and results are kept
   --jobs N                  files elaborated at once
   --subverso URL-or-PATH    where to get SubVerso (default ${DEFAULT_SUBVERSO})
@@ -737,6 +1052,20 @@ Options
   --clone-base URL          where repositories are cloned from (default ${DEFAULT_CLONE_BASE})
   --no-sandbox              run a project's code with your own permissions and environment
 `;
+
+async function clean(values) {
+  const result = await cleanCache(values.cache, { results: values.all, force: values.force });
+  if (!result.removed.length) {
+    console.log(`Nothing to remove in ${result.dir}.`);
+  } else {
+    console.log(`Removed ${formatBytes(result.bytes)} from ${result.dir}: ${result.removed.map((entry) => `${entry.what} (${formatBytes(entry.bytes)})`).join(', ')}.`);
+    if (result.freed !== null && result.bytes > 100e6 && result.freed < result.bytes / 2) {
+      console.log(`The disk gained about ${formatBytes(result.freed)}: the copy of a linked checkout shares its space with the original.`);
+    }
+  }
+  if (result.toolchains.length) console.log(`Uninstalled the Lean versions the helper had installed: ${result.toolchains.join(', ')}.`);
+  console.log(values.all ? 'The settings are kept.' : 'The settings and the results of earlier runs are kept (`clean --all` removes the results too).');
+}
 
 async function main() {
   const { values, positionals } = parseArgs({
@@ -746,14 +1075,23 @@ async function main() {
       allow: { type: 'string', multiple: true }, link: { type: 'string', multiple: true },
       subverso: { type: 'string' }, 'subverso-rev': { type: 'string' }, 'clone-base': { type: 'string' },
       repo: { type: 'string' }, sha: { type: 'string' }, pr: { type: 'string' }, 'no-sandbox': { type: 'boolean' },
+      'keep-builds': { type: 'boolean' }, 'tidy-after': { type: 'string' }, all: { type: 'boolean' }, force: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
     },
   });
   if (values.help) { console.log(USAGE); return; }
+  // What happens when the helper is told to stop (Ctrl-C, or the terminal closing).
+  let stop = () => { stopCommands(); process.exit(130); };
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => stop());
+
+  if (positionals[0] === 'clean') { await clean(values); return; }
+
   const helper = createHelper({
     cacheDir: values.cache, jobs: values.jobs, subverso: values.subverso, subversoRev: values['subverso-rev'],
     cloneBase: values['clone-base'], sandbox: !values['no-sandbox'],
+    keepBuilds: values['keep-builds'], tidyMinutes: values['tidy-after'],
   });
+  stop = () => { helper.shutdown(); process.exit(130); };
   const sandboxLine = {
     seatbelt: "on: the project's code runs without network access and cannot read or change your files",
     none: 'not available on this system: Lean runs with your permissions',
@@ -787,11 +1125,20 @@ async function main() {
       if (state.state !== 'ready') failed = true;
     }
     if (failed) process.exitCode = 1;
+    await helper.idle();
+    helper.shutdown();
     return;
   }
 
   const port = Number(values.port) || DEFAULT_PORT;
-  await serve(helper, port);
+  const server = await serve(helper, port);
+  stop = () => {
+    console.log(`\nStopping.${helper.keepBuilds ? '' : ' Removing the builds; the results stay.'}`);
+    server.close();
+    helper.shutdown();
+    process.exit(0);
+  };
+  const minutes = `${helper.tidyMinutes} minute${helper.tidyMinutes === 1 ? '' : 's'}`;
   console.log(`Lean Lens helper is running.
 
   Address  http://127.0.0.1:${port}
@@ -800,7 +1147,10 @@ async function main() {
 Paste both into the extension's options, under "Real Lean".
 Sandbox ${sandboxLine}.
 Allowed repositories: ${helper.config.allow.length ? helper.config.allow.join(', ') : 'none yet (allow one from the extension, or with --allow owner/repo)'}
-Kept in: ${helper.cacheDir}
+Kept in: ${helper.cacheDir} (${formatBytes(await sizeOf(helper.cacheDir))} now)
+Builds: ${helper.keepBuilds
+    ? 'kept between runs (--keep-builds). `clean` removes them.'
+    : `a repository's copy and build are removed ${helper.tidyMinutes ? `after ${minutes} without a run` : 'when its run is over'}, and when the helper stops. The results stay.`}
 `);
 }
 

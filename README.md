@@ -49,7 +49,7 @@ The helper runs Lean itself on the code you are reading, so nothing is estimated
 node helper/lean-lens-helper.mjs
 ```
 
-It prints an address and a token. Paste both into the extension's options, under **Real Lean**. Then, on a pull request, hover any name and press **Run Lean** in the tooltip. The first run on a project takes a while (see below); after that the files of a commit are kept, and hovers on them are instant.
+It prints an address and a token. Paste both into the extension's options, under **Real Lean**. Then, on a pull request, hover any name and press **Run Lean** in the tooltip. The first run on a project takes a while (see below); after that the results for the files of a commit are kept, and hovers on them are instant, with or without the project's build on disk.
 
 What a hover shows once Lean has run:
 
@@ -64,6 +64,7 @@ What the helper does for a repository, a commit and its Lean files:
 1. Fetches the commit into its own folder. It never touches your checkouts.
 2. Installs the Lean version the project pins, and downloads Mathlib's prebuilt cache if the project depends on Mathlib.
 3. Builds what the files import, then elaborates each file with [SubVerso](https://github.com/leanprover/subverso), the library [Verso](https://verso.lean-lang.org/) uses to get this information.
+4. Keeps the result for each file, and removes the copy and its build once they are not in use (see **Disk space**).
 
 It needs Node 20 or later, `git`, and Lean's `elan` and `lake`.
 
@@ -73,18 +74,34 @@ It needs Node 20 or later, `git`, and Lean's `elan` and `lake`.
 node helper/lean-lens-helper.mjs --link seewoo5/DifferentProofs=$HOME/code/DifferentProofs
 ```
 
+**Disk space.** Lean has to be on the machine that runs it. A Lean version is about 3 GB, and a project that uses Mathlib needs Mathlib's build, about 10 GB. The helper keeps as little of that as it can:
+
+- What stays is the results (some hundred kilobytes for each Lean file), the SubVerso extractor (about 225 MB for each Lean version) and the settings.
+- A repository's copy and its build are removed 30 minutes after its last run, and when the helper stops. If a helper was killed, the next one removes what it left. `--tidy-after MINUTES` changes the time (`0`: as soon as a run is over). `--keep-builds` keeps them, which saves the next run on that repository the copying or downloading.
+- Mathlib's downloads (about 550 MB, compressed) go to a folder of the run and are deleted once unpacked. They do not go to your own `~/.cache/mathlib`.
+- Lean versions are installed by `elan` and shared with your own projects. The helper notes the ones it installed itself.
+- A project that uses Mathlib is not fetched when less than 12 GB is free.
+
+```bash
+node helper/lean-lens-helper.mjs clean
+```
+
+removes everything but the settings and the results, and uninstalls the Lean versions the helper installed. `clean --all` removes the results too.
+
+The copy of a linked checkout shares its disk space with the original, so it costs far less than it looks: a 10.6 GB build copied this way took 0.3 GB of the disk. Tools that add up file sizes (`du`, the Finder) count it in full all the same.
+
 **Safety.** Elaborating a Lean file runs the code in it, and `lake` runs the project's `lakefile`. So running Lean on a pull request means running that pull request's code on your machine.
 
 - Lean never starts on its own. It runs when you press **Run Lean**, and only on repositories you have allowed (the button asks the first time; `--allow owner/repo` does it ahead).
 - The helper listens on `127.0.0.1` only and answers only requests that carry its token. Requests from web pages are refused.
-- **On macOS the project's code runs in a sandbox** (`lake`, and Lean elaborating a file). In it there is no network, except for the one step that fetches the project's dependencies and Mathlib's cache. It cannot read your home folder, other volumes or the temporary folders: only system files, the Lean toolchain and the helper's copy of the project. It can write only to that copy (in the fetching step, also to Mathlib's download cache), and not to the copy's `.git`. It gets none of the helper's environment variables and an empty home folder of its own.
+- **On macOS the project's code runs in a sandbox** (`lake`, and Lean elaborating a file). In it there is no network, except for the one step that fetches the project's dependencies and Mathlib's build. It cannot read your home folder, other volumes or the temporary folders: only system files, the Lean toolchain and the helper's copy of the project. It can write only inside that copy and the scratch folders of the run. It cannot write to the copy's `.git`, and it cannot move those folders or put something else in their place. It gets none of the helper's environment variables, and empty home and temporary folders that are deleted when the run is over.
 - On Linux there is no sandbox yet, only the clean environment. The helper says which applies when it starts, and **Test Connection** in the options shows it.
 
 The sandbox guards against the obvious; it is not a guarantee. It uses the system's `sandbox-exec` with rules that deny the things above and allow the rest (starting processes, reading system files). `--no-sandbox` turns it off. That is needed when a project's dependencies are private repositories, because the sandbox has no git credentials.
 
-A test file that tries to read a file in the home folder, write one there, fetch a URL, read an environment variable and plant a git hook is refused all five in the sandbox, and allowed all five without it.
+A test file that tries to read a file in the home folder, write one there, fetch a URL, read an environment variable of the helper, plant a git hook, move the project's copy away and move its scratch home folder away is refused all seven in the sandbox. Without it the first five are allowed (the last two were not tried there: they would move real folders).
 
-**Measured** on an Apple M2 with Lean 4.35 and DifferentProofs linked: 39 seconds from an empty cache to the first file of a pull request, then about 15 seconds for each further file. Building the SubVerso extractor takes about 30 seconds, once for each Lean version.
+**Measured** on an Apple M2 with Lean 4.35 and DifferentProofs linked: 78 seconds from an empty cache to the first file of a pull request. Of that, 28 seconds copy the checkout's build (10.6 GB), 25 build the SubVerso extractor (once for each Lean version), and the rest builds what the file imports and elaborates it. A further file takes 5 to 40 seconds. Removing the copy takes about 10 seconds. When Mathlib's build has to come from the network instead, it is 556 MB in about 9,000 files, which took 12 minutes on a connection giving 0.6 to 2 MB/s. The sandbox made no difference to that.
 
 **Limits**
 
@@ -95,7 +112,7 @@ A test file that tries to read a file in the home folder, write one there, fetch
 - **Run Lean** on an added or unchanged line runs the pull request's Lean files. On a removed line it runs that one file at the base commit, which makes the helper switch commits and rebuild.
 - Tested with Lean 4.35 only. SubVerso's output format is not stable, so the helper builds a pinned revision (`--subverso-rev` picks another), and it refuses output that does not reproduce the source text.
 
-The same program can elaborate files without the extension, for example in a script:
+The same program can elaborate files without the extension, for example in a script. It removes the copy when it is done; with `--keep-builds` the next run starts from it.
 
 ```bash
 node helper/lean-lens-helper.mjs run --repo owner/repo --sha <full commit hash> Path/To/File.lean

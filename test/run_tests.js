@@ -1451,6 +1451,7 @@ console.log("22. Testing real Lean data (the local helper)...");
     const helperDir = path.join(__dirname, '..', 'helper');
     const { convertModule, DATA_FORMAT_VERSION } = await import(pathToFileURL(path.join(helperDir, 'convert.mjs')).href);
     const helper = await import(pathToFileURL(path.join(helperDir, 'lean-lens-helper.mjs')).href);
+    const { spawnSync } = require('child_process');
 
     // --- The converter: Lean's hovers, proof states and messages, by line and column.
     const data = Object.assign(convertModule(sampleModule, sampleSource), { lean: 'leanprover/lean4:v4.35.0' });
@@ -1606,19 +1607,23 @@ console.log("22. Testing real Lean data (the local helper)...");
       assert(profile.includes(`(allow file-read* (subpath "/opt/lean") (subpath "${copy}"))`), profile);
       assert(profile.includes(`(deny file-write* (subpath "${copy}/.git"))`), profile);
       assert(profile.indexOf('(deny file-write* (subpath') > profile.indexOf('(allow file-write*'), 'the guard comes after the allowance, so it wins');
+      // The writable folder itself can't be moved or swapped for a link to another place, which
+      // the helper would then open to the sandbox or run `git` in.
+      assert(profile.includes(`(deny file-write* (literal "${copy}"))`), profile);
+      assert(profile.indexOf(`(deny file-write* (literal "${copy}"))`) > profile.indexOf('(allow file-write*'));
       assert(profile.includes('(literal "/Users/me/Library/Caches")'), 'folders above an allowed path can be looked through');
       assert(!/\(allow file-read\*\s*\)/.test(helper.seatbeltProfile({})), 'no allowance without a path (it would allow everything)');
       assert(helper.seatbeltProfile({ readable: ['/a "b"'] }).includes('(subpath "/a \\"b\\"")'), 'paths are quoted');
       if (process.platform === 'darwin' && fs.existsSync('/usr/bin/sandbox-exec')) {
         // The real thing, on files made for the purpose.
-        const { spawnSync } = require('child_process');
         const box = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lean-lens-box-')));
         try {
           fs.mkdirSync(path.join(box, 'in', '.git'), { recursive: true });
           fs.mkdirSync(path.join(box, 'out'));
+          fs.mkdirSync(path.join(box, 'empty'));
           fs.writeFileSync(path.join(box, 'in', 'a.txt'), 'inside');
           fs.writeFileSync(path.join(box, 'out', 'b.txt'), 'outside');
-          const confined = helper.seatbeltProfile({ writable: [path.join(box, 'in')], guarded: [path.join(box, 'in', '.git')] });
+          const confined = helper.seatbeltProfile({ writable: [path.join(box, 'in'), path.join(box, 'empty')], guarded: [path.join(box, 'in', '.git')] });
           const sb = (...command) => spawnSync('/usr/bin/sandbox-exec', ['-p', confined, ...command], { encoding: 'utf8' });
           if (sb('/usr/bin/true').status === 0) { // (not when the tests themselves run in a sandbox)
             assert.strictEqual(sb('/bin/cat', path.join(box, 'in', 'a.txt')).stdout, 'inside');
@@ -1627,6 +1632,11 @@ console.log("22. Testing real Lean data (the local helper)...");
             assert.notStrictEqual(sb('/usr/bin/touch', path.join(box, 'out', 'new.txt')).status, 0, 'nor writable');
             assert.notStrictEqual(sb('/usr/bin/touch', path.join(box, 'in', '.git', 'hook')).status, 0, 'the checkout\'s .git is kept');
             assert(!fs.existsSync(path.join(box, 'out', 'new.txt')) && !fs.existsSync(path.join(box, 'in', '.git', 'hook')));
+            // A writable folder itself stays what and where it is.
+            assert.notStrictEqual(sb('/bin/rmdir', path.join(box, 'empty')).status, 0, 'an empty writable folder cannot be removed (and a link put there)');
+            assert.notStrictEqual(sb('/bin/mv', path.join(box, 'in'), path.join(box, 'empty', 'moved')).status, 0, 'nor moved away, .git and all');
+            assert(fs.lstatSync(path.join(box, 'empty')).isDirectory() && fs.existsSync(path.join(box, 'in', '.git')));
+            assert.strictEqual(sb('/usr/bin/touch', path.join(box, 'empty', 'x')).status, 0, 'writing inside it still works');
           }
         } finally {
           fs.rmSync(box, { recursive: true, force: true });
@@ -1661,6 +1671,128 @@ console.log("22. Testing real Lean data (the local helper)...");
       const ready = ask('POST', '/file', { repo: 'o/r', sha, path: 'Sample.lean' });
       assert.strictEqual(ready.body.state, 'ready');
       assert.strictEqual(ready.body.data.hovers.length, data.hovers.length);
+
+      // The Lean version a project pins goes to elan, outside the sandbox: a plain file naming a
+      // version, never a link to some other file.
+      const project = path.join(root, 'project');
+      fs.mkdirSync(project);
+      assert.throws(() => helper.toolchainOf(project), /no lean-toolchain file/);
+      fs.writeFileSync(path.join(project, 'lean-toolchain'), 'leanprover/lean4:v4.35.0\n');
+      assert.strictEqual(helper.toolchainOf(project), 'leanprover/lean4:v4.35.0');
+      fs.writeFileSync(path.join(project, 'lean-toolchain'), 'v4; curl example.com\n');
+      assert.throws(() => helper.toolchainOf(project), /does not name a Lean version/);
+      fs.rmSync(path.join(project, 'lean-toolchain'));
+      fs.writeFileSync(path.join(root, 'elsewhere.txt'), 'leanprover/lean4:v4.35.0\n');
+      fs.symlinkSync(path.join(root, 'elsewhere.txt'), path.join(project, 'lean-toolchain'));
+      assert.throws(() => helper.toolchainOf(project), /does not name a Lean version/, 'a link is not read');
+
+      // --- Disk. Only the results stay: a repository's copy and its build go when they are not
+      // in use. At start, what an earlier helper left behind is removed.
+      assert.strictEqual(helper.formatBytes(10.6e9), '10.6 GB');
+      assert.strictEqual(helper.formatBytes(225e6), '225 MB');
+      assert.strictEqual(helper.formatBytes(412e3), '412 KB');
+      const cache2 = path.join(root, 'cache2');
+      const stateOf = (cache, repo) => path.join(cache, 'state', helper.sha256(repo).slice(0, 32));
+      const fakeCopy = (cache, repo, owner) => {
+        fs.mkdirSync(path.join(cache, 'repos', ...repo.split('/'), '.git'), { recursive: true });
+        fs.writeFileSync(path.join(cache, 'repos', ...repo.split('/'), '.git', 'HEAD'), 'ref: refs/heads/main\n');
+        fs.mkdirSync(stateOf(cache, repo), { recursive: true });
+        if (owner) fs.writeFileSync(path.join(stateOf(cache, repo), 'owner'), `${owner}\n`);
+      };
+      const gone = spawnSync(process.execPath, ['-e', '']).pid; // a process that has ended
+      fakeCopy(cache2, 'o/left', gone); // its helper was killed
+      fakeCopy(cache2, 'o/old', null); // from a version that did not note who uses a copy
+      fakeCopy(cache2, 'o/inuse', process.ppid); // a process that is running
+      fs.mkdirSync(path.join(cache2, 'work', `${gone}-abc`), { recursive: true });
+      fs.mkdirSync(path.join(cache2, 'work', `${process.ppid}-abc`), { recursive: true });
+      fs.mkdirSync(path.join(cache2, 'home'));
+      const said = [];
+      const h2 = helper.createHelper({ cacheDir: cache2, log: (message) => said.push(message) });
+      assert(!fs.existsSync(path.join(cache2, 'repos', 'o', 'left')) && !fs.existsSync(path.join(cache2, 'repos', 'o', 'old')), 'copies no running helper uses go at start');
+      assert(!fs.existsSync(stateOf(cache2, 'o/left')), 'with what was noted about them');
+      assert(fs.existsSync(path.join(cache2, 'repos', 'o', 'inuse', '.git')), 'a copy a running helper uses is left');
+      assert(!fs.existsSync(path.join(cache2, 'work', `${gone}-abc`)) && fs.existsSync(path.join(cache2, 'work', `${process.ppid}-abc`)), 'scratch folders likewise');
+      assert(!fs.existsSync(path.join(cache2, 'home')), 'the scratch folders of earlier versions go');
+      assert(said.some((message) => message.includes('o/left') && message.includes('The results stay')), said.join('\n'));
+      fakeCopy(cache2, 'o/kept', gone);
+      helper.createHelper({ cacheDir: cache2, keepBuilds: true, log: () => {} });
+      assert(fs.existsSync(path.join(cache2, 'repos', 'o', 'kept')), '--keep-builds removes nothing');
+      assert.throws(() => helper.createHelper({ cacheDir: cache2, tidyMinutes: -1, log: () => {} }), /number of minutes/);
+
+      // `clean`: everything but the settings and the results; with `results`, those too.
+      fs.mkdirSync(path.join(cache2, 'extractors', 'x'), { recursive: true });
+      fs.writeFileSync(path.join(cache2, 'extractors', 'x', 'subverso-extract-mod'), 'binary');
+      fs.mkdirSync(path.join(cache2, 'data', 'v2'), { recursive: true });
+      fs.writeFileSync(path.join(cache2, 'data', 'v2', 'r.json'), '{}');
+      await assert.rejects(helper.cleanCache(cache2), /A helper is running/, 'not under a helper that is using the files');
+      assert(fs.existsSync(path.join(cache2, 'repos', 'o', 'inuse')));
+      const cleaned = await helper.cleanCache(cache2, { force: true });
+      assert.deepStrictEqual(fs.readdirSync(cache2).sort(), ['config.json', 'data']);
+      assert.strictEqual(cleaned.removed.map((entry) => entry.what).join(' | '), 'copies of repositories with their builds | SubVerso extractors | scratch files');
+      assert(cleaned.bytes >= 0 && (cleaned.freed === null || cleaned.freed >= 0));
+      assert.strictEqual(JSON.parse(fs.readFileSync(path.join(cache2, 'config.json'), 'utf8')).token, h2.config.token, 'the token stays');
+      await helper.cleanCache(cache2, { results: true });
+      assert.deepStrictEqual(fs.readdirSync(cache2), ['config.json']);
+      assert.strictEqual((await helper.cleanCache(cache2)).removed.length, 0);
+      fs.mkdirSync(path.join(cache2, 'repos', 'o'), { recursive: true });
+      assert.strictEqual((await helper.cleanCache(cache2)).removed.length, 0, 'an empty folder goes without a mention');
+      assert.deepStrictEqual(fs.readdirSync(cache2), ['config.json']);
+
+      if (spawnSync('git', ['--version']).status === 0) {
+        // Runs as far as git goes: a repository with one Lean file and no Lake project.
+        const git = (cwd, ...args) => {
+          const result = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', '-c', 'init.defaultBranch=main', ...args], { cwd, encoding: 'utf8' });
+          assert.strictEqual(result.status, 0, result.stderr);
+          return result.stdout.trim();
+        };
+        const origin = path.join(root, 'origin');
+        fs.mkdirSync(origin);
+        git(origin, 'init', '--quiet');
+        fs.writeFileSync(path.join(origin, 'A.lean'), 'def a := 1\n');
+        git(origin, 'add', 'A.lean');
+        git(origin, 'commit', '--quiet', '-m', 'one');
+        const commit = git(origin, 'rev-parse', 'HEAD');
+        fs.mkdirSync(path.join(root, 'remotes', 'o'), { recursive: true });
+        git(root, 'clone', '--quiet', '--bare', origin, path.join(root, 'remotes', 'o', 'r.git'));
+        const cloneBase = pathToFileURL(path.join(root, 'remotes')).href;
+        const cache3 = path.join(root, 'cache3');
+        const copy3 = path.join(cache3, 'repos', 'o', 'r');
+        const runOnce = async (options) => {
+          const made = helper.createHelper(Object.assign({ cacheDir: cache3, cloneBase, log: () => {} }, options));
+          made.allow('o/r');
+          made.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+          while (made.status('o/r', commit).state === 'pending') await tick(20);
+          assert.strictEqual(made.status('o/r', commit).state, 'done', made.status('o/r', commit).error);
+          assert.strictEqual(made.fileState('o/r', commit, 'A.lean').error, 'This file is not inside a Lake project');
+          await made.idle();
+          return made;
+        };
+        // The copy stays for a while after a run, and goes when the helper stops.
+        const h3 = await runOnce({});
+        assert.strictEqual(fs.readFileSync(path.join(copy3, 'A.lean'), 'utf8'), 'def a := 1\n', 'the commit is checked out in the copy');
+        assert.strictEqual(fs.readFileSync(path.join(stateOf(cache3, 'o/r'), 'owner'), 'utf8').trim(), String(process.pid), 'and this helper is noted as using it');
+        h3.shutdown();
+        assert(!fs.existsSync(copy3) && !fs.existsSync(stateOf(cache3, 'o/r')), 'stopping removes the copy');
+        assert.deepStrictEqual(fs.readdirSync(path.join(cache3, 'work')), [], 'and the scratch folders');
+        // --tidy-after 0: it goes as soon as its run is over.
+        const h4 = await runOnce({ tidyMinutes: 0 });
+        assert(!fs.existsSync(copy3), 'removed when the run is over');
+        h4.shutdown();
+        // --keep-builds: it stays, also when the helper stops.
+        (await runOnce({ keepBuilds: true })).shutdown();
+        assert(fs.existsSync(path.join(copy3, 'A.lean')));
+        // Something else where the copy should be, a link to another checkout: the helper makes
+        // its own copy there, and leaves alone what the link points to.
+        fs.rmSync(copy3, { recursive: true, force: true });
+        const theirs = path.join(root, 'theirs');
+        fs.mkdirSync(path.join(theirs, '.git'), { recursive: true });
+        fs.writeFileSync(path.join(theirs, 'mine.txt'), 'mine');
+        fs.symlinkSync(theirs, copy3);
+        (await runOnce({ keepBuilds: true })).shutdown();
+        assert(fs.lstatSync(copy3).isDirectory(), 'a real folder now');
+        assert.strictEqual(fs.readFileSync(path.join(theirs, 'mine.txt'), 'utf8'), 'mine');
+        assert(!fs.existsSync(path.join(theirs, 'A.lean')), 'nothing was checked out through the link');
+      }
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
