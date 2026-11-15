@@ -498,6 +498,10 @@ export function createHelper(options = {}) {
     })
     : null;
 
+  // Repositories that run on this machine even so (`--here`): ones a codespace cannot serve.
+  const here = new Set(options.here || []);
+  const away = (repo) => Boolean(remote) && !here.has(repo);
+
   const repoQueues = new Map(); // repo → promise of its last job (one checkout per repository)
   const latestJob = new Map(); // repo@sha → the job last started for that commit
   const fileStates = new Map(); // repo@sha:path → {state: 'queued' | 'running' | 'error', error}
@@ -569,7 +573,7 @@ export function createHelper(options = {}) {
   function tidyWhenIdle(repo) {
     clearTimeout(tidyTimers.get(repo));
     tidyTimers.delete(repo);
-    if (remote ? keepCodespaces : keepBuilds) return;
+    if (away(repo) ? keepCodespaces : keepBuilds) return;
     const why = tidyMinutes ? `not used for ${tidyMinutes} minute${tidyMinutes === 1 ? '' : 's'}` : 'its run is over';
     const discard = () => {
       tidyTimers.delete(repo);
@@ -577,8 +581,8 @@ export function createHelper(options = {}) {
       // With Lean in a codespace there is no copy here: the codespace is what is stopped.
       const previous = repoQueues.get(repo) || Promise.resolve();
       repoQueues.set(repo, previous
-        .then(() => (active.get(repo) ? null : (remote ? remote.rest(repo, why) : discardCopy(repo, why))))
-        .catch((error) => log(`${remote ? 'The codespace' : 'The copy'} of ${repo} could not be ${remote ? 'stopped' : 'removed'}: ${error.message}`)));
+        .then(() => (active.get(repo) ? null : (away(repo) ? remote.rest(repo, why) : discardCopy(repo, why))))
+        .catch((error) => log(`${away(repo) ? 'The codespace' : 'The copy'} of ${repo} could not be ${away(repo) ? 'stopped' : 'removed'}: ${error.message}`)));
     };
     if (tidyMinutes === 0) { discard(); return; }
     const timer = setTimeout(discard, tidyMinutes * 60 * 1000);
@@ -660,8 +664,9 @@ export function createHelper(options = {}) {
       const origin = await run('git', ['-C', linked, 'remote', 'get-url', 'origin']);
       await must('git', ['-C', staging, 'remote', 'rename', 'origin', 'local']);
       await must('git', ['-C', staging, 'remote', 'add', 'origin', origin.code === 0 && origin.stdout.trim() ? origin.stdout.trim() : remote]);
-      // The build too, so Lake only rebuilds what differs at the commit being read.
-      const lakefiles = await run('git', ['-C', linked, 'ls-files', '--', 'lakefile.lean', 'lakefile.toml', '*/lakefile.lean', '*/lakefile.toml']);
+      // The build too, so Lake only rebuilds what differs at the commit being read. (Not where
+      // that build may be half made: a codespace whose own setup is still fetching it.)
+      const lakefiles = options.linkedBuilds === false ? { stdout: '' } : await run('git', ['-C', linked, 'ls-files', '--', 'lakefile.lean', 'lakefile.toml', '*/lakefile.lean', '*/lakefile.toml']);
       for (const lakefile of lakefiles.stdout.split('\n').filter(Boolean)) {
         const root = path.dirname(lakefile);
         const built = path.join(linked, root, '.lake');
@@ -903,7 +908,7 @@ export function createHelper(options = {}) {
 
   async function runJob(job) {
     job.phase = 'preparing'; // no longer waiting behind another run
-    if (remote) {
+    if (away(job.repo)) {
       // Lean runs in the repository's codespace; what comes back is kept here like any result.
       await remote.runJob(job, {
         store(file, data) {
@@ -1151,6 +1156,7 @@ Options
   --allow owner/repo        allow a repository (remembered; can be repeated)
   --link owner/repo=PATH    start from your existing checkout of a repository, so its commits
                             and its build are reused instead of downloaded (remembered)
+  --commits-only            take a linked checkout's commits, but not its build
   --keep-builds             keep each repository's copy and build between runs (about 10 GB for
                             a project that uses Mathlib). Without it they are removed after
                             --tidy-after minutes without a run, and when the helper stops
@@ -1158,6 +1164,8 @@ Options
   --codespaces              run Lean in GitHub Codespaces on your account instead of on this
                             machine: one codespace for each repository, made when you first
                             run Lean on it. Needs \`gh\`, signed in, with the codespace scope
+  --here owner/repo         with --codespaces: run this repository on this machine all the same
+                            (can be repeated). For one whose codespace cannot be set up
   --keep-codespaces         leave codespaces running when idle and when the helper stops
   --codespace-machine NAME  the machine for codespaces it creates (default basicLinux32gb, two
                             cores; standardLinux32gb has four and uses the allowance twice as fast)
@@ -1211,12 +1219,12 @@ async function main() {
     allowPositionals: true,
     options: {
       port: { type: 'string' }, cache: { type: 'string' }, builds: { type: 'string' }, jobs: { type: 'string' },
-      allow: { type: 'string', multiple: true }, link: { type: 'string', multiple: true },
+      allow: { type: 'string', multiple: true }, link: { type: 'string', multiple: true }, here: { type: 'string', multiple: true },
       subverso: { type: 'string' }, 'subverso-rev': { type: 'string' }, 'clone-base': { type: 'string' },
       repo: { type: 'string' }, sha: { type: 'string' }, pr: { type: 'string' }, 'no-sandbox': { type: 'boolean' },
       'keep-builds': { type: 'boolean' }, 'tidy-after': { type: 'string' }, all: { type: 'boolean' }, force: { type: 'boolean' },
       codespaces: { type: 'boolean' }, 'keep-codespaces': { type: 'boolean' }, gh: { type: 'string' }, 'codespace-machine': { type: 'string' },
-      stop: { type: 'boolean' }, delete: { type: 'boolean' },
+      stop: { type: 'boolean' }, delete: { type: 'boolean' }, 'commits-only': { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -1231,14 +1239,15 @@ async function main() {
   const helper = createHelper({
     cacheDir: values.cache, buildsDir: values.builds, jobs: values.jobs, subverso: values.subverso, subversoRev: values['subverso-rev'],
     cloneBase: values['clone-base'], sandbox: !values['no-sandbox'],
-    keepBuilds: values['keep-builds'], tidyMinutes: values['tidy-after'],
+    keepBuilds: values['keep-builds'], tidyMinutes: values['tidy-after'], linkedBuilds: !values['commits-only'],
     codespaces: values.codespaces ? (await import('./codespaces.mjs')).createCodespaces : null,
-    gh: values.gh, keepCodespaces: values['keep-codespaces'], machine: values['codespace-machine'],
+    gh: values.gh, keepCodespaces: values['keep-codespaces'], machine: values['codespace-machine'], here: values.here,
   });
+  for (const repo of values.here || []) if (!isRepo(repo)) throw new Error(`--here takes owner/repo, not ${repo}`);
   stop = () => { helper.shutdown(); process.exit(130); };
   if (helper.remote) await helper.remote.check(); // `gh` is there and may use codespaces
   const sandboxLine = helper.remote
-    ? 'Lean runs in GitHub Codespaces on your account, one for each repository, and not on this machine'
+    ? `Lean runs in GitHub Codespaces on your account, one for each repository, and not on this machine${(values.here || []).length ? ` (except for ${values.here.join(', ')})` : ''}`
     : `Sandbox ${{
       seatbelt: "on: the project's code runs without network access and cannot read or change your files",
       bwrap: "on: the project's code runs without network access and sees none of your files",

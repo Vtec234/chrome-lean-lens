@@ -40,6 +40,11 @@ if (args[0] === 'api') {
 } else if (!state.scope) {
   fail('error getting codespaces: HTTP 403: Must have admin rights to Repository.\nThis API operation needs the "codespace" scope. To request it, run:  gh auth refresh -h github.com -s codespace');
 } else if (args[1] === 'list') {
+  // A new codespace is "Provisioning" for as many listings as `slow` says.
+  for (const space of state.codespaces) {
+    if (space.slow > 0) { space.slow -= 1; space.state = space.slow ? 'Provisioning' : 'Available'; }
+  }
+  save(state);
   console.log(JSON.stringify(state.codespaces));
 } else if (args[1] === 'create') {
   // A repository may allow only some machines, as mathlib4 does.
@@ -47,7 +52,7 @@ if (args[0] === 'api') {
     fail(`error getting machine type: there is no such machine for the repository: ${option('--machine')}\nAvailable machines: [${state.machines.join(' ')}]`);
   }
   const name = `fake-${state.created = (state.created || state.codespaces.length) + 1}`;
-  state.codespaces.push({ name, displayName: option('--display-name'), repository: option('--repo'), state: 'Available', lastUsedAt: null, machine: option('--machine') });
+  state.codespaces.push({ name, displayName: option('--display-name'), repository: option('--repo'), state: state.slow ? 'Provisioning' : 'Available', slow: state.slow || 0, lastUsedAt: null, machine: option('--machine') });
   fs.mkdirSync(home(name), { recursive: true });
   save(state);
   console.log(name);

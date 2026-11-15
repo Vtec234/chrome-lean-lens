@@ -109,6 +109,7 @@ The sandbox guards against the obvious; it is not a guarantee. `--no-sandbox` tu
 - A tactic shows the goals **after** it. Hover the previous tactic or `by` for the goals before.
 - A tactic that contains another proof, such as `exact foo (by simp)`, shows no state of its own.
 - Files that need much compiled from source are slow in a codespace's two cores. `--codespace-machine standardLinux32gb` asks for four, at twice the cost.
+- A codespace is built from the repository's own dev container when it has one. If that setup fails, GitHub starts the codespace in recovery mode, where Lean can't run, and the helper says so. mathlib4 is such a case today: its setup runs out of disk. Run those repositories on your machine with `--here owner/repo`.
 - GitHub stops a codespace that nobody has connected to for 30 minutes. The helper keeps a running job alive, but a machine asleep for longer loses the run.
 - Tested with Lean 4.35, on macOS and in GitHub's default codespace image.
 
@@ -119,6 +120,7 @@ The sandbox guards against the obvious; it is not a guarantee. `--no-sandbox` tu
 | `--codespaces` | Run Lean in GitHub Codespaces instead of on this machine |
 | `--link owner/repo=PATH` | Start from your own built checkout of a repository |
 | `--allow owner/repo` | Allow a repository ahead of time |
+| `--here owner/repo` | With `--codespaces`: run this repository on your machine all the same |
 | `--keep-builds` | Keep builds between runs: faster next time, more disk |
 | `--keep-codespaces` | Leave codespaces running when idle and when the helper stops |
 | `--tidy-after MINUTES` | How long an unused build or codespace stays (default 30) |

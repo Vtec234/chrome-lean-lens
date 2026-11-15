@@ -1732,7 +1732,7 @@ console.log("22. Testing real Lean data (the local helper)...");
       const boot = cs.bootstrapScript({ files: { 'a.mjs': "it's here" }, token: 'tok-1', repo: 'o/r', port: 6000, sandbox: false, cloneBase: 'file:///x y/' });
       assert(boot.includes(`put 'a.mjs' '${Buffer.from("it's here").toString('base64')}'`), 'the helper\'s files travel with it');
       assert(boot.includes('--port 6000') && boot.includes("--allow 'o/r'") && boot.includes('--no-sandbox') && boot.includes("--clone-base 'file:///x y/'"), boot);
-      assert(boot.includes('/workspaces/r}}"') && boot.includes(`--link 'o/r='"$CHECKOUT"`), 'it starts from the codespace\'s own checkout');
+      assert(boot.includes('/workspaces/r}}"') && boot.includes(`--commits-only --link 'o/r='"$CHECKOUT"`), 'it starts from the commits of the codespace\'s own checkout');
       assert(!cs.bootstrapScript({ files: {}, token: 't', repo: 'o/r' }).includes('--no-sandbox'));
       if (spawnSync('bash', ['--version']).status === 0) {
         assert.strictEqual(spawnSync('bash', ['-n'], { input: boot, encoding: 'utf8' }).status, 0, 'the script is valid bash');
@@ -2010,6 +2010,42 @@ console.log("22. Testing real Lean data (the local helper)...");
             await finish(h13, commit);
             assert(/no such machine for the repository: largeLinux/.test(h13.status('o/r', commit).error), h13.status('o/r', commit).error);
             h13.shutdown();
+            // GitHub may take long to set a codespace up (a repository's own dev container): the
+            // helper waits. If that setup failed, GitHub starts the codespace in recovery mode,
+            // where Lean cannot run: the helper says so, stops it, and names the way out.
+            fake = fakeState();
+            delete fake.machines;
+            fake.slow = 3;
+            fs.writeFileSync(path.join(fakeDir, 'state.json'), JSON.stringify(fake));
+            const h14 = withCodespaces({ retryMs: 10 });
+            h14.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+            await finish(h14, commit);
+            assert.strictEqual(h14.status('o/r', commit).state, 'done', h14.status('o/r', commit).error);
+            assert(heard.some((message) => message.includes('Waiting for GitHub to set up the codespace')), heard.join(' | '));
+            h14.shutdown();
+            fs.writeFileSync(path.join(root, 'recovery-reason'), 'Error code: 1302 (UnifiedContainersErrorFatalCreatingContainer)');
+            process.env.LEAN_LENS_RECOVERY_FILE = path.join(root, 'recovery-reason');
+            try {
+              const h15 = withCodespaces({ retryMs: 10 });
+              h15.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+              await finish(h15, commit);
+              const refusal = h15.status('o/r', commit).error;
+              assert(/recovery mode/.test(refusal) && /Error code: 1302/.test(refusal) && /--here o\/r/.test(refusal), refusal);
+              assert.strictEqual(fakeState().codespaces.find((space) => space.displayName === 'Lean Lens r').state, 'Shutdown', 'not left running');
+              h15.shutdown();
+              // --here: that repository runs on this machine, whatever its codespace is like.
+              const creations = fakeState().calls.filter((call) => call === 'codespace ssh').length;
+              const h16 = withCodespaces({ here: ['o/r'], keepBuilds: true });
+              h16.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+              await finish(h16, commit);
+              assert.strictEqual(h16.fileState('o/r', commit, 'A.lean').error, 'This file is not inside a Lake project');
+              assert(fs.existsSync(path.join(here, 'repos', 'o', 'r', 'A.lean')), 'its copy is on this machine');
+              assert.strictEqual(fakeState().calls.filter((call) => call === 'codespace ssh').length, creations, 'and no codespace was touched');
+              h16.shutdown();
+              fs.rmSync(path.join(here, 'repos'), { recursive: true, force: true });
+            } finally {
+              delete process.env.LEAN_LENS_RECOVERY_FILE;
+            }
             // Without the scope, it says what to run.
             fake = fakeState();
             fake.scope = false;

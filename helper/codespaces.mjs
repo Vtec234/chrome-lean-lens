@@ -71,6 +71,10 @@ umask 077
 say() { printf 'LEANLENS %s\\n' "$*"; }
 fail() { printf 'LEANLENS-ERROR %s\\n' "$*"; exit 1; }
 fetch() { if command -v curl >/dev/null 2>&1; then curl -fsSL "$1"; else wget -qO- "$1"; fi; }
+# When a repository's own dev container cannot be set up, GitHub starts the codespace in
+# "recovery mode": a bare container in which Lean cannot be installed.
+RECOVERY="\${LEAN_LENS_RECOVERY_FILE:-/workspaces/.codespaces/.persistedshare/RECOVERY-REASON-FILE}"
+[ -f "$RECOVERY" ] && fail "RECOVERY $(head -c 160 "$RECOVERY" | tr '\n' ' ')"
 DIR="$HOME/.lean-lens"
 mkdir -p "$DIR/cache" && cd "$DIR" || fail "cannot use $DIR"
 
@@ -122,10 +126,11 @@ if [ -z "\${LEAN_LENS_SKIP_INSTALL:-}" ] && [ "$(free /tmp)" -gt "$(free "$DIR")
   mkdir -p "$BUILDS" && [ -O "$BUILDS" ] && [ ! -L "$BUILDS" ] || fail "cannot use $BUILDS"
 fi
 
-# The codespace's own checkout is where the helper's copy starts from.
+# The codespace's own checkout is where the helper's copy starts from: its commits, not its
+# build, which the codespace's own setup may still be fetching (mathlib4's does that).
 CHECKOUT="\${LEAN_LENS_CHECKOUT:-\${CODESPACE_VSCODE_FOLDER:-/workspaces/${repo.split('/')[1]}}}"
 set -- "$DIR/lean-lens-helper.mjs" --port ${Number(port)} --cache "$DIR/cache" --builds "$BUILDS" $KEEP --allow ${quote(repo)}${sandbox ? '' : ' --no-sandbox'}${cloneBase ? ` --clone-base ${quote(cloneBase)}` : ''}
-[ -d "$CHECKOUT/.git" ] && set -- "$@" --link ${quote(`${repo}=`)}"$CHECKOUT"
+[ -d "$CHECKOUT/.git" ] && set -- "$@" --commits-only --link ${quote(`${repo}=`)}"$CHECKOUT"
 
 answers() { "$NODE" -e '${status}' "http://127.0.0.1:${Number(port)}/status" ${quote(token)} 2>/dev/null; }
 
@@ -271,6 +276,11 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
     const ready = result.stdout.match(/^LEANLENS READY (.*)$/m);
     if (!ready) {
       const failed = result.stdout.match(/^LEANLENS-ERROR (.*)$/m);
+      if (failed && failed[1].startsWith('RECOVERY')) {
+        const error = new Error(`GitHub could not set up ${repo}'s own dev container, and started the codespace in recovery mode, where Lean cannot be installed (${failed[1].slice(9).trim() || 'no reason given'}). To run this repository on your machine instead, start the helper with --here ${repo}.`);
+        error.recovery = true;
+        throw error;
+      }
       throw new Error(failed ? `The helper could not be started in the codespace: ${failed[1]}` : explain(result));
     }
     return JSON.parse(ready[1]);
@@ -323,8 +333,20 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
     const token = known && known.name === space.name && typeof known.token === 'string' ? known.token : randomBytes(24).toString('base64url');
     config.codespaces[repo] = { name: space.name, token };
     save();
+    // A repository's own dev container can take many minutes to build, longer than gh waits
+    // when asked to connect. So the wait is here.
+    for (let waited = 0; waited < 45 * 60 * 1000; waited += retryMs) {
+      const now = (await list()).find((entry) => entry.name === space.name);
+      if (!now || now.state !== 'Provisioning') break;
+      if (!waited) say(`Waiting for GitHub to set up the codespace ${space.name}`);
+      await sleep(retryMs);
+    }
     say(space.state === 'Available' ? `Setting up Lean in the codespace ${space.name}` : `Starting the codespace ${space.name}`);
-    const status = await boot(space.name, repo, token, say);
+    const status = await boot(space.name, repo, token, say).catch(async (error) => {
+      // A codespace in recovery mode is of no use: it is stopped rather than left running.
+      if (error.recovery) await run(gh, ['codespace', 'stop', '-c', space.name], { timeoutMs: 3 * 60 * 1000 });
+      throw error;
+    });
     if (!confines(status.sandbox)) {
       if (sandbox && await canPush(repo)) {
         await run(gh, ['codespace', 'ssh', '-c', space.name, '--', STOP_COMMAND], { timeoutMs: 60 * 1000 });
