@@ -97,8 +97,11 @@ document.addEventListener('DOMContentLoaded', () => {
       { action: "TEST_HELPER", url: helperUrl.value.trim(), token: helperToken.value.trim() },
       (res) => {
         if (res && res.success) {
-          const allowed = (res.details && res.details.allow) || [];
-          const sandbox = res.details && res.details.sandbox === 'seatbelt' ? 'Sandbox on.' : 'No sandbox: Lean runs with your permissions.';
+          const details = res.details || {};
+          const allowed = details.allow || [];
+          const sandbox = details.runs === 'codespaces'
+            ? 'Lean runs in GitHub Codespaces, not on this machine.'
+            : (details.sandbox === 'seatbelt' || details.sandbox === 'bwrap' ? 'Sandbox on.' : 'No sandbox: Lean runs with your permissions.');
           helperTestResult.textContent = `✓ Connected. ${sandbox} Allowed repositories: ${allowed.length ? allowed.join(', ') : 'none yet'}.`;
           helperTestResult.style.color = '#3fb950';
         } else if (res && res.state === 'unauthorized') {

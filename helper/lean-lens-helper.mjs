@@ -9,6 +9,7 @@
 //   node lean-lens-helper.mjs [--port 5326] [--allow owner/repo] [--link owner/repo=/checkout]
 //   node lean-lens-helper.mjs run --repo owner/repo --sha <commit> [--pr N] File.lean …
 //   node lean-lens-helper.mjs clean [--all]
+//   node lean-lens-helper.mjs --codespaces        Lean runs in GitHub Codespaces, not here
 //
 // Elaborating a Lean file runs the code in it. The helper therefore only works on repositories
 // you have allowed, only when asked with its token, and never on its own initiative. On macOS
@@ -21,13 +22,13 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
-  chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, rmdirSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmSync, rmdirSync,
   statfsSync, writeFileSync,
 } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { availableParallelism, homedir } from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 import { DATA_FORMAT_VERSION, convertModule } from './convert.mjs';
@@ -200,16 +201,23 @@ export function stopCommands() {
   for (const child of runningCommands) stopCommand(child);
 }
 
-/** Run a command (never through a shell). Resolves to `{code, stdout, stderr}`. */
-function run(command, args, { cwd, env, onLine, timeoutMs } = {}) {
+/**
+ * Run a command (never through a shell). Resolves to `{code, stdout, stderr}`. `input`, when
+ * given, is what the command reads on its standard input.
+ */
+function run(command, args, { cwd, env, input, onLine, timeoutMs } = {}) {
   return new Promise((resolve) => {
     const child = spawn(command, args, {
       cwd,
       env: env || { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       detached: true, // its own process group: see `stopCommand`
     });
     runningCommands.add(child);
+    if (input !== undefined) {
+      child.stdin.on('error', () => { /* it stopped reading: how it ends says why */ });
+      child.stdin.end(input);
+    }
     const kept = { stdout: '', stderr: '' };
     const feed = (which) => (chunk) => {
       const text = chunk.toString('utf8');
@@ -306,8 +314,52 @@ export function seatbeltProfile({ network = false, readable = [], writable = [],
   ].join('\n');
 }
 
-/** How this machine can confine a command: 'seatbelt' (macOS), or null when it can't. */
+/** The system folders a confined command needs on Linux, as `bwrap` arguments. */
+function linuxSystem() {
+  const args = ['--ro-bind', '/usr', '/usr'];
+  // `/bin`, `/lib` and the like are links into `/usr` on most systems, and folders on some.
+  for (const dir of ['/bin', '/sbin', '/lib', '/lib32', '/lib64', '/libx32']) {
+    const stat = kind(dir);
+    if (stat && stat.isSymbolicLink()) args.push('--symlink', readlinkSync(dir), dir);
+    else if (stat) args.push('--ro-bind', dir, dir);
+  }
+  // Of `/etc`, what programs need to find names, certificates and libraries. Not the rest:
+  // a machine's settings can hold secrets.
+  for (const name of ['resolv.conf', 'hosts', 'nsswitch.conf', 'passwd', 'group', 'ssl', 'ca-certificates', 'ca-certificates.conf', 'pki',
+    'ld.so.cache', 'ld.so.conf', 'ld.so.conf.d', 'alternatives', 'localtime']) {
+    args.push('--ro-bind-try', `/etc/${name}`, `/etc/${name}`);
+  }
+  return args;
+}
+
+/**
+ * The same confinement on Linux, as arguments for `bwrap` (bubblewrap). The command gets a
+ * file system of its own, made of the system folders and the `readable` paths, all read-only,
+ * and the `writable` ones, with the `guarded` paths in them read-only. Nothing else exists
+ * for it: no home folder, no other checkout, no credentials. It sees only its own processes,
+ * and has no network unless `network` is set.
+ */
+export function bwrapArgs({ network = false, readable = [], writable = [], guarded = [], cwd = null, system = linuxSystem() } = {}) {
+  return [
+    '--unshare-all', ...(network ? ['--share-net'] : []), '--die-with-parent', '--new-session',
+    '--proc', '/proc', '--dev', '/dev',
+    ...system,
+    ...readable.flatMap((target) => ['--ro-bind', target, target]),
+    ...writable.flatMap((target) => ['--bind', target, target]),
+    ...guarded.flatMap((target) => ['--ro-bind-try', target, target]),
+    // What was put there above is all there is. The rest of this file system is empty, and
+    // made read-only: it lives in memory, and without this a command could write there at will.
+    '--remount-ro', '/',
+    ...(cwd ? ['--chdir', cwd] : []),
+  ];
+}
+
+/** How this machine can confine a command: 'seatbelt' (macOS), 'bwrap' (Linux), or null when it can't. */
 async function detectSandbox() {
+  if (process.platform === 'linux') {
+    const probe = await run('bwrap', [...bwrapArgs(), '--', 'true']);
+    return probe.code === 0 ? 'bwrap' : null;
+  }
   if (process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec')) return null;
   const probe = await run('/usr/bin/sandbox-exec', ['-p', seatbeltProfile({ readable: ['/usr/bin'] }), '/usr/bin/true']);
   return probe.code === 0 ? 'seatbelt' : null;
@@ -368,18 +420,19 @@ const CACHE_PARTS = [
  * Resolves to `{removed: [{what, bytes}], bytes, freed, toolchains}`: `bytes` is what `du`
  * counted, `freed` how much free space the disk gained (or null when the system doesn't say).
  */
-export async function cleanCache(cacheDir, { results = false, force = false } = {}) {
+export async function cleanCache(cacheDir, { results = false, force = false, buildsDir = null } = {}) {
   const dir = path.resolve(cacheDir || defaultCacheDir());
+  const dirs = [...new Set([dir, path.resolve(buildsDir || dir)])];
   const { config, save } = loadConfig(dir);
-  const users = [...new Set(entries(path.join(dir, 'state')).map((name) => ownerIn(path.join(dir, 'state', name))))]
+  const users = [...new Set(dirs.flatMap((at) => entries(path.join(at, 'state')).map((name) => ownerIn(path.join(at, 'state', name)))))]
     .filter((pid) => pid !== null && pid !== process.pid);
   if (users.length && !force) {
     throw new Error(`A helper is running and using these files (process ${users.join(', ')}). Stop it first, which removes the builds, or pass --force.`);
   }
   const before = freeBytes(dir);
   const removed = [];
-  for (const [name, what] of [...CACHE_PARTS, ...(results ? [['data', 'results of earlier runs']] : [])]) {
-    const target = path.join(dir, name);
+  const parts = dirs.flatMap((at) => CACHE_PARTS.map(([name, what]) => [path.join(at, name), what]));
+  for (const [target, what] of [...parts, ...(results ? [[path.join(dir, 'data'), 'results of earlier runs']] : [])]) {
     if (!kind(target)) continue;
     const bytes = holdsFiles(target) ? await sizeOf(target) : 0;
     rmSync(target, { recursive: true, force: true });
@@ -405,12 +458,15 @@ export async function cleanCache(cacheDir, { results = false, force = false } = 
 // The helper itself.
 
 /**
- * @param {object} options `{cacheDir, jobs, subverso, subversoRev, cloneBase, sandbox,
+ * @param {object} options `{cacheDir, buildsDir, jobs, subverso, subversoRev, cloneBase, sandbox,
  *   keepBuilds, tidyMinutes, log}`
  * @returns `{config, allow, link, start, status, fileState, readData, handle, sandbox, idle, shutdown}`
  */
 export function createHelper(options = {}) {
   const cacheDir = path.resolve(options.cacheDir || defaultCacheDir());
+  // Where repositories' copies, their builds and scratch files go: the large, short-lived part.
+  // In the cache folder unless another place suits it better (a codespace's temporary disk).
+  const buildsDir = path.resolve(options.buildsDir || cacheDir);
   const { config, save } = loadConfig(cacheDir);
   const log = options.log || ((message) => console.log(`[${new Date().toTimeString().slice(0, 8)}] ${message}`));
   const poolSize = Math.max(1, Number(options.jobs) || Math.min(4, Math.ceil(availableParallelism() / 2)));
@@ -427,15 +483,25 @@ export function createHelper(options = {}) {
     ? detectSandbox().then((found) => { sandboxState = found || 'none'; return found; })
     : Promise.resolve(null);
 
+  // Lean in codespaces instead of here (see codespaces.mjs, whose `createCodespaces` is passed in).
+  const keepCodespaces = Boolean(options.keepCodespaces);
+  const remote = options.codespaces
+    ? options.codespaces({
+      config, save, run, log, gh: options.gh, sandbox: sandboxWanted, keep: keepCodespaces,
+      remotePort: options.remotePort, cloneBase: options.cloneBase, pollMs: options.pollMs, keepAliveMs: options.keepAliveMs, retryMs: options.retryMs,
+      machine: options.machine,
+    })
+    : null;
+
   const repoQueues = new Map(); // repo → promise of its last job (one checkout per repository)
   const latestJob = new Map(); // repo@sha → the job last started for that commit
   const fileStates = new Map(); // repo@sha:path → {state: 'queued' | 'running' | 'error', error}
   const extractorBuilds = new Map(); // directory → promise of the extractor binary
 
-  const repoDir = (repo) => path.join(cacheDir, 'repos', ...repo.split('/'));
+  const repoDir = (repo) => path.join(buildsDir, 'repos', ...repo.split('/'));
   // Scratch folders, one per run, named after this process so that a later helper can tell
   // which ones were left behind.
-  const workRoot = path.join(cacheDir, 'work');
+  const workRoot = path.join(buildsDir, 'work');
   const scratchDir = (label) => ownDir(path.join(workRoot, `${process.pid}-${label}`));
   // Results are kept by data format, so a newer helper never serves an older format.
   const dataFile = (repo, sha, file) => path.join(cacheDir, 'data', `v${DATA_FORMAT_VERSION}`, ...repo.split('/'), sha, `${file}.json`);
@@ -466,8 +532,8 @@ export function createHelper(options = {}) {
 
   /** Note that this helper is the one using a repository's copy. */
   function claim(repo) {
-    mkdirSync(stateDirOf(cacheDir, repo), { recursive: true });
-    writeFileSync(path.join(stateDirOf(cacheDir, repo), 'owner'), `${process.pid}\n`);
+    mkdirSync(stateDirOf(buildsDir, repo), { recursive: true });
+    writeFileSync(path.join(stateDirOf(buildsDir, repo), 'owner'), `${process.pid}\n`);
     owned.add(repo);
   }
 
@@ -477,7 +543,7 @@ export function createHelper(options = {}) {
     if (why && kind(dir)) log(`Removing the copy of ${repo} and its build (${why}). The results stay.`);
     rmSync(dir, { recursive: true, force: true });
     try { rmdirSync(path.dirname(dir)); } catch { /* other repositories of that owner are there */ }
-    rmSync(stateDirOf(cacheDir, repo), { recursive: true, force: true });
+    rmSync(stateDirOf(buildsDir, repo), { recursive: true, force: true });
     owned.delete(repo);
   }
 
@@ -498,15 +564,16 @@ export function createHelper(options = {}) {
   function tidyWhenIdle(repo) {
     clearTimeout(tidyTimers.get(repo));
     tidyTimers.delete(repo);
-    if (keepBuilds) return;
+    if (remote ? keepCodespaces : keepBuilds) return;
     const why = tidyMinutes ? `not used for ${tidyMinutes} minute${tidyMinutes === 1 ? '' : 's'}` : 'its run is over';
     const discard = () => {
       tidyTimers.delete(repo);
       // Queued like a run, so a run started meanwhile waits for it and then makes a fresh copy.
+      // With Lean in a codespace there is no copy here: the codespace is what is stopped.
       const previous = repoQueues.get(repo) || Promise.resolve();
       repoQueues.set(repo, previous
-        .then(() => (active.get(repo) ? null : discardCopy(repo, why)))
-        .catch((error) => log(`The copy of ${repo} could not be removed: ${error.message}`)));
+        .then(() => (active.get(repo) ? null : (remote ? remote.rest(repo, why) : discardCopy(repo, why))))
+        .catch((error) => log(`${remote ? 'The codespace' : 'The copy'} of ${repo} could not be ${remote ? 'stopped' : 'removed'}: ${error.message}`)));
     };
     if (tidyMinutes === 0) { discard(); return; }
     const timer = setTimeout(discard, tidyMinutes * 60 * 1000);
@@ -522,11 +589,11 @@ export function createHelper(options = {}) {
     // Scratch folders of earlier versions, which kept them between runs.
     for (const name of ['home', 'tmp']) rmSync(path.join(cacheDir, name), { recursive: true, force: true });
     if (keepBuilds) return;
-    const repos = path.join(cacheDir, 'repos');
+    const repos = path.join(buildsDir, 'repos');
     for (const owner of entries(repos)) {
       for (const name of entries(path.join(repos, owner))) {
         const repo = `${owner}/${name}`;
-        if (isRepo(repo) && ownerIn(stateDirOf(cacheDir, repo)) === null) forgetCopy(repo, 'no running helper is using it');
+        if (isRepo(repo) && ownerIn(stateDirOf(buildsDir, repo)) === null) forgetCopy(repo, 'no running helper is using it');
       }
       try { rmdirSync(path.join(repos, owner)); } catch { /* still in use */ }
     }
@@ -537,6 +604,7 @@ export function createHelper(options = {}) {
     for (const timer of tidyTimers.values()) clearTimeout(timer);
     tidyTimers.clear();
     stopCommands();
+    if (remote) remote.shutdown();
     if (!keepBuilds) for (const repo of [...owned]) forgetCopy(repo, 'the helper is stopping');
     for (const name of entries(workRoot)) {
       if (name.startsWith(`${process.pid}-`)) rmSync(path.join(workRoot, name), { recursive: true, force: true });
@@ -558,9 +626,9 @@ export function createHelper(options = {}) {
   const depsStamp = (root) => sha256(['lean-toolchain', 'lake-manifest.json', 'lakefile.lean', 'lakefile.toml']
     .map((name) => { try { return readFileSync(path.join(root, name), 'utf8'); } catch { return ''; } }).join('\0'));
   // Which dependencies a project's copy was last prepared for.
-  const stampFile = (repo, rootDir) => path.join(stateDirOf(cacheDir, repo), `${sha256(rootDir === '.' ? '' : rootDir).slice(0, 32)}.deps`);
+  const stampFile = (repo, rootDir) => path.join(stateDirOf(buildsDir, repo), `${sha256(rootDir === '.' ? '' : rootDir).slice(0, 32)}.deps`);
   const writeStamp = (repo, rootDir, stamp) => {
-    mkdirSync(stateDirOf(cacheDir, repo), { recursive: true });
+    mkdirSync(stateDirOf(buildsDir, repo), { recursive: true });
     writeFileSync(stampFile(repo, rootDir), stamp);
   };
 
@@ -650,17 +718,21 @@ export function createHelper(options = {}) {
       GIT_TERMINAL_PROMPT: '0',
       ...extra,
     };
-    if ((await sandboxKind) !== 'seatbelt') return run(command, args, { cwd, env, onLine, timeoutMs });
+    const confinement = await sandboxKind;
+    if (!confinement) return run(command, args, { cwd, env, onLine, timeoutMs });
     const allowed = [home, temporary, ...writable].map(realOrSame);
-    const profile = seatbeltProfile({
+    const limits = {
       network,
       readable: [...(toolchain ? [toolchain.root] : []), ...readable].map(realOrSame),
       writable: allowed,
       // A checkout's own `.git` stays as it is: the helper runs `git` there later, outside the
       // sandbox, and a hook or setting planted now would run then.
       guarded: allowed.map((target) => path.join(target, '.git')),
-    });
-    return run('/usr/bin/sandbox-exec', ['-p', profile, command, ...args], { cwd, env, onLine, timeoutMs });
+    };
+    if (confinement === 'bwrap') {
+      return run('bwrap', [...bwrapArgs({ ...limits, cwd: cwd ? realOrSame(cwd) : null }), '--', command, ...args], { cwd, env, onLine, timeoutMs });
+    }
+    return run('/usr/bin/sandbox-exec', ['-p', seatbeltProfile(limits), command, ...args], { cwd, env, onLine, timeoutMs });
   }
 
   /**
@@ -670,13 +742,21 @@ export function createHelper(options = {}) {
    */
   async function resolveToolchain(root, job) {
     const name = toolchainOf(root);
-    let found = await run('elan', ['which', 'lake'], { cwd: root });
-    if (found.code !== 0 && found.code !== -1) {
+    // elan installs a missing version by itself, without a word, the moment it is asked about
+    // it. So the helper looks first, says what is happening, and notes what it brought in.
+    const versions = async () => {
+      const listed = await run('elan', ['toolchain', 'list']);
+      return listed.code === 0 ? listed.stdout.split('\n').map((line) => line.trim().split(/\s+/)[0]).filter(Boolean) : null;
+    };
+    const before = await versions();
+    if (before && !before.includes(name)) {
       job.say(`Installing ${name} (about 3 GB)`);
       await must('elan', ['toolchain', 'install', name], { onLine: (line) => job.progress(line) });
-      if (!config.toolchains.includes(name)) { config.toolchains.push(name); save(); }
-      found = await must('elan', ['which', 'lake'], { cwd: root });
+      for (const added of (await versions() || []).filter((version) => !before.includes(version))) {
+        if (!config.toolchains.includes(added)) { config.toolchains.push(added); save(); }
+      }
     }
+    let found = await run('elan', ['which', 'lake'], { cwd: root });
     // Without elan, whichever `lake` is installed.
     if (found.code !== 0) found = await must('/usr/bin/which', ['lake']);
     const lake = realOrSame(found.stdout.trim().split('\n').pop());
@@ -811,6 +891,20 @@ export function createHelper(options = {}) {
   }
 
   async function runJob(job) {
+    job.phase = 'preparing'; // no longer waiting behind another run
+    if (remote) {
+      // Lean runs in the repository's codespace; what comes back is kept here like any result.
+      await remote.runJob(job, {
+        store(file, data) {
+          const target = dataFile(job.repo, job.sha, file);
+          mkdirSync(path.dirname(target), { recursive: true });
+          writeFileSync(target, JSON.stringify(data));
+          fileStates.delete(fileKey(job.repo, job.sha, file));
+        },
+        fail(file, error) { fileStates.set(fileKey(job.repo, job.sha, file), { state: 'error', error }); },
+      });
+      return;
+    }
     const workDir = scratchDir(randomBytes(6).toString('hex'));
     try {
       const dir = await ensureRepo(job, workDir);
@@ -922,7 +1016,10 @@ export function createHelper(options = {}) {
     const { pathname, searchParams } = new URL(url, 'http://127.0.0.1');
     const request = body || {};
     if (method === 'GET' && pathname === '/status') {
-      return json(200, { ok: true, name: 'lean-lens-helper', version: HELPER_VERSION, format: DATA_FORMAT_VERSION, allow: config.allow, sandbox: sandboxState });
+      return json(200, {
+        ok: true, name: 'lean-lens-helper', version: HELPER_VERSION, format: DATA_FORMAT_VERSION, allow: config.allow, sandbox: sandboxState,
+        runs: remote ? 'codespaces' : 'here',
+      });
     }
     if (method === 'POST' && pathname === '/allow') {
       if (!isRepo(request.repo)) return json(400, { error: 'Bad repository name' });
@@ -953,7 +1050,7 @@ export function createHelper(options = {}) {
   const sandbox = () => sandboxKind.then(() => sandboxState);
 
   sweep();
-  return { cacheDir, config, allow, link, start, status, fileState, readData, handle, poolSize, sandbox, keepBuilds, tidyMinutes, idle, shutdown };
+  return { cacheDir, buildsDir, config, allow, link, start, status, fileState, readData, handle, poolSize, sandbox, keepBuilds, keepCodespaces, tidyMinutes, remote, idle, shutdown };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1035,6 +1132,8 @@ const USAGE = `Lean Lens helper: real Lean hovers and proof states for the exten
                                                        elaborate files once, without the extension
   node lean-lens-helper.mjs clean [--all]              remove what the helper keeps on disk
                                                        (--all: the results of earlier runs too)
+  node lean-lens-helper.mjs codespaces [--stop | --delete]
+                                                       list, stop or delete the codespaces it made
 
 Options
   --port N                  port on 127.0.0.1 (default ${DEFAULT_PORT})
@@ -1045,7 +1144,17 @@ Options
                             a project that uses Mathlib). Without it they are removed after
                             --tidy-after minutes without a run, and when the helper stops
   --tidy-after MINUTES      how long an unused build stays (default ${DEFAULT_TIDY_MINUTES}; 0: until its run is over)
-  --cache DIR               where clones, builds and results are kept
+  --codespaces              run Lean in GitHub Codespaces on your account instead of on this
+                            machine: one codespace for each repository, made when you first
+                            run Lean on it. Needs \`gh\`, signed in, with the codespace scope
+  --keep-codespaces         leave codespaces running when idle and when the helper stops
+  --codespace-machine NAME  the machine for codespaces it creates (default basicLinux32gb, two
+                            cores; standardLinux32gb has four and uses the allowance twice as fast)
+  --gh PATH                 the \`gh\` program to use
+  --cache DIR               where settings, results and (unless --builds says otherwise) clones
+                            and builds are kept
+  --builds DIR              where clones and builds go instead: the large part, which is removed
+                            again (see --keep-builds)
   --jobs N                  files elaborated at once
   --subverso URL-or-PATH    where to get SubVerso (default ${DEFAULT_SUBVERSO})
   --subverso-rev REV        SubVerso revision to build
@@ -1054,7 +1163,7 @@ Options
 `;
 
 async function clean(values) {
-  const result = await cleanCache(values.cache, { results: values.all, force: values.force });
+  const result = await cleanCache(values.cache, { results: values.all, force: values.force, buildsDir: values.builds });
   if (!result.removed.length) {
     console.log(`Nothing to remove in ${result.dir}.`);
   } else {
@@ -1067,15 +1176,36 @@ async function clean(values) {
   console.log(values.all ? 'The settings are kept.' : 'The settings and the results of earlier runs are kept (`clean --all` removes the results too).');
 }
 
+async function codespacesCommand(values) {
+  const { createCodespaces } = await import('./codespaces.mjs');
+  const { config, save } = loadConfig(path.resolve(values.cache || defaultCacheDir()));
+  const spaces = createCodespaces({ config, save, run, log: console.log, gh: values.gh });
+  const ours = await spaces.ours();
+  if (!ours.length) console.log('There are no Lean Lens codespaces.');
+  for (const space of ours) {
+    if (values.delete) {
+      await spaces.remove(space.name);
+      console.log(`Deleted ${space.name} (${space.repository})`);
+    } else if (values.stop && space.state !== 'Shutdown') {
+      await spaces.stop(space.name);
+      console.log(`Stopped ${space.name} (${space.repository})`);
+    } else {
+      console.log(`${space.name}  ${space.repository}  ${space.state}  last used ${space.lastUsedAt || 'never'}`);
+    }
+  }
+}
+
 async function main() {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
     options: {
-      port: { type: 'string' }, cache: { type: 'string' }, jobs: { type: 'string' },
+      port: { type: 'string' }, cache: { type: 'string' }, builds: { type: 'string' }, jobs: { type: 'string' },
       allow: { type: 'string', multiple: true }, link: { type: 'string', multiple: true },
       subverso: { type: 'string' }, 'subverso-rev': { type: 'string' }, 'clone-base': { type: 'string' },
       repo: { type: 'string' }, sha: { type: 'string' }, pr: { type: 'string' }, 'no-sandbox': { type: 'boolean' },
       'keep-builds': { type: 'boolean' }, 'tidy-after': { type: 'string' }, all: { type: 'boolean' }, force: { type: 'boolean' },
+      codespaces: { type: 'boolean' }, 'keep-codespaces': { type: 'boolean' }, gh: { type: 'string' }, 'codespace-machine': { type: 'string' },
+      stop: { type: 'boolean' }, delete: { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -1085,18 +1215,25 @@ async function main() {
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => stop());
 
   if (positionals[0] === 'clean') { await clean(values); return; }
+  if (positionals[0] === 'codespaces') { await codespacesCommand(values); return; }
 
   const helper = createHelper({
-    cacheDir: values.cache, jobs: values.jobs, subverso: values.subverso, subversoRev: values['subverso-rev'],
+    cacheDir: values.cache, buildsDir: values.builds, jobs: values.jobs, subverso: values.subverso, subversoRev: values['subverso-rev'],
     cloneBase: values['clone-base'], sandbox: !values['no-sandbox'],
     keepBuilds: values['keep-builds'], tidyMinutes: values['tidy-after'],
+    codespaces: values.codespaces ? (await import('./codespaces.mjs')).createCodespaces : null,
+    gh: values.gh, keepCodespaces: values['keep-codespaces'], machine: values['codespace-machine'],
   });
   stop = () => { helper.shutdown(); process.exit(130); };
-  const sandboxLine = {
-    seatbelt: "on: the project's code runs without network access and cannot read or change your files",
-    none: 'not available on this system: Lean runs with your permissions',
-    off: 'off (--no-sandbox): Lean runs with your permissions',
-  }[await helper.sandbox()];
+  if (helper.remote) await helper.remote.check(); // `gh` is there and may use codespaces
+  const sandboxLine = helper.remote
+    ? 'Lean runs in GitHub Codespaces on your account, one for each repository, and not on this machine'
+    : `Sandbox ${{
+      seatbelt: "on: the project's code runs without network access and cannot read or change your files",
+      bwrap: "on: the project's code runs without network access and sees none of your files",
+      none: 'not available on this system: Lean runs with your permissions',
+      off: 'off (--no-sandbox): Lean runs with your permissions',
+    }[await helper.sandbox()]}`;
   for (const entry of values.link || []) {
     const split = entry.indexOf('=');
     if (split < 1) throw new Error(`--link takes owner/repo=PATH, not ${entry}`);
@@ -1110,7 +1247,7 @@ async function main() {
       throw new Error('run needs --repo owner/repo, --sha with a full commit hash, and Lean files');
     }
     helper.allow(values.repo);
-    console.log(`Sandbox ${sandboxLine}`);
+    console.log(sandboxLine);
     helper.start({ repo: values.repo, sha: values.sha, pr: Number(values.pr) || null, paths });
     await new Promise((resolve) => {
       const poll = setInterval(() => {
@@ -1133,7 +1270,9 @@ async function main() {
   const port = Number(values.port) || DEFAULT_PORT;
   const server = await serve(helper, port);
   stop = () => {
-    console.log(`\nStopping.${helper.keepBuilds ? '' : ' Removing the builds; the results stay.'}`);
+    console.log(`\nStopping.${helper.remote
+      ? (helper.keepCodespaces ? '' : ' Stopping the codespaces that were used; the results stay here.')
+      : (helper.keepBuilds ? '' : ' Removing the builds; the results stay.')}`);
     server.close();
     helper.shutdown();
     process.exit(0);
@@ -1145,16 +1284,22 @@ async function main() {
   Token    ${helper.config.token}
 
 Paste both into the extension's options, under "Real Lean".
-Sandbox ${sandboxLine}.
+${sandboxLine}.
 Allowed repositories: ${helper.config.allow.length ? helper.config.allow.join(', ') : 'none yet (allow one from the extension, or with --allow owner/repo)'}
-Kept in: ${helper.cacheDir} (${formatBytes(await sizeOf(helper.cacheDir))} now)
-Builds: ${helper.keepBuilds
-    ? 'kept between runs (--keep-builds). `clean` removes them.'
-    : `a repository's copy and build are removed ${helper.tidyMinutes ? `after ${minutes} without a run` : 'when its run is over'}, and when the helper stops. The results stay.`}
+Kept in: ${helper.cacheDir} (${formatBytes(await sizeOf(helper.cacheDir))} now)${helper.buildsDir === helper.cacheDir ? '' : `\nBuilds go to: ${helper.buildsDir}`}
+${helper.remote
+    ? `Codespaces: ${helper.keepCodespaces
+      ? 'left running (--keep-codespaces); GitHub stops an idle one by itself.'
+      : `one is stopped ${helper.tidyMinutes ? `after ${minutes} without a run` : 'when its run is over'}, and when the helper stops. The results are kept here.`}`
+    : `Builds: ${helper.keepBuilds
+      ? 'kept between runs (--keep-builds). `clean` removes them.'
+      : `a repository's copy and build are removed ${helper.tidyMinutes ? `after ${minutes} without a run` : 'when its run is over'}, and when the helper stops. The results stay.`}`}
 `);
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Run as a program (not imported): compared by real path, since Node loads the file by its real
+// path while the command line may name it through a link (`/var` on macOS is one).
+if (process.argv[1] && realOrSame(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((error) => {
     console.error(error.message);
     process.exitCode = 1;

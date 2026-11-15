@@ -1644,7 +1644,7 @@ console.log("22. Testing real Lean data (the local helper)...");
       }
 
       const h = helper.createHelper({ cacheDir: path.join(root, 'cache'), log: () => {} });
-      assert(['seatbelt', 'none'].includes(await h.sandbox()), 'the sandbox is on wherever the system has one');
+      assert(['seatbelt', 'bwrap', 'none'].includes(await h.sandbox()), 'the sandbox is on wherever the system has one');
       assert.strictEqual(await helper.createHelper({ cacheDir: path.join(root, 'cache'), log: () => {}, sandbox: false }).sandbox(), 'off');
       const sha = '1adf3d0cad950f5a9059596b4df342c38aae8353';
       const ask = (method, url, body) => { const r = h.handle(method, url, body); return { status: r.status, body: JSON.parse(r.body) }; };
@@ -1672,6 +1672,11 @@ console.log("22. Testing real Lean data (the local helper)...");
       assert.strictEqual(ready.body.state, 'ready');
       assert.strictEqual(ready.body.data.hovers.length, data.hovers.length);
 
+      // Started through a link to its folder (as `/var` is on macOS), the helper still runs.
+      fs.symlinkSync(helperDir, path.join(root, 'linked-helper'));
+      const viaLink = spawnSync(process.execPath, [path.join(root, 'linked-helper', 'lean-lens-helper.mjs'), '--help'], { encoding: 'utf8' });
+      assert(viaLink.stdout.includes('Lean Lens helper'), `the helper said nothing: ${viaLink.stderr}`);
+
       // The Lean version a project pins goes to elan, outside the sandbox: a plain file naming a
       // version, never a link to some other file.
       const project = path.join(root, 'project');
@@ -1685,6 +1690,25 @@ console.log("22. Testing real Lean data (the local helper)...");
       fs.writeFileSync(path.join(root, 'elsewhere.txt'), 'leanprover/lean4:v4.35.0\n');
       fs.symlinkSync(path.join(root, 'elsewhere.txt'), path.join(project, 'lean-toolchain'));
       assert.throws(() => helper.toolchainOf(project), /does not name a Lean version/, 'a link is not read');
+
+      // --- Lean in a codespace, the parts that need none: the script that starts the helper
+      // there, and the Linux sandbox it runs a pull request's code in.
+      const cs = await import(pathToFileURL(path.join(helperDir, 'codespaces.mjs')).href);
+      assert.strictEqual(cs.displayNameFor('seewoo5/DifferentProofs'), 'Lean Lens DifferentProofs');
+      assert.strictEqual(cs.displayNameFor('o/my.repo_1-x'), 'Lean Lens my-repo_1-x', 'GitHub refuses a colon or a dot in the name');
+      assert(cs.displayNameFor(`o/${'x'.repeat(80)}`).length <= 48, 'GitHub allows 48 characters');
+      assert(cs.confines('seatbelt') && cs.confines('bwrap') && !cs.confines('none') && !cs.confines('off'));
+      const boot = cs.bootstrapScript({ files: { 'a.mjs': "it's here" }, token: 'tok-1', repo: 'o/r', port: 6000, sandbox: false, cloneBase: 'file:///x y/' });
+      assert(boot.includes(`put 'a.mjs' '${Buffer.from("it's here").toString('base64')}'`), 'the helper\'s files travel with it');
+      assert(boot.includes('--port 6000') && boot.includes("--allow 'o/r'") && boot.includes('--no-sandbox') && boot.includes("--clone-base 'file:///x y/'"), boot);
+      assert(boot.includes('/workspaces/r}}"') && boot.includes(`--link 'o/r='"$CHECKOUT"`), 'it starts from the codespace\'s own checkout');
+      assert(!cs.bootstrapScript({ files: {}, token: 't', repo: 'o/r' }).includes('--no-sandbox'));
+      if (spawnSync('bash', ['--version']).status === 0) {
+        assert.strictEqual(spawnSync('bash', ['-n'], { input: boot, encoding: 'utf8' }).status, 0, 'the script is valid bash');
+      }
+      assert.strictEqual(helper.bwrapArgs({ readable: ['/opt/lean'], writable: ['/c/copy'], guarded: ['/c/copy/.git'], cwd: '/c/copy', system: ['--ro-bind', '/usr', '/usr'] }).join(' '),
+        '--unshare-all --die-with-parent --new-session --proc /proc --dev /dev --ro-bind /usr /usr --ro-bind /opt/lean /opt/lean --bind /c/copy /c/copy --ro-bind-try /c/copy/.git /c/copy/.git --remount-ro / --chdir /c/copy');
+      assert(helper.bwrapArgs({ network: true, system: [] }).includes('--share-net'), 'the network only when asked');
 
       // --- Disk. Only the results stay: a repository's copy and its build go when they are not
       // in use. At start, what an earlier helper left behind is removed.
@@ -1733,6 +1757,17 @@ console.log("22. Testing real Lean data (the local helper)...");
       assert.strictEqual(JSON.parse(fs.readFileSync(path.join(cache2, 'config.json'), 'utf8')).token, h2.config.token, 'the token stays');
       await helper.cleanCache(cache2, { results: true });
       assert.deepStrictEqual(fs.readdirSync(cache2), ['config.json']);
+      // Builds kept in a folder of their own (--builds) are found there, at start and by `clean`.
+      const builds2 = path.join(root, 'builds2');
+      fakeCopy(builds2, 'o/elsewhere', gone);
+      helper.createHelper({ cacheDir: cache2, buildsDir: builds2, keepBuilds: true, log: () => {} });
+      assert(fs.existsSync(path.join(builds2, 'repos', 'o', 'elsewhere')) && !fs.existsSync(path.join(cache2, 'repos')));
+      assert.strictEqual((await helper.cleanCache(cache2)).removed.length, 0, 'not without being told where the builds are');
+      assert.strictEqual((await helper.cleanCache(cache2, { buildsDir: builds2 })).removed[0].what, 'copies of repositories with their builds');
+      assert.deepStrictEqual(fs.readdirSync(builds2), []);
+      fakeCopy(builds2, 'o/elsewhere', gone);
+      helper.createHelper({ cacheDir: cache2, buildsDir: builds2, log: () => {} });
+      assert(!fs.existsSync(path.join(builds2, 'repos', 'o', 'elsewhere')), 'a copy nobody uses goes at start, wherever builds are kept');
       assert.strictEqual((await helper.cleanCache(cache2)).removed.length, 0);
       fs.mkdirSync(path.join(cache2, 'repos', 'o'), { recursive: true });
       assert.strictEqual((await helper.cleanCache(cache2)).removed.length, 0, 'an empty folder goes without a mention');
@@ -1792,6 +1827,139 @@ console.log("22. Testing real Lean data (the local helper)...");
         assert(fs.lstatSync(copy3).isDirectory(), 'a real folder now');
         assert.strictEqual(fs.readFileSync(path.join(theirs, 'mine.txt'), 'utf8'), 'mine');
         assert(!fs.existsSync(path.join(theirs, 'A.lean')), 'nothing was checked out through the link');
+
+        // --- Lean in a codespace. The helper here hands the run to the same helper there, shows
+        // its progress and keeps its results. `gh` is played by test/fixtures/fake-gh.mjs: its
+        // codespace is a folder, and the helper "in" it runs on this machine.
+        if (spawnSync('bash', ['--version']).status === 0) {
+          const fakeDir = path.join(root, 'fake-gh');
+          fs.mkdirSync(fakeDir);
+          const before = process.env.FAKE_GH_DIR;
+          process.env.FAKE_GH_DIR = fakeDir;
+          const fakeState = () => JSON.parse(fs.readFileSync(path.join(fakeDir, 'state.json'), 'utf8'));
+          const running = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+          const thereHome = path.join(fakeDir, 'homes', 'fake-1');
+          const therePid = () => Number(fs.readFileSync(path.join(thereHome, '.lean-lens', 'helper.pid'), 'utf8'));
+          let remotePort = null;
+          try {
+            remotePort = await new Promise((resolve) => {
+              const probe = require('net').createServer();
+              probe.listen(0, '127.0.0.1', () => { const { port } = probe.address(); probe.close(() => resolve(port)); });
+            });
+            const here = path.join(root, 'cache-here');
+            const heard = [];
+            const withCodespaces = (extra) => helper.createHelper(Object.assign({
+              cacheDir: here, codespaces: cs.createCodespaces, gh: path.join(__dirname, 'fixtures', 'fake-gh.mjs'), remotePort, cloneBase, pollMs: 40, log: (message) => heard.push(message),
+            }, extra));
+            const finish = async (made, sha) => {
+              for (let i = 0; made.status('o/r', sha).state === 'pending'; i++) { assert(i < 1500, `still pending: ${heard.join(' | ')}`); await tick(20); }
+              await made.idle();
+            };
+            const h7 = withCodespaces({});
+            await h7.remote.check();
+            assert.strictEqual(JSON.parse(h7.handle('GET', '/status').body).runs, 'codespaces');
+            assert.strictEqual(JSON.parse(h.handle('GET', '/status').body).runs, 'here');
+            // One file the codespace already has a result for, and one Lean can't process.
+            const there = path.join(thereHome, '.lean-lens', 'cache', 'data', `v${DATA_FORMAT_VERSION}`, 'o', 'r', commit, 'Sample.lean.json');
+            fs.mkdirSync(path.dirname(there), { recursive: true });
+            fs.writeFileSync(there, JSON.stringify(data));
+            const begun = h7.start({ repo: 'o/r', sha: commit, pr: 7, paths: ['A.lean', 'Sample.lean'] });
+            assert.strictEqual(begun.state, 'pending', 'answered at once, before any codespace exists');
+            await finish(h7, commit);
+            assert.strictEqual(h7.status('o/r', commit).state, 'done', h7.status('o/r', commit).error);
+            assert.strictEqual(h7.fileState('o/r', commit, 'A.lean').error, 'This file is not inside a Lake project', 'the error from the codespace');
+            assert.strictEqual(h7.fileState('o/r', commit, 'Sample.lean').state, 'ready');
+            assert.strictEqual(JSON.parse(h7.readData('o/r', commit, 'Sample.lean')).hovers.length, data.hovers.length, 'the result is kept here');
+            let fake = fakeState();
+            assert.strictEqual(fake.codespaces.length, 1);
+            assert.strictEqual(fake.codespaces[0].repository, 'o/r', 'a codespace on the repository being read');
+            assert.strictEqual(fake.codespaces[0].displayName, 'Lean Lens r');
+            assert.strictEqual(fake.codespaces[0].machine, 'basicLinux32gb');
+            assert.strictEqual(h7.config.codespaces['o/r'].name, 'fake-1', 'and remembered');
+            assert.notStrictEqual(h7.config.codespaces['o/r'].token, h7.config.token, 'the helper there has a token of its own');
+            assert(heard.some((message) => message.includes('Creating a codespace for o/r')), heard.join(' | '));
+            assert(heard.some((message) => message.includes('Setting up Lean in the codespace fake-1')) && heard.some((message) => message.includes('Done (2 files)')), heard.join(' | '));
+            assert(!fs.existsSync(path.join(here, 'repos')), 'no copy of the repository on this machine');
+            const pid = therePid();
+            assert(running(pid));
+            // Stopping the helper stops the codespace.
+            h7.shutdown();
+            assert.strictEqual(fakeState().codespaces[0].state, 'Shutdown');
+            for (let i = 0; running(pid) && i < 200; i++) await tick(20);
+            assert(!running(pid), 'the helper there has stopped');
+            // The results are here: reading them needs no codespace.
+            const h8 = withCodespaces({});
+            assert.strictEqual(h8.fileState('o/r', commit, 'Sample.lean').state, 'ready');
+            assert.strictEqual(fakeState().codespaces[0].state, 'Shutdown', 'a hover starts nothing');
+            // A new run uses the same codespace, started again.
+            h8.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+            await finish(h8, commit);
+            fake = fakeState();
+            assert.strictEqual(fake.codespaces.length, 1);
+            assert.strictEqual(fake.codespaces[0].state, 'Available');
+            assert.strictEqual(fake.calls.filter((call) => call === 'codespace create').length, 1, 'created once');
+            assert.strictEqual(h8.config.codespaces['o/r'].token, h7.config.codespaces['o/r'].token);
+            // --tidy-after 0: the codespace is stopped as soon as the run is over.
+            h8.shutdown();
+            const h9 = withCodespaces({ tidyMinutes: 0 });
+            fs.rmSync(path.join(here, 'data'), { recursive: true, force: true });
+            h9.start({ repo: 'o/r', sha: commit, pr: null, paths: ['Sample.lean'] });
+            await finish(h9, commit);
+            assert.strictEqual(h9.fileState('o/r', commit, 'Sample.lean').state, 'ready');
+            assert.strictEqual(fakeState().codespaces[0].state, 'Shutdown', 'stopped when idle');
+            h9.shutdown();
+            // --keep-codespaces: left running.
+            const h10 = withCodespaces({ keepCodespaces: true, tidyMinutes: 0 });
+            h10.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+            await finish(h10, commit);
+            h10.shutdown();
+            assert.strictEqual(fakeState().codespaces[0].state, 'Available');
+            // A helper still running in the codespace is left alone when the connection is made
+            // again (this machine slept, or the helper here was started anew), and its runs with it.
+            const stillThere = therePid();
+            assert(running(stillThere), 'left running by --keep-codespaces');
+            const sshBefore = fakeState().calls.filter((call) => call === 'codespace ssh').length;
+            const h11 = withCodespaces({ keepCodespaces: true, keepAliveMs: 0, retryMs: 10 });
+            fs.rmSync(path.join(here, 'data'), { recursive: true, force: true });
+            h11.start({ repo: 'o/r', sha: commit, pr: null, paths: ['Sample.lean'] });
+            await finish(h11, commit);
+            assert.strictEqual(h11.fileState('o/r', commit, 'Sample.lean').state, 'ready');
+            assert.strictEqual(therePid(), stillThere, 'the same helper, not a new one');
+            // The connection goes (the forwarded port closes): the next request makes it again.
+            spawnSync('pkill', ['-f', `ports forward ${remotePort}:`]);
+            h11.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+            await finish(h11, commit);
+            assert.strictEqual(h11.fileState('o/r', commit, 'A.lean').error, 'This file is not inside a Lake project');
+            assert.strictEqual(therePid(), stillThere);
+            // While a run lasts, the helper connects over ssh now and then: GitHub stops a codespace
+            // nobody has connected to for 30 minutes, whatever is running in it.
+            assert(fakeState().calls.filter((call) => call === 'codespace ssh').length > sshBefore + 2, 'two connections and at least one more to keep it alive');
+            h11.shutdown();
+            // Its own codespaces can be listed and deleted; nothing else is touched.
+            fake = fakeState();
+            fake.codespaces.push({ name: 'mine', displayName: 'my own work', repository: 'o/r', state: 'Available' });
+            fs.writeFileSync(path.join(fakeDir, 'state.json'), JSON.stringify(fake));
+            const spaces = cs.createCodespaces({ config: h10.config, save: () => {}, run: h10.remote.run, log: () => {}, gh: path.join(__dirname, 'fixtures', 'fake-gh.mjs') });
+            assert.strictEqual((await spaces.ours()).map((space) => space.name).join(), 'fake-1');
+            await spaces.remove('fake-1');
+            assert.strictEqual(fakeState().codespaces.map((space) => space.name).join(), 'mine');
+            assert.strictEqual(h10.config.codespaces['o/r'], undefined, 'and forgotten');
+            // Without the scope, it says what to run.
+            fake = fakeState();
+            fake.scope = false;
+            fs.writeFileSync(path.join(fakeDir, 'state.json'), JSON.stringify(fake));
+            await assert.rejects(withCodespaces({}).remote.check(), /gh auth refresh -h github\.com -s codespace/);
+            await assert.rejects(withCodespaces({ gh: path.join(root, 'no-such-gh') }).remote.check(), /not installed/);
+            assert.throws(() => withCodespaces({ machine: 'big; rm -rf' }), /Not a codespace machine name/);
+          } finally {
+            // Whatever happened above, no helper is left running "in a codespace", and no forwarding.
+            if (typeof remotePort === 'number') spawnSync('pkill', ['-f', `ports forward ${remotePort}:`]);
+            for (const name of fs.existsSync(path.join(fakeDir, 'homes')) ? fs.readdirSync(path.join(fakeDir, 'homes')) : []) {
+              try { process.kill(Number(fs.readFileSync(path.join(fakeDir, 'homes', name, '.lean-lens', 'helper.pid'), 'utf8')), 'SIGKILL'); } catch { /* it has stopped */ }
+            }
+            if (before === undefined) delete process.env.FAKE_GH_DIR; else process.env.FAKE_GH_DIR = before;
+          }
+        }
       }
     } finally {
       fs.rmSync(root, { recursive: true, force: true });

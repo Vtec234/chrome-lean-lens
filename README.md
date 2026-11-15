@@ -7,7 +7,7 @@ It works on both GitHub diff views (the classic `/files` view and the newer `/ch
 Hovers come from two sources:
 
 - **Estimated, with nothing to set up.** The extension reads the source, the PR's files and [Loogle](https://loogle.lean-lang.org/), and works out what Lean would show. This is what the sections below describe.
-- **Lean's own output, with the local helper.** A small program on your machine runs Lean on the pull request you are reading. Hovers are then exactly Lean's, and each tactic shows its proof state. See [Real Lean with the local helper](#real-lean-with-the-local-helper).
+- **Lean's own output, with the local helper.** A small program on your machine has Lean run on the pull request you are reading, on your machine or in a GitHub Codespace of yours. Hovers are then exactly Lean's, and each tactic shows its proof state. See [Real Lean with the local helper](#real-lean-with-the-local-helper).
 
 ---
 
@@ -90,18 +90,44 @@ removes everything but the settings and the results, and uninstalls the Lean ver
 
 The copy of a linked checkout shares its disk space with the original, so it costs far less than it looks: a 10.6 GB build copied this way took 0.3 GB of the disk. Tools that add up file sizes (`du`, the Finder) count it in full all the same.
 
+**Lean in a codespace instead of on your machine.** Lean needs its files wherever it runs. With `--codespaces` that place is a [GitHub Codespace](https://github.com/features/codespaces) on your account, and your machine keeps only the results:
+
+```bash
+node helper/lean-lens-helper.mjs --codespaces
+```
+
+The extension is set up as before and talks to the same address.
+
+- The first **Run Lean** on a repository creates a codespace on that repository (the smallest machine: 2 cores), installs Lean in it and starts this same helper there. Later runs use the same codespace, starting it again if it was stopped.
+- The tooltip shows the run's progress as usual. The results are copied to your machine, so hovers keep working once the codespace has stopped. A hover never starts a codespace: only **Run Lean** does.
+- A codespace is stopped 30 minutes after its last run and when the helper stops (`--tidy-after` changes the time, `--keep-codespaces` leaves them running). GitHub deletes one that goes unused for a week.
+- A run goes on when the connection is lost, because your machine slept or its network changed: the helper in the codespace keeps working, and the helper here connects again and picks the run up. GitHub itself stops a codespace 30 minutes after the last connection to it, whatever is running in it, so during a run the helper connects every few minutes. A machine asleep for longer than that loses the run.
+- `node helper/lean-lens-helper.mjs codespaces` lists the codespaces the helper made, with `--stop` it stops them and with `--delete` it deletes them. It leaves your other codespaces alone.
+
+Your machine needs Node and GitHub's command line tool [`gh`](https://cli.github.com), signed in and allowed to use codespaces (`gh auth refresh -h github.com -s codespace`). It needs no Lean.
+
+It is paid for from your own Codespaces allowance. A free account has 120 core-hours a month, which is 60 hours of this machine, and 15 GB-months of storage. Builds go to the codespace's temporary disk, which GitHub empties when the codespace stops, so a stopped one holds a Lean version (3 GB) and little else.
+
+There is a codespace for each repository, and not one for everything, because GitHub's terms allow a codespace for developing or testing the repository it was started on.
+
 **Safety.** Elaborating a Lean file runs the code in it, and `lake` runs the project's `lakefile`. So running Lean on a pull request means running that pull request's code on your machine.
 
 - Lean never starts on its own. It runs when you press **Run Lean**, and only on repositories you have allowed (the button asks the first time; `--allow owner/repo` does it ahead).
 - The helper listens on `127.0.0.1` only and answers only requests that carry its token. Requests from web pages are refused.
 - **On macOS the project's code runs in a sandbox** (`lake`, and Lean elaborating a file). In it there is no network, except for the one step that fetches the project's dependencies and Mathlib's build. It cannot read your home folder, other volumes or the temporary folders: only system files, the Lean toolchain and the helper's copy of the project. It can write only inside that copy and the scratch folders of the run. It cannot write to the copy's `.git`, and it cannot move those folders or put something else in their place. It gets none of the helper's environment variables, and empty home and temporary folders that are deleted when the run is over.
-- On Linux there is no sandbox yet, only the clean environment. The helper says which applies when it starts, and **Test Connection** in the options shows it.
+- **On Linux it runs in a sandbox too**, made with [bubblewrap](https://github.com/containers/bubblewrap) when `bwrap` is installed and allowed to work. The code gets a file system of its own: the system folders and the Lean toolchain, read-only, and the helper's copy of the project and the scratch folders of the run. Nothing else exists for it. It has no network outside the fetching step, sees no process but its own, and gets the same clean environment. Without `bwrap` there is only the clean environment.
+- **In a codespace** the pull request's code is not on your machine at all, and it runs in that Linux sandbox. That matters there too: a codespace holds a GitHub token that can push to the repository when you can, in a file any program in the codespace can read. If a codespace has no working sandbox and you can push to the repository, the run is refused unless the helper was started with `--no-sandbox`.
+- The helper says which applies when it starts, and **Test Connection** in the options shows it.
 
-The sandbox guards against the obvious; it is not a guarantee. It uses the system's `sandbox-exec` with rules that deny the things above and allow the rest (starting processes, reading system files). `--no-sandbox` turns it off. That is needed when a project's dependencies are private repositories, because the sandbox has no git credentials.
+The sandbox guards against the obvious; it is not a guarantee. On macOS it uses the system's `sandbox-exec` with rules that deny the things above and allow the rest (starting processes, reading system files). On Linux, bubblewrap builds the file system the code sees, which leaves it less; in the fetching step it shares the machine's network. `--no-sandbox` turns it off. That is needed when a project's dependencies are private repositories, because the sandbox has no git credentials.
 
 A test file that tries to read a file in the home folder, write one there, fetch a URL, read an environment variable of the helper, plant a git hook, move the project's copy away and move its scratch home folder away is refused all seven in the sandbox. Without it the first five are allowed (the last two were not tried there: they would move real folders).
 
+In a codespace, such a file tries eleven things: to read the codespace's GitHub token from its file, find it in the environment, read git's credential helper, the helper's own settings and a file in the home folder, write to the home folder and to the codespace's checkout, fetch a URL, plant a git hook, and move the project's copy and its scratch home folder away. All eleven are refused in the sandbox, where it sees three processes instead of fifteen. Without the sandbox, eight of the nine that were tried are allowed, reading the token's file among them.
+
 **Measured** on an Apple M2 with Lean 4.35 and DifferentProofs linked: 78 seconds from an empty cache to the first file of a pull request. Of that, 28 seconds copy the checkout's build (10.6 GB), 25 build the SubVerso extractor (once for each Lean version), and the rest builds what the file imports and elaborates it. A further file takes 5 to 40 seconds. Removing the copy takes about 10 seconds. When Mathlib's build has to come from the network instead, it is 556 MB in about 9,000 files, which took 12 minutes on a connection giving 0.6 to 2 MB/s. The sandbox made no difference to that.
+
+**Measured in a codespace** (2 cores, GitHub's default image, DifferentProofs): 6 minutes from nothing to the first result on this machine. Creating the codespace and starting the helper take half a minute, installing Lean one minute, fetching and unpacking Mathlib's build 3 to 5 minutes, and building the SubVerso extractor one minute. A stopped codespace takes about as long again: starting it takes half a minute, but its temporary disk is gone, and Mathlib's build with it. While it is up, a file takes what its imports take to build (2.5 minutes for all of DifferentProofs' own modules) and 5 to 45 seconds to elaborate. A run whose connection was cut on purpose in the middle finished all the same, and no later. The results are byte for byte those of the Mac.
 
 **Limits**
 
@@ -110,6 +136,8 @@ A test file that tries to read a file in the home folder, write one there, fetch
 - SubVerso records the wrong goal on the `by` of `have h : T := by …`, so that `by` shows none. The `have` and the tactics inside it are right.
 - A Verso document (`#doc … =>`) has no Lean hovers in its body.
 - **Run Lean** on an added or unchanged line runs the pull request's Lean files. On a removed line it runs that one file at the base commit, which makes the helper switch commits and rebuild.
+- A codespace of the smallest kind has two cores, and what Mathlib's cache does not cover is compiled there from source. DifferentProofs' blueprint chapters import Verso: building that was not finished after 28 minutes. `--codespace-machine standardLinux32gb` asks for four cores, which uses the allowance twice as fast.
+- The Linux sandbox and the codespace route were tried in GitHub's default codespace image only (Ubuntu 24.04, bubblewrap 0.9), on a public repository. A repository whose own dev container has no SSH server cannot be set up this way, and the helper says so.
 - Tested with Lean 4.35 only. SubVerso's output format is not stable, so the helper builds a pinned revision (`--subverso-rev` picks another), and it refuses output that does not reproduce the source text.
 
 The same program can elaborate files without the extension, for example in a script. It removes the copy when it is done; with `--keep-builds` the next run starts from it.
@@ -163,6 +191,7 @@ chrome-lean-lens/
 ├── options/                       # Settings page
 ├── helper/
 │   ├── lean-lens-helper.mjs       # The local helper: fetches a commit, runs Lean, serves the result
+│   ├── codespaces.mjs             # Lean in a GitHub Codespace: the helper hands a run to itself there
 │   └── convert.mjs                # SubVerso's output → hovers, proof states and messages by position
 └── test/                          # Unit tests, fixtures and the demo page
 ```
