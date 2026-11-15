@@ -42,7 +42,11 @@ if (args[0] === 'api') {
 } else if (args[1] === 'list') {
   console.log(JSON.stringify(state.codespaces));
 } else if (args[1] === 'create') {
-  const name = `fake-${state.codespaces.length + 1}`;
+  // A repository may allow only some machines, as mathlib4 does.
+  if (state.machines && !state.machines.includes(option('--machine'))) {
+    fail(`error getting machine type: there is no such machine for the repository: ${option('--machine')}\nAvailable machines: [${state.machines.join(' ')}]`);
+  }
+  const name = `fake-${state.created = (state.created || state.codespaces.length) + 1}`;
   state.codespaces.push({ name, displayName: option('--display-name'), repository: option('--repo'), state: 'Available', lastUsedAt: null, machine: option('--machine') });
   fs.mkdirSync(home(name), { recursive: true });
   save(state);

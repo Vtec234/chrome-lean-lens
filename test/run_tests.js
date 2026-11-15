@@ -1992,6 +1992,24 @@ console.log("22. Testing real Lean data (the local helper)...");
             await spaces.remove('fake-1');
             assert.strictEqual(fakeState().codespaces.map((space) => space.name).join(), 'mine');
             assert.strictEqual(h10.config.codespaces['o/r'], undefined, 'and forgotten');
+            // A repository that allows only a larger machine (mathlib4 does) gets that one, and the
+            // log says so. A machine asked for by name is not swapped for another.
+            fake = fakeState();
+            fake.machines = ['standardLinux32gb', 'premiumLinux'];
+            fs.writeFileSync(path.join(fakeDir, 'state.json'), JSON.stringify(fake));
+            const h12 = withCodespaces({});
+            h12.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+            await finish(h12, commit);
+            assert.strictEqual(h12.status('o/r', commit).state, 'done', h12.status('o/r', commit).error);
+            assert.strictEqual(fakeState().codespaces.find((space) => space.displayName === 'Lean Lens r').machine, 'standardLinux32gb');
+            assert(heard.some((message) => message.includes('needs a larger codespace than the smallest: using standardLinux32gb')), heard.join(' | '));
+            h12.shutdown();
+            await spaces.remove(fakeState().codespaces.find((space) => space.displayName === 'Lean Lens r').name);
+            const h13 = withCodespaces({ machine: 'largeLinux' });
+            h13.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+            await finish(h13, commit);
+            assert(/no such machine for the repository: largeLinux/.test(h13.status('o/r', commit).error), h13.status('o/r', commit).error);
+            h13.shutdown();
             // Without the scope, it says what to run.
             fake = fakeState();
             fake.scope = false;

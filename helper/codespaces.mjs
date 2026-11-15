@@ -302,8 +302,18 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
       all.find((entry) => entry.repository === repo && entry.displayName === displayNameFor(repo));
     if (!space) {
       say(`Creating a codespace for ${repo}`);
-      const created = await must(['codespace', 'create', '--repo', repo, '--machine', machine, '--display-name', displayNameFor(repo),
+      const create = (size) => run(gh, ['codespace', 'create', '--repo', repo, '--machine', size, '--display-name', displayNameFor(repo),
         '--retention-period', RETENTION, '--default-permissions'], { timeoutMs: 15 * 60 * 1000 });
+      let created = await create(machine);
+      // A repository can ask for more than the smallest machine (mathlib4 does). gh then names
+      // the ones it allows: the first of those is taken, unless a machine was asked for by name.
+      const offered = created.code === 0 ? null : /Available machines: \[([^\]]*)\]/.exec(`${created.stderr}\n${created.stdout}`);
+      const larger = offered ? offered[1].split(/[\s,]+/).filter((size) => /^[A-Za-z0-9]+$/.test(size)) : [];
+      if (larger.length && machine === MACHINE) {
+        say(`${repo} needs a larger codespace than the smallest: using ${larger[0]}, which uses your allowance faster`);
+        created = await create(larger[0]);
+      }
+      if (created.code !== 0) throw new Error(explain(created));
       space = { name: created.stdout.trim().split('\n').pop().trim(), state: 'Available' };
       if (!space.name) throw new Error('`gh codespace create` did not say which codespace it made');
       // gh says whose allowance the codespace is charged to: worth passing on.
