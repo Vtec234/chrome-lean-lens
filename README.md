@@ -42,9 +42,27 @@ With the helper switched on, a tooltip says which one you are looking at.
 - **Local variables and hypotheses**: their type, written or inferred (from `intro`, `obtain`, `rw … at h` and the like).
 - **Terms**: hover a gap, a bracket or an operator to get the term there and its type.
 - **Tactics**: their documentation.
+- **Declaration keywords** (`theorem`, `lemma`, `def`, …): what is in force there, as `#where` prints it: the namespaces and sections, and the `open`, `variable`, `include`, `omit`, `universe` and `set_option` commands, each with its line. On a pull request, a declaration it adds also gets [placement hints](#outline-and-placement).
 - **With real Lean**: the goals after each tactic, and Lean's errors and `#check` output.
 
 Estimated hovers follow Lean's rules for scopes, `open`, dot notation and section variables. When a type can't be worked out, no tooltip appears; when several names fit, the tooltip lists them.
+
+### Stepping through a proof
+
+With real Lean, a tactic's tooltip shows what it changed, as Lean's infoview does: in the goals **after** it, what is new is green; switch to **Before** to see what went away in red. Hypotheses are matched by name and goals by their `case`, so only the part of a type or target that changed is marked.
+
+The ◀ ▶ buttons (or ← → once the tooltip is pinned) move to the previous or next tactic of the proof. The tactic is shaded in the diff and the tooltip follows it.
+
+### Outline and placement
+
+The **Outline** button at the bottom right of a pull request's files (or a Lean file page) lists the file's declarations with their line numbers, together with the commands GitHub's symbol list leaves out: `namespace`, `section`, `end`, `open`, `variable`, `include`, `omit`, and `open … in`-style prefixes. Click a line number to go there; click a declaration to see what is in force at it.
+
+On a pull request, the declarations it adds are marked **new**, and a ⚑ marks a hint where one might belong instead:
+
+- it sits between two declarations that go together (`foo` and `foo'`);
+- it is much more like a declaration elsewhere in the file than like its neighbours.
+
+Similarity is read from names (their words, with duals such as `open`/`closed` and `left`/`right` counted as alike) and the constants their statements mention. It is a hint, not a rule. Both the outline and the hints come from the file's text, without Lean, so they work without the helper.
 
 ## Real Lean
 
@@ -120,7 +138,7 @@ The sandbox guards against the obvious; it is not a guarantee. `--no-sandbox` tu
 
 ### Good to know
 
-- A tactic shows the goals **after** it. Hover the previous tactic or `by` for the goals before.
+- A tactic shows the goals **after** it, and what it changed. The goals before the first tactic of a proof nested in another (`have h : T := by simp`) are not in Lean's recorded data, so that one shows its goals without a diff.
 - A tactic that contains another proof, such as `exact foo (by simp)`, shows no state of its own.
 - Files that need much compiled from source are slow in a codespace's two cores. `--codespace-machine standardLinux32gb` asks for four, at twice the cost.
 - A codespace is built from the repository's own dev container when it has one. If that setup fails, GitHub starts the codespace in recovery mode, where Lean can't run, and the helper says so. mathlib4 is such a case today: its setup runs out of disk. Run those repositories on your machine with `--here owner/repo`.
@@ -153,6 +171,7 @@ In Chrome, right-click the toolbar icon → **Options**. In Firefox, open `about
 
 - **Hover delay** and **theme**
 - **Sources** for estimated hovers: the PR's own declarations, Loogle, built-in tactic docs
+- **File outline**: the Outline button and its placement hints
 - **Real Lean**: the helper's address and token, with a **Test Connection** button
 
 ## Development
@@ -167,7 +186,7 @@ The tests need no Lean installation. Many expected outputs are Lean's own hovers
 manifest.json     Manifest V3 configuration (Chrome)
 scripts/          build-firefox.mjs: the Firefox copy in dist/firefox/, with its own manifest
 background/       Service worker (an event page in Firefox): Loogle, caching, the helper's client
-content/          Hover handling, the term engine, the PR scanner, the tooltip
+content/          Hover handling, the term engine, the PR scanner, the tooltip, goal diffs, the outline
 options/, popup/  Settings page and toolbar popup
 helper/           The helper: runs Lean (locally or in a codespace) and converts its output
 test/             Tests, fixtures and the demo page

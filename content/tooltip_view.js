@@ -153,12 +153,32 @@
         helper.run();
       });
 
-      // Keyboard handler (Esc to dismiss, Alt to toggle pin)
+      // Stepping through a proof, and switching between the goals before and after a tactic.
+      const goalsEl = this.container.querySelector('#verso-goals');
+      goalsEl?.addEventListener('click', (e) => {
+        const stepBtn = e.target.closest && e.target.closest('[data-step]');
+        const sideBtn = e.target.closest && e.target.closest('[data-side]');
+        if (!stepBtn && !sideBtn) return;
+        e.stopPropagation();
+        if (sideBtn) {
+          this.goalsSide = sideBtn.getAttribute('data-side');
+          this.renderExtras(this.currentExtras);
+        } else {
+          this.step(Number(stepBtn.getAttribute('data-step')));
+        }
+      });
+
+      // Keyboard handler (Esc to dismiss, Alt to toggle pin, ← → to step through a proof)
       window.addEventListener('keydown', (e) => {
         if (e.key === 'Escape' && this.isVisible()) {
           this.hide(true);
         } else if (e.key === 'Alt' && this.isVisible()) {
           this.togglePin();
+        } else if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && this.isVisible() && this.isPinned &&
+          this.currentExtras && this.currentExtras.stepper && !e.altKey && !e.metaKey && !e.ctrlKey &&
+          !(e.target && e.target.closest && e.target.closest('input, textarea, [contenteditable="true"]'))) {
+          e.preventDefault();
+          this.step(e.key === 'ArrowLeft' ? -1 : 1);
         }
       });
     }
@@ -188,6 +208,7 @@
         data = { name: 'Proof state', kind: 'goal', source: 'lean', lean: extras && extras.lean, bare: true };
       }
       this.currentData = data;
+      this.goalsSide = 'after';
       this.setShade(shade);
 
       const titleEl = this.container.querySelector('#verso-title');
@@ -234,7 +255,7 @@
       if (data.docstring) {
         docEl.innerHTML = this.renderMarkdown(data.docstring, { softWrap: data.source === 'lean' });
         docEl.classList.remove('verso-hidden');
-      } else if (data.kind === 'term' || data.source === 'lean') {
+      } else if (data.kind === 'term' || data.source === 'lean' || data.source === 'outline') {
         // (Lean's own hover has a docstring only when the declaration does.)
         docEl.innerHTML = '';
         docEl.classList.add('verso-hidden');
@@ -273,6 +294,10 @@
         } else {
           docsLink.classList.add('verso-hidden');
         }
+      } else if (data.source === 'outline') {
+        // `#where` at a declaration, read from the file's commands.
+        sourceEl.textContent = `In force at line ${data.lineNumber}${data.isNew ? ' · added in this PR' : ''} (like #where)`;
+        docsLink.classList.add('verso-hidden');
       } else if (data.source === 'term') {
         sourceEl.textContent = 'Type inferred from the source';
         docsLink.classList.add('verso-hidden');
@@ -311,10 +336,7 @@
 
       const goals = extras && extras.goals;
       if (goals) {
-        goalsTitle.innerHTML = `${goals.at ? 'Goal at' : 'After'} <code class="verso-inline-code">${esc(goals.tactic)}</code>`;
-        goalsBody.innerHTML = goals.goals.length
-          ? goals.goals.map((goal) => this.highlightLean(goal, { binders: false })).join('\n\n')
-          : '<span class="verso-no-goals">No goals</span>';
+        this.renderGoals(goals, extras.stepper, goalsTitle, goalsBody);
         goalsEl.classList.remove('verso-hidden');
       } else {
         goalsEl.classList.add('verso-hidden');
@@ -346,6 +368,48 @@
       }
     }
 
+    /**
+     * The proof state at a tactic. With the goals before it known, what it changed is marked as
+     * in Lean's infoview: new in green in the goals after it, gone in red in the goals before it
+     * (`goalsSide` picks which). `stepper` (`{go(delta)}`) moves to the proof's other tactics.
+     */
+    renderGoals(goals, stepper, titleEl, bodyEl) {
+      const esc = (str) => String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const differ = typeof window !== 'undefined' && window.LeanGoalDiff;
+      const diff = differ && !goals.at && Array.isArray(goals.before) ? differ.diffStates(goals.before, goals.goals) : null;
+      const side = diff && this.goalsSide === 'before' ? 'before' : 'after';
+      const steps = stepper && goals.steps > 1 && goals.step >= 0
+        ? `<span class="verso-steps"><button class="verso-step-btn" data-step="-1" title="Previous tactic (←)"${goals.step === 0 ? ' disabled' : ''}>◀</button>` +
+          `<span class="verso-step-count">${goals.step + 1}/${goals.steps}</span>` +
+          `<button class="verso-step-btn" data-step="1" title="Next tactic (→)"${goals.step === goals.steps - 1 ? ' disabled' : ''}>▶</button></span>`
+        : '';
+      const switcher = diff
+        ? `<span class="verso-goal-sides">${['before', 'after'].map((s) =>
+          `<button class="verso-side-btn${s === side ? ' verso-side-active' : ''}" data-side="${s}">${s === 'before' ? 'Before' : 'After'}</button>`).join('')}</span>`
+        : '';
+      const label = goals.at ? 'Goal at' : side === 'before' ? 'Before' : 'After';
+      titleEl.innerHTML = `${steps}<span class="verso-goals-label">${label} <code class="verso-inline-code">${esc(goals.tactic)}</code></span>${switcher}`;
+
+      const shown = diff ? (side === 'before' ? diff.before : diff.after) : null;
+      const texts = side === 'before' ? goals.before : goals.goals;
+      if (!texts.length) {
+        bodyEl.innerHTML = '<span class="verso-no-goals">No goals</span>';
+      } else if (shown) {
+        const mark = side === 'before' ? 'del' : 'ins';
+        bodyEl.innerHTML = shown.map((view) => `<span class="verso-goal verso-goal-${view.status}">${view.lines.map((line) => {
+          const wholeLine = line.status === 'ins' || line.status === 'del';
+          const body = line.segments.map((seg) => (seg.changed && !wholeLine
+            ? `<span class="verso-diff-${mark}">${this.highlightLean(seg.text, { binders: false })}</span>`
+            : this.highlightLean(seg.text, { binders: false }))).join('');
+          return `<span class="verso-goal-line${wholeLine ? ` verso-diff-line-${mark}` : ''}">${body}</span>`;
+        }).join('')}</span>`).join('');
+      } else {
+        bodyEl.innerHTML = texts.map((goal) => `<span class="verso-goal">${goal.split('\n').map((line) =>
+          `<span class="verso-goal-line">${this.highlightLean(line, { binders: false })}</span>`).join('')}</span>`).join('');
+      }
+      this.goalsDiffShown = Boolean(diff && diff.changed);
+    }
+
     /** The status row's words (and button) for a state of the local helper, or null for no row. */
     helperStatus(helper, estimated) {
       const lead = estimated ? 'Estimated. ' : '';
@@ -369,6 +433,14 @@
         default:
           return null;
       }
+    }
+
+    /** Move to another tactic of the proof shown (the tooltip stays open while stepping). */
+    step(delta) {
+      const stepper = this.currentExtras && this.currentExtras.stepper;
+      if (!stepper || typeof stepper.go !== 'function') return;
+      if (!this.isPinned) this.togglePin();
+      stepper.go(delta);
     }
 
     /** Update what Lean's run adds while the tooltip stays open (progress of a run). */
@@ -523,7 +595,7 @@
       // 4. Typeclass Instance Binders: [...]
       // 5. Implicit Binders: {...}
       // 6. Symbols & Operators: :=, →, ∀, ∃, etc.
-      const tokenRegex = /(--[^\n]*|\/-[\s\S]*?-\/)|("(?:\\[\s\S]|[^"\\])*")|(\b(?:def|theorem|lemma|axiom|inductive|structure|class|instance|where|by|have|let|suffices|show|fun|match|with|if|then|else)\b)|(\[[^\]]+\])|(\{[^}]+\})|(:=|→|∀|∃|∧|∨|¬|↔|≤|≥|=|≠|∈|⊆|∪|∩|:)/g;
+      const tokenRegex = /(--[^\n]*|\/-[\s\S]*?-\/)|("(?:\\[\s\S]|[^"\\])*")|(\b(?:def|theorem|lemma|axiom|inductive|structure|class|instance|where|by|have|let|suffices|show|fun|match|with|if|then|else|namespace|section|variable|include|omit|open|universe|set_option)\b)|(\[[^\]]+\])|(\{[^}]+\})|(:=|→|∀|∃|∧|∨|¬|↔|≤|≥|=|≠|∈|⊆|∪|∩|:)/g;
 
       let result = '';
       let lastIndex = 0;

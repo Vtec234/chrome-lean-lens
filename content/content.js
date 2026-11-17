@@ -9,8 +9,20 @@
     enabled: true,
     hoverDelay: 250,
     enablePRScanner: true,
-    enableBuiltins: true
+    enableBuiltins: true,
+    showOutline: true
   };
+
+  /** Show or hide the outline button for the Lean files on this page. */
+  function refreshOutline() {
+    const panel = window.LeanOutlinePanel;
+    if (!panel) return;
+    if (settings.showOutline === false) {
+      if (panel.root) panel.root.classList.add('lean-outline-gone');
+      return;
+    }
+    panel.refresh();
+  }
 
   let hoverTimer = null;
   let loadingTimer = null;
@@ -30,6 +42,7 @@
       chrome.runtime.sendMessage({ action: "GET_SETTINGS" }, (res) => {
         if (res && res.settings) {
           settings = Object.assign(settings, res.settings);
+          refreshOutline();
         }
       });
     } catch (err) {
@@ -46,6 +59,7 @@
     rescanDebounceTimer = setTimeout(() => {
       window.LeanPRScanner.scanPage();
       indexProjectFiles();
+      refreshOutline();
     }, 350);
   }
 
@@ -75,9 +89,11 @@
    * Initialize PR diff scanning on GitHub.
    */
   function initPRScanner() {
+    refreshOutline();
     if (!settings.enablePRScanner) return;
     window.LeanPRScanner.scanPage();
     indexProjectFiles();
+    refreshOutline();
 
     // Re-scan when GitHub mounts new virtualized diff chunks
     const observer = new MutationObserver((mutations) => {
@@ -732,7 +748,9 @@
   /** What the tooltip adds from Lean's run: goals and messages when it has run, else its state. */
   function exactExtras(tokenInfo, exact) {
     if (exact.state === 'ready') {
-      return { lean: exact.lean, goals: exact.goals, messages: exact.messages, helper: { state: 'ready' } };
+      const goals = exact.goals;
+      const stepper = goals && goals.steps > 1 && exact.fileRef ? { go: (delta) => stepBy(tokenInfo, exact, delta) } : null;
+      return { lean: exact.lean, goals, messages: exact.messages, helper: { state: 'ready' }, stepper };
     }
     return {
       lean: null, goals: null, messages: [],
@@ -742,6 +760,80 @@
         run: () => runLean(tokenInfo, exact)
       }
     };
+  }
+
+  /**
+   * Step through the proof the hovered tactic is in (the tooltip's ◀ ▶, or ← → while pinned):
+   * the goals at the previous or next tactic, with that tactic shaded in the code when it is on
+   * the page. The proof's steps are read from Lean's data once per hover.
+   */
+  function stepBy(tokenInfo, exact, delta) {
+    const goals = exact.goals;
+    if (!tokenInfo.proofSteps) {
+      tokenInfo.proofSteps = sendMessageP({ action: 'EXACT_STEPS', fileRef: exact.fileRef, index: goals.index })
+        .then((res) => (res && Array.isArray(res.steps) ? res.steps : []));
+      tokenInfo.stepAt = goals.step;
+    }
+    tokenInfo.proofSteps.then((steps) => {
+      if (!steps.length || !window.VersoTooltipView.isVisible()) return;
+      const at = Math.max(0, Math.min(steps.length - 1, tokenInfo.stepAt + delta));
+      if (at === tokenInfo.stepAt && tokenInfo.stepShown) return;
+      tokenInfo.stepAt = at;
+      tokenInfo.stepShown = true;
+      const step = steps[at];
+      const view = window.VersoTooltipView;
+      const extras = Object.assign({}, tokenInfo.extras, {
+        goals: Object.assign({}, step, { step: at, steps: steps.length }),
+        messages: step.messages || []
+      });
+      tokenInfo.extras = extras;
+      const shade = regionRanges(tokenInfo.textNode, step.range);
+      const side = view.goalsSide;
+      const pinned = view.isPinned;
+      // The card is now about the tactic stepped to, not the token first hovered.
+      view.show(null, shade.length ? shade[0].getBoundingClientRect() : tokenInfo.boundingRect, shade.length ? shade : tokenInfo.shade, extras);
+      view.goalsSide = side;
+      if (pinned && !view.isPinned) view.togglePin();
+      view.renderExtras(extras);
+      if (shade.length) {
+        const el = shade[0].startContainer.parentElement;
+        const rect = shade[0].getBoundingClientRect();
+        if (el && (rect.top < 0 || rect.bottom > window.innerHeight)) el.scrollIntoView({ block: 'center' });
+      }
+    });
+  }
+
+  /**
+   * Ranges over a region of the hovered file (`[line, column, end line, end column]`) on the
+   * lines the page shows, one per line, without indentation.
+   */
+  function regionRanges(textNode, region) {
+    const ctx = window.VersoBinderContext;
+    const tk = window.LeanTokenizer;
+    const internal = ctx && ctx.internal;
+    const d = internal && internal.domLineEls ? internal.domLineEls(textNode) : null;
+    if (!d || !region || !internal.lineFor) return [];
+    const here = internal.lineFor(d.els[d.idx]);
+    const byLine = new Map();
+    for (const el of d.els) {
+      const pos = internal.lineFor(el);
+      if (pos && (!here || pos.side === here.side)) byLine.set(pos.line, el);
+    }
+    const out = [];
+    for (let line = region[0]; line <= region[2]; line++) {
+      const el = byLine.get(line);
+      if (!el) continue;
+      const container = tk.codeContainer(el);
+      const marker = tk.markerLength(container);
+      const text = (container.textContent || '').slice(marker);
+      let from = line === region[0] ? region[1] : 0;
+      let to = line === region[2] ? region[3] : text.length;
+      while (from < to && /\s/.test(text[from])) from++;
+      while (to > from && /\s/.test(text[to - 1])) to--;
+      const range = to > from ? tk.rangeForOffsets(container, marker + from, marker + to) : null;
+      if (range) out.push(range);
+    }
+    return out;
   }
 
   /** Lean's hover for a token, as a tooltip card. */
@@ -808,10 +900,67 @@
     setTimeout(tick, 1500);
   }
 
+  // The keywords that start a declaration: hovering one shows what is in force there.
+  const DECL_KEYWORDS = new Set(['theorem', 'lemma', 'def', 'abbrev', 'instance', 'opaque', 'example', 'structure',
+    'class', 'inductive', 'axiom', 'irreducible_def']);
+
+  /** Whether the hovered token is the keyword a declaration starts with (`theorem` in `@[simp] theorem foo`). */
+  function isDeclKeyword(tokenInfo) {
+    return Boolean(tokenInfo && tokenInfo.kind !== 'term' && DECL_KEYWORDS.has(tokenInfo.token) &&
+      /^\s*(?:@\[[^\]]*\]\s*)*(?:(?:private|protected|public|noncomputable|scoped|partial|nonrec|unsafe|meta)\s+)*$/.test(
+        (tokenInfo.linePrefix || '').replace(/^\s*(?:open|omit|include|set_option)\b.*?\sin\s+/, '')));
+  }
+
+  /**
+   * `#where` at a declaration: its namespaces and the `open`, `variable`, `include` and `omit`
+   * commands in force there, read from the file; on a pull request's own side, hints where a
+   * declaration it adds might belong.
+   */
+  function showWhere(tokenInfo) {
+    const ctx = window.VersoBinderContext;
+    const fileRef = ctx && ctx.fileRefFromDom ? ctx.fileRefFromDom(tokenInfo.textNode) : null;
+    if (!fileRef) return false;
+    const rev = ctx.pageRevision();
+    fileRef.baseSha = rev.base;
+    activeHover = tokenInfo;
+    sendMessageP({ action: 'DECL_WHERE', fileRef }).then((res) => {
+      if (!isCurrent(tokenInfo) || !res) return;
+      present(tokenInfo, whereCard(res, fileRef));
+    });
+    return true;
+  }
+
+  /** A `DECL_WHERE` answer as a tooltip card. */
+  function whereCard(res, fileRef) {
+    const decl = res.decl;
+    const notes = [];
+    if (res.hints && res.hints.length) {
+      notes.push(`**Placement**\n\n${res.hints.map((h) => `- ${h.text}`).join('\n')}`);
+    }
+    const similar = (res.similar || []).filter((s) => !(res.hints || []).some((h) => h.line === s.line));
+    if (similar.length) {
+      notes.push(`Similar in this file: ${similar.map((s) => `\`${s.name}\` (line ${s.line})`).join(', ')}.`);
+    }
+    if (!res.where) notes.unshift('Nothing opened and no variables here: the top level of the file.');
+    return {
+      name: decl ? decl.fullName || decl.name || decl.kind : 'Context',
+      kind: 'where',
+      typeSignature: res.where || '',
+      docstring: notes.join('\n\n'),
+      source: 'outline',
+      bare: !res.where,
+      filePath: fileRef.path,
+      lineNumber: decl ? decl.line : fileRef.line,
+      isNew: res.isNew
+    };
+  }
+
   /**
    * Resolve and display hover definition.
    */
   function triggerHoverLookup(tokenInfo) {
+    // The keyword starting a declaration: what is in force there (`#where`).
+    if (isDeclKeyword(tokenInfo) && showWhere(tokenInfo)) return;
     // A Verso document's prose (known once the file has been read): no hover.
     if (isPromise(tokenInfo.verso)) {
       tokenInfo.verso.then((state) => {
@@ -1017,7 +1166,7 @@
       else tokenInfo.verso = verso;
     }
     // (A keyword has a hover only from Lean's own data: its docs, and the proof state there.)
-    if (!tokenInfo || !tokenInfo.token || (tokenInfo.isKeyword && !settings.enableHelper)) {
+    if (!tokenInfo || !tokenInfo.token || (tokenInfo.isKeyword && !settings.enableHelper && !isDeclKeyword(tokenInfo))) {
       if (hoverTimer) {
         clearTimeout(hoverTimer);
         hoverTimer = null;
@@ -1070,6 +1219,7 @@
     // Handle GitHub SPA soft navigations (Turbo / PJAX)
     const handleNavigation = () => {
       window.VersoTooltipView.hide(true);
+      setTimeout(refreshOutline, 500);
       setTimeout(() => {
         initPRScanner();
       }, 500);
@@ -1105,7 +1255,7 @@
 
   // Exposed for the test suite.
   window.VersoContentInternals = { receiverFor, lookupContext, isInProse, isInAttribute, isInString, refineLocal, triggerTermLookup, versoState, inLeanNames,
-    triggerHoverLookup, exactCard, exactExtras, setSettings: (values) => Object.assign(settings, values), hovering: (token) => { lastHoveredToken = token; } };
+    triggerHoverLookup, exactCard, exactExtras, regionRanges, isDeclKeyword, whereCard, setSettings: (values) => Object.assign(settings, values), hovering: (token) => { lastHoveredToken = token; } };
 
   // Startup
   loadSettings();

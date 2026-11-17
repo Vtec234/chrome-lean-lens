@@ -5,7 +5,7 @@
 
 // Shared binder parsing (also used by the content script).
 if (typeof importScripts === 'function') {
-  try { importScripts('../content/lean_terms.js', '../content/binder_context.js', '../content/pr_scanner.js'); } catch (err) { /* lookups still work without them */ }
+  try { importScripts('../content/lean_terms.js', '../content/binder_context.js', '../content/pr_scanner.js', '../content/lean_outline.js'); } catch (err) { /* lookups still work without them */ }
   // Reading what the local helper's real Lean run produced.
   try { importScripts('exact_data.js'); } catch (err) { /* approximate hovers still work */ }
 }
@@ -23,6 +23,8 @@ const DEFAULT_SETTINGS = {
   enableHelper: false,
   helperUrl: "http://127.0.0.1:5326",
   helperToken: "",
+  // The outline button beside a Lean file (declarations, `open`, `variable`, placement hints).
+  showOutline: true,
   theme: "auto"
 };
 
@@ -1373,6 +1375,81 @@ async function exactHover(request) {
     self.LeanLensExact.describe(file.data, fileRef.line, request.column, request.columnEnd, request.caret, request.chain, request.chainColumn));
 }
 
+// ---------------------------------------------------------------------------------------------
+// A file's outline, what is in force at a declaration (`#where`), and where it might belong.
+
+const outlineCache = new Map(); // file text (+ base text) → { entries, hints, added }
+
+/**
+ * The outline of the file `fileRef` names, at the commit the page shows. On a pull request's
+ * own side, the declarations it adds (`added`, their lines) and placement hints for those;
+ * elsewhere, hints for none (`hints` then only lists similar declarations on request).
+ */
+async function fileOutline(fileRef) {
+  const outline = self.LeanOutline;
+  if (!outline || !fileRef || !fileRef.path) return null;
+  const text = await getFileText(Object.assign({}, fileRef, { line: undefined }));
+  if (text === null || text === undefined) return null;
+  const onPrSide = Boolean(fileRef.pr) && fileRef.side !== 'left';
+  const base = onPrSide ? await getFileText(Object.assign({}, fileRef, { side: 'left', sha: fileRef.baseSha || undefined })) : undefined;
+  const key = `${fileRef.owner}/${fileRef.repo}:${fileRef.path}\u0000${text}\u0000${onPrSide ? base : ''}`;
+  if (outlineCache.has(key)) return outlineCache.get(key);
+  const entries = outline.outline(text);
+  let added = null;
+  let hints = [];
+  if (onPrSide) {
+    // A file the pull request creates has no base: all of it is new.
+    const lines = outline.addedLines(base === null ? null : base, text);
+    added = entries.filter((e) => e.kind === 'decl' && lines.has(e.line)).map((e) => e.line);
+    hints = outline.placementHints(text, new Set(added), entries).filter((h) => h.hints.length);
+  }
+  const result = {
+    text, entries, added, hints,
+    slim: entries.map((e) => ({
+      kind: e.kind, line: e.line, endLine: e.endLine, depth: e.depth, text: e.text.split('\n')[0].slice(0, 160),
+      name: e.name || '', fullName: e.fullName || '', declKind: e.declKind || '', prefixes: e.prefixes || []
+    }))
+  };
+  if (outlineCache.size > 12) outlineCache.delete(outlineCache.keys().next().value);
+  outlineCache.set(key, result);
+  return result;
+}
+
+/** What is in force at `fileRef.line` (`#where`), the declaration there, and where it might belong. */
+async function declWhere(fileRef) {
+  const outline = self.LeanOutline;
+  const file = await fileOutline(fileRef);
+  if (!file || !fileRef.line) return null;
+  const ctx = outline.contextAt(file.text, fileRef.line, file.entries);
+  const decl = ctx.decl;
+  const placed = decl && decl.name ? outline.placementHints(file.text, new Set([decl.line]), file.entries)[0] : null;
+  const isNew = Boolean(decl && file.added && file.added.includes(decl.line));
+  return {
+    where: outline.whereText(ctx),
+    namespace: ctx.namespace,
+    decl: decl ? { kind: decl.declKind, name: decl.name, fullName: decl.fullName, line: decl.line, endLine: decl.endLine } : null,
+    isNew,
+    similar: placed ? placed.similar : [],
+    // Hints about placement only for what the pull request adds (the rest was there before).
+    hints: placed && (isNew || !file.added) && fileRef.pr ? placed.hints : []
+  };
+}
+
+/** Every step of the proof the recorded tactic `request.index` of a file is in (the stepper). */
+async function exactSteps(request) {
+  const fileRef = request.fileRef;
+  if (!fileRef || !fileRef.path || !self.LeanLensExact || typeof request.index !== 'number') return { steps: [] };
+  const sha = await commitOf(fileRef);
+  if (!sha) return { steps: [] };
+  const file = await exactFile(`${fileRef.owner}/${fileRef.repo}`, sha, fileRef.path);
+  if (file.state !== 'ready') return { steps: [] };
+  const exact = self.LeanLensExact;
+  return {
+    steps: exact.stepsOfProof(file.data, request.index)
+      .map((step) => Object.assign(step, { messages: exact.messagesAt(file.data, step.range[0], step.range[1]) }))
+  };
+}
+
 /** Start Lean on files of a commit. The page only sends this after a click. */
 async function helperRun(request) {
   const sha = request.sha || await commitOf(request);
@@ -1464,6 +1541,15 @@ const MESSAGE_HANDLERS = {
   EXACT_HOVER: (request) => exactHover(request),
   // Ask the helper to run Lean on files of a commit (only ever after a click in the page).
   HELPER_RUN: (request) => helperRun(request),
+  // A file's outline (with the scope commands), the declarations a PR adds, and hints for those.
+  FILE_OUTLINE: async (request) => {
+    const file = await fileOutline(request.fileRef);
+    return file ? { entries: file.slim, added: file.added, hints: file.hints } : null;
+  },
+  // `#where` at a declaration: its namespaces, `open`s, `variable`s, `include`s and `omit`s.
+  DECL_WHERE: (request) => declWhere(request.fileRef),
+  // The proof a hovered tactic is in, step by step, for stepping through it in the tooltip.
+  EXACT_STEPS: (request) => exactSteps(request),
   HELPER_ALLOW: async (request) => {
     const res = await helperRequest('/allow', { body: { repo: request.repo } });
     exactCache.clear();

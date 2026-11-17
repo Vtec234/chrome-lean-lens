@@ -8,6 +8,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const themeSelect = document.getElementById('theme-select');
   const enablePRScanner = document.getElementById('enable-pr-scanner');
   const enableBuiltins = document.getElementById('enable-builtins');
+  const showOutline = document.getElementById('show-outline');
   const enableLoogle = document.getElementById('enable-loogle');
   const enableHelper = document.getElementById('enable-helper');
   const helperUrl = document.getElementById('helper-url');
@@ -32,6 +33,7 @@ document.addEventListener('DOMContentLoaded', () => {
       themeSelect.value = currentSettings.theme || 'auto';
       enablePRScanner.checked = currentSettings.enablePRScanner !== false;
       enableBuiltins.checked = currentSettings.enableBuiltins !== false;
+      showOutline.checked = currentSettings.showOutline !== false;
       enableLoogle.checked = currentSettings.enableLoogle !== false;
       enableHelper.checked = Boolean(currentSettings.enableHelper);
       helperUrl.value = currentSettings.helperUrl || 'http://127.0.0.1:5326';
@@ -53,6 +55,7 @@ document.addEventListener('DOMContentLoaded', () => {
       theme: themeSelect.value,
       enablePRScanner: enablePRScanner.checked,
       enableBuiltins: enableBuiltins.checked,
+      showOutline: showOutline.checked,
       enableLoogle: enableLoogle.checked,
       enableHelper: enableHelper.checked,
       helperUrl: helperUrl.value.trim(),
@@ -83,6 +86,7 @@ document.addEventListener('DOMContentLoaded', () => {
   themeSelect.addEventListener('change', saveSettings);
   enablePRScanner.addEventListener('change', saveSettings);
   enableBuiltins.addEventListener('change', saveSettings);
+  showOutline.addEventListener('change', saveSettings);
   enableLoogle.addEventListener('change', saveSettings);
   enableHelper.addEventListener('change', saveSettings);
   // Save while typing or pasting too: `change` waits for the field to lose focus, which never

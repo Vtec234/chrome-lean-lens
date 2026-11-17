@@ -164,6 +164,7 @@ context.document.createElement = () => ({
 });
 context.document.body = { appendChild: () => {} };
 
+loadScript('content/goal_diff.js');
 loadScript('content/tooltip_view.js');
 const tooltipView = context.VersoTooltipView;
 assert(tooltipView, "VersoTooltipView should be defined");
@@ -1399,6 +1400,18 @@ console.log("21. Testing cases from sweeping DifferentProofs PRs...");
     vm.runInContext(fs.readFileSync(path.join(__dirname, '..', f), 'utf8'), cctx);
   }
   const CI = cctx.VersoContentInternals, cbc = cctx.VersoBinderContext;
+  // The keyword a declaration starts with shows `#where`; other keywords and words don't.
+  assert(CI.isDeclKeyword({ token: 'theorem', linePrefix: '' }));
+  assert(CI.isDeclKeyword({ token: 'lemma', linePrefix: '@[simp] private ' }));
+  assert(CI.isDeclKeyword({ token: 'theorem', linePrefix: 'open Real in ' }));
+  assert(!CI.isDeclKeyword({ token: 'def', linePrefix: '  exact foo ' }), 'not after other code');
+  assert(!CI.isDeclKeyword({ token: 'have', linePrefix: '  ' }));
+  const wc = CI.whereCard({ where: 'namespace A  -- line 3', decl: { kind: 'theorem', name: 'b', fullName: 'A.b', line: 5 }, isNew: true,
+    similar: [{ name: "b'", line: 9, score: 1 }, { name: 'c', line: 12, score: 0.6 }], hints: [{ kind: 'far', line: 9, text: 'Most like `b\'` at line 9: it may belong next to it.' }] },
+  { path: 'A.lean', line: 5 });
+  assert.strictEqual(wc.name, 'A.b');
+  assert.strictEqual(wc.typeSignature, 'namespace A  -- line 3');
+  assert(wc.docstring.startsWith('**Placement**') && wc.docstring.includes('Similar in this file: `c` (line 12).') && !wc.docstring.includes("`b'` (line 9)."), wc.docstring);
   cbc.contextFromDom = () => 'theorem foo : P ∧ Q := by\n  constructor';
   const lc = CI.lookupContext({ token: 'constructor', subToken: 'constructor', chainUpToCursor: 'constructor', linePrefix: '  ', lineSuffix: '', textNode: {} });
   assert.strictEqual(lc.queryToken, 'constructor', 'not `NOTATION_ALIASES.constructor`');
@@ -1505,6 +1518,60 @@ console.log("22. Testing real Lean data (the local helper)...");
     const rule = at(23, 'Nat.add_succ');
     assert(rule.token.typeSignature.startsWith('Nat.add_succ '), rule.token.typeSignature);
     assert.strictEqual(rule.goals.goals.join('|'), 'case succ\nk : Nat\nih : 0 + k = k\n⊢ (0 + k).succ = k + 1');
+    const same = (a, b, m) => assert.strictEqual(JSON.stringify(a), JSON.stringify(b), m);
+    // The goals before a tactic: after the one before it at the same level, or for a `rw` rule
+    // the goals before its `rw`. The first tactic of a nested `have … := by` has none recorded.
+    const lastLine = (goals) => goals && goals.map((g) => g.split('\n').pop());
+    same(lastLine(at(5, 'unfold').goals.before), ['⊢ double n = 2 * n']);
+    same(lastLine(at(6, 'omega').goals.before), ['⊢ n + n = 2 * n']);
+    same(lastLine(at(11, 'rw').goals.before), ['⊢ a + b = b + a'], '`rw [h₁]` follows the `have`');
+    assert.strictEqual(at(10, 'rw').goals.before, null, 'the first tactic of `have … := by` has no state before it');
+    same(lastLine(at(23, 'Nat.add_succ').goals.before), ['⊢ 0 + (k + 1) = k + 1'], 'the first rule: before its `rw`');
+    same(lastLine(at(23, 'ih').goals.before), ['⊢ (0 + k).succ = k + 1'], 'the next rule: after the one before');
+    same(lastLine(at(14, 'constructor').goals.before), ['⊢ p ∧ q']);
+    assert.strictEqual(at(4, 'by').goals.before, null, 'a `by` shows the state there, not a change');
+    // Stepping through a proof: its tactics in order, and where the hovered one is among them.
+    const two = at(16, 'exact');
+    assert.strictEqual(two.goals.steps, 8);
+    assert.strictEqual(two.goals.step, 6);
+    const steps = exact.stepsOfProof(data, two.goals.index);
+    same(steps.map((st) => st.tactic), ['by', 'constructor', '·', 'exact hp', '·', "have hq' : q := by exact hq", 'exact hq', "exact hq'"]);
+    same(steps[1].range, [14, 2, 14, 13]);
+    assert.strictEqual(exact.stepsOfProof(data, at(6, 'omega').goals.index).length, 3, 'only the proof the tactic is in');
+
+    // What a tactic changed, as in Lean's infoview.
+    const diff = context.LeanGoalDiff;
+    const constructorDiff = diff.diffStates(at(14, 'constructor').goals.before, at(14, 'constructor').goals.goals);
+    same(constructorDiff.after.map((v) => v.status), ['ins', 'ins'], 'goals with new case names are new');
+    same(constructorDiff.before.map((v) => v.status), ['del'], 'the goal split up is gone');
+    const haveDiff = diff.diffStates(at(16, 'have').goals.before, at(16, 'have').goals.goals);
+    const hq = haveDiff.after[0].lines.find((l) => l.segments.map((x) => x.text).join('').startsWith('hq'));
+    assert.strictEqual(hq.status, 'changed');
+    same(hq.segments.filter((x) => x.changed).map((x) => x.text.trim()), ["hq'"], 'only the new name is marked');
+    const unfoldDiff = diff.diffStates(at(5, 'unfold').goals.before, at(5, 'unfold').goals.goals);
+    const target = unfoldDiff.after[0].lines[1];
+    assert.strictEqual(target.status, 'changed');
+    same(target.segments.filter((x) => x.changed).map((x) => x.text), ['n +'], 'the part of the target that changed (one `n` is shared)');
+    same(unfoldDiff.before[0].lines[1].segments.filter((x) => x.changed).map((x) => x.text), ['double']);
+    assert.strictEqual(unfoldDiff.after[0].lines[0].status, 'same', 'an unchanged hypothesis');
+    const intro = diff.diffStates(['p q : Prop\n⊢ p → q'], ['p q : Prop\nhp : p\n⊢ q']);
+    same(intro.after[0].lines.map((l) => l.status), ['same', 'ins', 'changed']);
+    assert.strictEqual(diff.diffStates(['⊢ a'], ['⊢ a']).changed, false);
+    // The tooltip: the goals after with what is new marked, and the goals before on request.
+    const titleEl = { innerHTML: '' };
+    const bodyEl = { innerHTML: '' };
+    tooltipView.goalsSide = 'after';
+    tooltipView.renderGoals(at(5, 'unfold').goals, { go() {} }, titleEl, bodyEl);
+    assert(bodyEl.innerHTML.includes('<span class="verso-diff-ins">n +</span>'), bodyEl.innerHTML);
+    assert(titleEl.innerHTML.includes('data-side="before"') && titleEl.innerHTML.includes('2/3'), titleEl.innerHTML);
+    tooltipView.goalsSide = 'before';
+    tooltipView.renderGoals(at(5, 'unfold').goals, null, titleEl, bodyEl);
+    assert(bodyEl.innerHTML.includes('<span class="verso-diff-del">double</span>'), bodyEl.innerHTML);
+    assert(!titleEl.innerHTML.includes('data-step'), 'no step buttons without a stepper');
+    tooltipView.goalsSide = 'after';
+    tooltipView.renderGoals(at(4, 'by').goals, null, titleEl, bodyEl);
+    assert(!bodyEl.innerHTML.includes('verso-diff') && titleEl.innerHTML.startsWith('<span class="verso-goals-label">Goal at'), 'a `by`: the state alone');
+
     // Lean's messages: an error, and `#check`'s output.
     const failed = at(30, 'rfl');
     assert.strictEqual(failed.messages[0].severity, 'error');
@@ -2314,6 +2381,98 @@ asyncChecks.push(import('../scripts/build-firefox.mjs').then(({ firefoxManifest 
   assert.strictEqual(listeners.length, 1, 'the event page listens for messages');
   console.log("   ✓ Firefox build verified.\n");
 }));
+
+// 23. A file's outline, `#where` at a declaration, and where a declaration might belong.
+console.log("23. Testing the file outline, #where and placement hints...");
+{
+  loadScript('content/lean_outline.js');
+  const O = context.LeanOutline;
+  const same = (a, b, m) => assert.strictEqual(JSON.stringify(a), JSON.stringify(b), m);
+  const src = fs.readFileSync(path.join(__dirname, 'fixtures', 'Outline.lean'), 'utf8');
+  const entries = O.outline(src);
+  same(entries.map((e) => `${e.line}:${e.kind}${e.declKind ? ' ' + e.declKind : ''}${e.name ? ' ' + e.name : ''}`), [
+    '1:import', '6:open', '8:namespace TopologicalSpace', '10:variable', '13:section Open', '15:variable', '16:include',
+    '20:decl theorem isOpen_foo', "22:decl theorem isOpen_foo'", '25:end Open', '28:decl theorem isClosed_bar',
+    '31:decl lemma card_eq', '33:decl def f', '37:end TopologicalSpace', '39:decl theorem _root_.foo_bar'],
+  'commands and declarations, not what is in comments');
+  const byLine = (l) => entries.find((e) => e.line === l);
+  same([byLine(20).fullName, byLine(39).fullName], ['TopologicalSpace.isOpen_foo', 'foo_bar'], 'names with their namespaces');
+  same([byLine(20).startLine, byLine(22).endLine, byLine(33).endLine], [19, 23, 35], 'attributes, indented proofs and match arms belong to the declaration');
+  same(byLine(28).prefixes, ['open Topology'], '`open … in` applies to the next declaration alone');
+  same(byLine(31).prefixes, ['omit [TopologicalSpace X]']);
+  same([byLine(15).depth, byLine(20).depth, byLine(25).depth, byLine(39).depth], [2, 2, 1, 0], 'depth in namespaces and sections');
+  assert.strictEqual(byLine(10).text, 'variable {X : Type*} [TopologicalSpace X]\n  {s t : Set X}', 'a command\'s continuation lines');
+
+  // What is in force at a line, like `#where`.
+  const at20 = O.contextAt(src, 20, entries);
+  assert.strictEqual(at20.namespace, 'TopologicalSpace');
+  assert.strictEqual(at20.decl.name, 'isOpen_foo');
+  same(at20.commands.map((c) => c.kind), ['open', 'variable', 'variable', 'include']);
+  assert.strictEqual(O.whereText(at20), [
+    'open Set Filter  -- line 6',
+    'namespace TopologicalSpace  -- line 8',
+    '  variable {X : Type*} [TopologicalSpace X]  -- line 10',
+    '    {s t : Set X}',
+    '  section Open  -- line 13',
+    '    variable (hs : IsOpen s)  -- line 15',
+    '    include hs  -- line 16'].join('\n'));
+  // After `end Open`, the section's `variable` and `include` are gone; `open … in` shows.
+  same(O.contextAt(src, 28, entries).commands.map((c) => c.line), [6, 10]);
+  assert(O.whereText(O.contextAt(src, 28, entries)).endsWith('open Topology in  -- line 27'));
+  assert.strictEqual(O.whereText(O.contextAt(src, 39, entries)), 'open Set Filter  -- line 6', 'after the namespace closes');
+  assert.strictEqual(O.contextAt(src, 3, entries).decl, null, 'not in a declaration');
+
+  // Where a declaration belongs: next to those most like it.
+  const words = O.nameWords("Set.isOpen_iff'");
+  same(words, ['set', 'is', 'open', 'iff']);
+  const pr = [
+    'theorem isOpen_iff_nhds : A := x',
+    'theorem mul_comm_aux : B := y',
+    'theorem foo_le : C := z',
+    'theorem card_pos : D := w',
+    "theorem foo_le' : C := z",
+    'theorem continuous_add : E := x',
+    'theorem isClosed_iff_nhds : A := x', ''].join('\n');
+  const hints = O.placementHints(pr, new Set([2, 4, 7]));
+  same(hints.map((h) => h.hints.map((x) => x.kind)), [[], ['split'], ['far']]);
+  assert(hints[1].hints[0].text.includes('`foo_le` (line 3) from `foo_le\'` (line 5)'), hints[1].hints[0].text);
+  assert(hints[2].hints[0].text.startsWith('Most like `isOpen_iff_nhds` at line 1'), '`isClosed` and `isOpen` are alike: ' + hints[2].hints[0].text);
+  const together = pr.replace('theorem card_pos : D := w\n', '');
+  same(O.placementHints(together, new Set([3]))[0].hints, [], '`foo_le` next to `foo_le\'` is where it belongs');
+  same(O.placementHints(together, new Set([3]))[0].similar.map((x) => x.name), ["foo_le'"]);
+  // The lines a pull request adds.
+  same([...O.addedLines('a\nb\nc', 'a\nx\nb\nc\ny')], [2, 5]);
+  same([...O.addedLines(null, 'a\nb')], [1, 2], 'a new file is all new');
+  same([...O.addedLines('a\nb', 'a\nb')], []);
+
+  // Through the worker: `#where` and the hints for a declaration the pull request adds.
+  // (In a worker of its own, whose files are these two texts.)
+  const base = pr.split('\n').filter((l, i) => ![1, 3, 6].includes(i)).join('\n');
+  const wctx = {
+    console, setTimeout, clearTimeout, AbortController, URL, fetch: () => Promise.reject(new Error('offline')),
+    chrome: { runtime: { onMessage: { addListener: () => {} } }, storage: { local: { get: (k, cb) => cb({}), set: (v, cb) => cb && cb(), remove: (k, cb) => cb && cb() } } }
+  };
+  wctx.self = wctx; wctx.window = wctx; wctx.globalThis = wctx;
+  vm.createContext(wctx);
+  for (const f of ['content/lean_terms.js', 'content/binder_context.js', 'content/pr_scanner.js', 'content/lean_outline.js', 'background/exact_data.js', 'background/service_worker.js']) {
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '..', f), 'utf8'), wctx, { filename: f });
+  }
+  wctx.getFileText = (ref) => Promise.resolve(ref.side === 'left' ? base : pr);
+  asyncChecks.push((async () => {
+    const ref = { owner: 'o', repo: 'r', pr: '1', sha: 'h', baseSha: 'b', side: 'right', path: 'A.lean' };
+    const where = await wctx.declWhere(Object.assign({}, ref, { line: 4 }));
+    assert.strictEqual(where.decl.name, 'card_pos');
+    assert.strictEqual(where.isNew, true);
+    same(where.hints.map((h) => h.kind), ['split']);
+    const old = await wctx.declWhere(Object.assign({}, ref, { line: 3 }));
+    assert.strictEqual(old.isNew, false);
+    same(old.hints, [], 'no hints for what was there before');
+    const file = await wctx.fileOutline(ref);
+    same(file.added, [2, 4, 7]);
+    same(file.hints.map((h) => h.line), [4, 7]);
+  })());
+}
+console.log("   ✓ Outline, #where and placement hints verified.\n");
 
 Promise.all(asyncChecks).then(() => {
   console.log("   ✓ Rewrite replay verified.\n");

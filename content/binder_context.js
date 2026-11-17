@@ -1658,7 +1658,7 @@
     contextFromDom, fileRefFromDom, pageRevision, versoAbove,
     // For term_hover.js.
     internal: {
-      DECL_START, LINE_SELECTORS, ROW_SEL, domLineEls, headerEnd, inferPending, localType, localVariableInfo,
+      DECL_START, LINE_SELECTORS, ROW_SEL, domLineEls, lineFor, headerEnd, inferPending, localType, localVariableInfo,
       nearbyRowLines, projectionType, replayChanges
     }
   };

@@ -450,6 +450,44 @@ body.dark-mode .verso-hover-container,
   color: var(--verso-text-muted, #8b949e);
 }
 
+/* Goals one per block, a gap between them; each line its own row (for whole-line marks). */
+.verso-goal { display: block; }
+.verso-goal + .verso-goal { margin-top: 0.9em; }
+.verso-goal-line { display: block; min-height: 1.45em; }
+
+/* What a tactic changed, as in Lean's infoview: new in green, gone in red. */
+.verso-diff-ins { background: rgba(46, 160, 67, 0.28); border-radius: 2px; }
+.verso-diff-del { background: rgba(248, 81, 73, 0.28); border-radius: 2px; }
+.verso-diff-line-ins { background: rgba(46, 160, 67, 0.18); box-shadow: inset 2px 0 0 #2ea043; }
+.verso-diff-line-del { background: rgba(248, 81, 73, 0.18); box-shadow: inset 2px 0 0 #f85149; }
+
+/* The title row of the proof state: steps, which tactic, before/after. */
+.verso-goals-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.verso-goals-label { flex: 1 1 auto; min-width: 0; }
+.verso-steps, .verso-goal-sides { display: inline-flex; align-items: center; gap: 2px; flex: none; }
+.verso-step-count { font-variant-numeric: tabular-nums; padding: 0 3px; }
+.verso-step-btn, .verso-side-btn {
+  font: inherit;
+  font-size: 10.5px;
+  line-height: 1.4;
+  padding: 0 5px;
+  border: 1px solid var(--verso-border, #30363d);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--verso-text-muted, #8b949e);
+  cursor: pointer;
+}
+.verso-step-btn:hover:not([disabled]), .verso-side-btn:hover { color: var(--verso-text, #e6edf3); }
+.verso-step-btn[disabled] { opacity: 0.35; cursor: default; }
+.verso-side-btn + .verso-side-btn { border-left: none; border-top-left-radius: 0; border-bottom-left-radius: 0; }
+.verso-side-btn:first-child:not(:last-child) { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.verso-side-btn.verso-side-active { color: var(--verso-text, #e6edf3); background: var(--verso-code-bg, #0d1117); }
+
 /* Lean's messages at the hovered code (errors, warnings, `#check` output). */
 .verso-message {
   border-left: 3px solid var(--verso-border, #30363d);
@@ -566,3 +604,187 @@ body.dark-mode .verso-hover-container,
 .verso-hidden {
   display: none !important;
 }
+
+.verso-kind-where {
+  background: rgba(56, 139, 253, 0.15);
+  color: #58a6ff;
+  border: 1px solid rgba(56, 139, 253, 0.4);
+}
+
+/* ------------------------------------------------------------------------------------------ */
+/* The outline panel: a file's declarations and scope commands, beside the diff.             */
+
+[data-color-mode="light"] .lean-outline,
+body:not([data-color-mode="dark"]):not(.dark-mode) .lean-outline {
+  --verso-bg: #ffffff;
+  --verso-text: #1f2328;
+  --verso-text-muted: #656d76;
+  --verso-border: #d0d7de;
+  --verso-code-bg: #f6f8fa;
+  --verso-header-bg: #f8fafc;
+  --verso-kw: #cf222e;
+  --verso-sym: #0969da;
+  --verso-implicit: #8250df;
+  --verso-inst: #1a7f37;
+}
+
+[data-color-mode="dark"] .lean-outline,
+body.dark-mode .lean-outline,
+.lean-outline {
+  --verso-bg: #161b22;
+  --verso-text: #e6edf3;
+  --verso-text-muted: #8b949e;
+  --verso-border: #30363d;
+  --verso-code-bg: #0d1117;
+  --verso-header-bg: #1c2128;
+  --verso-kw: #ff7b72;
+  --verso-sym: #79c0ff;
+  --verso-implicit: #d2a8ff;
+  --verso-inst: #7ee787;
+}
+
+.lean-outline {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 9999998;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 12px;
+  color: var(--verso-text);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+.lean-outline.lean-outline-gone { display: none; }
+
+.lean-outline-toggle {
+  font: inherit;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--verso-border);
+  background: var(--verso-bg);
+  color: var(--verso-text);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+}
+.lean-outline-toggle:hover { border-color: #6366f1; }
+.lean-outline-is-open .lean-outline-toggle { order: 2; }
+
+.lean-outline-panel {
+  width: min(520px, calc(100vw - 32px));
+  max-height: min(70vh, 720px);
+  display: flex;
+  flex-direction: column;
+  background: var(--verso-bg);
+  border: 1px solid var(--verso-border);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+.lean-outline-panel.lean-outline-hidden { display: none; }
+
+.lean-outline-head, .lean-outline-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--verso-header-bg);
+  border-bottom: 1px solid var(--verso-border);
+}
+.lean-outline-tools { padding-top: 6px; padding-bottom: 6px; color: var(--verso-text-muted); }
+.lean-outline-tools label { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.lean-outline-file, .lean-outline-filter {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  color: var(--verso-text);
+  background: var(--verso-code-bg);
+  border: 1px solid var(--verso-border);
+  border-radius: 5px;
+  padding: 3px 6px;
+}
+.lean-outline-file.lean-outline-single { pointer-events: none; appearance: none; }
+.lean-outline-close {
+  font: inherit;
+  background: transparent;
+  border: none;
+  color: var(--verso-text-muted);
+  cursor: pointer;
+}
+.lean-outline-summary { padding: 6px 10px; color: var(--verso-text-muted); border-bottom: 1px solid var(--verso-border); }
+.lean-outline-list { overflow: auto; padding: 4px 0; flex: 1 1 auto; }
+.lean-outline-foot { padding: 6px 10px; color: var(--verso-text-muted); border-top: 1px solid var(--verso-border); font-size: 11px; }
+.lean-outline-note { padding: 8px 12px; color: var(--verso-text-muted); font-style: italic; }
+
+.lean-outline-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 1px 10px 1px calc(10px + var(--depth, 0) * 14px);
+  line-height: 1.6;
+}
+.lean-outline-row:hover { background: var(--verso-code-bg); }
+.lean-outline-line {
+  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--verso-text-muted);
+  background: none;
+  border: none;
+  padding: 0;
+  min-width: 3.2em;
+  text-align: right;
+  cursor: pointer;
+  flex: none;
+}
+.lean-outline-line:hover { color: #6366f1; text-decoration: underline; }
+.lean-outline-kind {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--verso-kw);
+  min-width: 4.5em;
+}
+.lean-outline-cmd .lean-outline-kind { color: var(--verso-sym); }
+.lean-outline-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lean-outline-text code { font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--verso-text-muted); }
+.lean-outline-decl .lean-outline-text { cursor: pointer; }
+.lean-outline-name { font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.lean-outline-prefix { margin-left: 8px; color: var(--verso-text-muted); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.lean-outline-new {
+  flex: none;
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 999px;
+  color: #3fb950;
+  border: 1px solid rgba(63, 185, 80, 0.5);
+}
+.lean-outline-warn { flex: none; color: #d29922; cursor: help; }
+.lean-outline-hint {
+  margin: 0 10px 2px calc(10px + 3.2em + 6px + var(--depth, 0) * 14px);
+  padding: 2px 8px;
+  border-left: 2px solid #d29922;
+  color: var(--verso-text-muted);
+  cursor: pointer;
+}
+.lean-outline-hint code, .lean-outline-foot code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.lean-outline-where {
+  margin: 2px 10px 6px calc(10px + 3.2em + 6px + var(--depth, 0) * 14px);
+  padding: 6px 8px;
+  background: var(--verso-code-bg);
+  border: 1px solid var(--verso-border);
+  border-radius: 5px;
+  font: 11.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  color: var(--verso-text);
+}
+.lean-outline-where .v-comment, .lean-outline .v-comment { color: var(--verso-text-muted); }
+.lean-outline .v-kw { color: var(--verso-kw); }
+.lean-outline .v-sym { color: var(--verso-sym); }
+.lean-outline .v-implicit { color: var(--verso-implicit); }
+.lean-outline .v-inst { color: var(--verso-inst); }

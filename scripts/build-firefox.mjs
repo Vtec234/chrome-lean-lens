@@ -29,6 +29,7 @@ export function firefoxManifest(chrome) {
       'content/lean_terms.js',
       'content/binder_context.js',
       'content/pr_scanner.js',
+      'content/lean_outline.js',
       'background/exact_data.js',
       'background/service_worker.js'
     ]
