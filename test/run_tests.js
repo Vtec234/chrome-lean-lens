@@ -181,6 +181,11 @@ assert(highlighted.includes('<span class="v-inst">[TopologicalSpace α]</span>')
 assert(highlighted.includes('<span class="v-sym">:</span>'), "Colon should be wrapped in v-sym span");
 assert(highlighted.includes('<span class="v-sym">→</span>'), "Arrow should be wrapped in v-sym span");
 
+// An attribute is not an instance argument.
+const attributed = tooltipView.highlightLean('@[expose] public section\n@[simp] theorem t [Group G] : True');
+assert(attributed.includes('<span class="v-attr">@[expose]</span>') && attributed.includes('<span class="v-attr">@[simp]</span>'), attributed);
+assert(attributed.includes('<span class="v-inst">[Group G]</span>'), attributed);
+
 console.log("   ✓ Syntax Highlighter verified: perfectly renders Lean keywords, binders, and symbols.\n");
 
 // 5. Test Loogle Dynamic Hit Selection
@@ -1572,6 +1577,37 @@ console.log("22. Testing real Lean data (the local helper)...");
     tooltipView.renderGoals(at(4, 'by').goals, null, titleEl, bodyEl);
     assert(!bodyEl.innerHTML.includes('verso-diff') && titleEl.innerHTML.startsWith('<span class="verso-goals-label">Goal at'), 'a `by`: the state alone');
 
+    // Regions Lean records at a bracket: `simp_rw`'s `[` (named after its tactic) and the closing
+    // `]` of a `rw` (named after the `rw` and not stepped through: it repeats the `rw`'s state).
+    const bracket = {
+      hovers: [{ k: 'doc', n: 'simp_rw', p: 'Mathlib.Tactic.tacticSimp_rw___' }, { k: 'doc', n: 'by', p: 'Lean.Parser.Term.byTactic' }],
+      lines: { 1: [20, 22, 1], 2: [2, 9, 0] },
+      strings: ['⊢ a', '⊢ b', 'by', '[', 'h', 'rw [h]', ']'],
+      goals: [[0], [1]],
+      tactics: [[1, 20, 1, 22, 1, [0], 2], [2, 10, 2, 11, 0, [0], 3], [2, 11, 2, 12, 0, [1], 4], [3, 2, 3, 8, 0, [1], 5], [3, 7, 3, 8, 0, [1], 6]]
+    };
+    assert.strictEqual(exact.tacticAt(bracket, 2, 10).tactic, 'simp_rw [');
+    same(exact.stepsOfProof(bracket, 0).map((st) => st.tactic), ['by', 'simp_rw [', 'h', 'rw [h]']);
+    const closing = exact.tacticAt(bracket, 3, 7);
+    same([closing.tactic, closing.step, closing.steps], ['rw [h]', 3, 4], 'the `]` counts as its `rw`');
+
+    // Read like a person would: one change for what replaced a term, shared terms kept whole.
+    const differ2 = context.LeanGoalDiff;
+    const simpOnly = differ2.diffStates(['⊢ ∫ (v : V), Complex.exp (↑(-2 * π * ⟪v, w⟫) * Complex.I) • (f ∘ ⇑A) v = c'], ['⊢ ∫ (v : V), g (A v) = c']);
+    same(simpOnly.after[0].lines[0].segments.filter((x) => x.changed).map((x) => x.text), ['g (A v)'], 'not `g` and `)` with a stray `(`, `A`, `v`');
+    const fourierEq = differ2.tokenDiff('𝓕 (f ∘ ⇑A) w', '∫ (v : V), e v • (f ∘ ⇑A) v');
+    same(fourierEq.b.map((x) => [x.text, x.changed]), [['∫ (v : V), e v •', true], [' (f ∘ ⇑A) ', false], ['v', true]]);
+    same(fourierEq.a.map((x) => [x.text, x.changed]), [['𝓕', true], [' (f ∘ ⇑A) ', false], ['w', true]]);
+    // What replaced a term is marked where it now is (`(a).toReal` → `a`, as the infoview marks it).
+    same(differ2.tokenDiff('(a).toReal • b', 'a • b').b.filter((x) => x.changed).map((x) => x.text), ['a']);
+    // A line that only lost something: marked on the side where it changed, a bar on the other.
+    tooltipView.goalsSide = 'after';
+    tooltipView.renderGoals({ at: false, tactic: 'rw [h]', goals: ['⊢ a • b'], before: ['⊢ c • a • b'], step: 0, steps: 1 }, null, titleEl, bodyEl);
+    assert(bodyEl.innerHTML.includes('verso-diff-line-touched-ins') && !bodyEl.innerHTML.includes('verso-diff-ins'), bodyEl.innerHTML);
+    // A tactic that changed nothing: its goals, without a before/after switch.
+    tooltipView.renderGoals({ at: false, tactic: 'skip', goals: ['⊢ a'], before: ['⊢ a'], step: 0, steps: 1 }, null, titleEl, bodyEl);
+    assert(titleEl.innerHTML.includes('(no change)') && !titleEl.innerHTML.includes('data-side'), titleEl.innerHTML);
+
     // Lean's messages: an error, and `#check`'s output.
     const failed = at(30, 'rfl');
     assert.strictEqual(failed.messages[0].severity, 'error');
@@ -2422,6 +2458,15 @@ console.log("23. Testing the file outline, #where and placement hints...");
   assert.strictEqual(O.whereText(O.contextAt(src, 39, entries)), 'open Set Filter  -- line 6', 'after the namespace closes');
   assert.strictEqual(O.contextAt(src, 3, entries).decl, null, 'not in a declaration');
 
+  // Mathlib's module system: `module` and `public import` lines are the header; a section's
+  // `#where` line is written as in the file.
+  const moduleSrc = ['module', '', 'public import Mathlib.A', 'public meta import Mathlib.B', 'import Mathlib.C', '',
+    '@[expose] public section', '', 'noncomputable section', '', 'namespace Real -- the reals', '',
+    'theorem t : True := trivial', '', 'end Real', ''].join('\n');
+  const modEntries = O.outline(moduleSrc);
+  same(modEntries.filter((e) => e.kind === 'import').map((e) => e.line), [1, 3, 4, 5]);
+  assert.strictEqual(O.whereText(O.contextAt(moduleSrc, 13, modEntries)),
+    '@[expose] public section  -- line 7\n  noncomputable section  -- line 9\n    namespace Real  -- line 11');
   // Where a declaration belongs: next to those most like it.
   const words = O.nameWords("Set.isOpen_iff'");
   same(words, ['set', 'is', 'open', 'iff']);

@@ -44,9 +44,17 @@
   const TOKEN = /\s+|[\p{L}\p{N}_'!?.₀-₉ₐ-ₜ]+|./gu;
   const tokens = (s) => String(s).match(TOKEN) || [];
 
+  const weight = (text) => text.replace(/\s+/g, '').length;
+
   /**
-   * `a` and `b` as segments `{text, changed}`: the tokens of each not in their longest common
-   * subsequence are `changed`. Whitespace never counts as a change.
+   * `a` and `b` as segments `{text, changed}`: what is not in their longest common subsequence
+   * of tokens is `changed`. Whitespace never counts as a change.
+   *
+   * The raw token diff is cleaned up as diff-match-patch does for people to read: a small piece
+   * shared between two changes becomes part of them (`g (A v)` replacing `… • (f ∘ ⇑A) v` is
+   * one change, not `g` and `)` with a stray `(`, `A` and `v` kept), and what both sides of a
+   * change start or end with goes back to the text around it (`𝓕 (f ∘ ⇑A)` → `∫ … • (f ∘ ⇑A)`
+   * keeps `(f ∘ ⇑A)` whole).
    */
   function tokenDiff(a, b) {
     const x = tokens(a);
@@ -62,29 +70,90 @@
         table[i][j] = x[i] === y[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
       }
     }
-    const keepA = new Array(n).fill(false);
-    const keepB = new Array(m).fill(false);
-    for (let i = 0, j = 0; i < n && j < m;) {
-      if (x[i] === y[j]) { keepA[i] = keepB[j] = true; i++; j++; }
-      else if (table[i + 1][j] >= table[i][j + 1]) i++;
-      else j++;
-    }
-    const segments = (toks, keep) => {
-      const out = [];
-      toks.forEach((t, i) => {
-        const changed = !keep[i] && !/^\s+$/.test(t);
-        const last = out[out.length - 1];
-        // Whitespace between two changed tokens is part of the change.
-        if (last && (last.changed === changed || (/^\s+$/.test(t) && last.changed))) last.text += t;
-        else out.push({ text: t, changed });
-      });
-      // Trailing whitespace of a change is not part of it.
-      return out.flatMap((s) => {
-        const m2 = s.changed && s.text.match(/^(.*?)(\s+)$/s);
-        return m2 ? [{ text: m2[1], changed: true }, { text: m2[2], changed: false }] : [s];
-      });
+    // The edit script: what both share (`eq`) between changes (`del` from a, `ins` in b).
+    const script = [];
+    const keep = (t) => {
+      const last = script[script.length - 1];
+      if (last && last.eq !== undefined) last.eq += t; else script.push({ eq: t });
     };
-    return { a: segments(x, keepA), b: segments(y, keepB) };
+    const change = (del, ins) => {
+      const last = script[script.length - 1];
+      if (last && last.eq === undefined) { last.del += del; last.ins += ins; } else script.push({ del, ins });
+    };
+    for (let i = 0, j = 0; i < n || j < m;) {
+      if (i < n && j < m && x[i] === y[j]) { keep(x[i]); i++; j++; }
+      else if (i < n && (j >= m || table[i + 1][j] >= table[i][j + 1])) { change(x[i], ''); i++; }
+      else { change('', y[j]); j++; }
+    }
+    cleanUp(script);
+    const side = (key) => {
+      const out = [];
+      for (const item of script) {
+        if (item.eq !== undefined) { out.push({ text: item.eq, changed: false }); continue; }
+        const text = item[key];
+        if (!text) continue;
+        // Whitespace around a change is not part of it.
+        const m2 = text.match(/^(\s*)([\s\S]*?)(\s*)$/);
+        if (m2[1]) out.push({ text: m2[1], changed: false });
+        if (m2[2]) out.push({ text: m2[2], changed: true });
+        if (m2[3]) out.push({ text: m2[3], changed: false });
+      }
+      // Neighbours of one kind as one segment.
+      return out.reduce((acc, seg) => {
+        const last = acc[acc.length - 1];
+        if (last && last.changed === seg.changed) last.text += seg.text; else acc.push(Object.assign({}, seg));
+        return acc;
+      }, []);
+    };
+    return { a: side('del'), b: side('ins') };
+  }
+
+  /** Make an edit script (`{eq}` and `{del, ins}` items) easier to read, in place. */
+  function cleanUp(script) {
+    // A shared piece no larger than the changes on both sides of it becomes part of them.
+    for (let again = true; again;) {
+      again = false;
+      for (let k = 1; k + 1 < script.length; k++) {
+        const eq = script[k];
+        const left = script[k - 1];
+        const right = script[k + 1];
+        if (eq.eq === undefined || left.eq !== undefined || right.eq !== undefined) continue;
+        const w = weight(eq.eq);
+        if (w <= Math.max(weight(left.del), weight(left.ins)) && w <= Math.max(weight(right.del), weight(right.ins))) {
+          left.del += eq.eq + right.del;
+          left.ins += eq.eq + right.ins;
+          script.splice(k, 2);
+          again = true;
+          break;
+        }
+      }
+    }
+    // What both sides of a change end (or start) with belongs to the shared text after (before) it.
+    for (let k = 0; k < script.length; k++) {
+      const item = script[k];
+      if (item.eq !== undefined || !item.del || !item.ins) continue;
+      const del = tokens(item.del);
+      const ins = tokens(item.ins);
+      let tail = 0;
+      while (tail < del.length && tail < ins.length && del[del.length - 1 - tail] === ins[ins.length - 1 - tail]) tail++;
+      // (Not all of a side: something must stay changed.)
+      if (tail >= del.length || tail >= ins.length) tail = 0;
+      let head = 0;
+      while (head < del.length - tail - 1 && head < ins.length - tail - 1 && del[head] === ins[head]) head++;
+      if (!tail && !head) continue;
+      const moved = del.slice(del.length - tail).join('');
+      const kept = del.slice(0, head).join('');
+      item.del = del.slice(head, del.length - tail).join('');
+      item.ins = ins.slice(head, ins.length - tail).join('');
+      if (tail) {
+        if (script[k + 1] && script[k + 1].eq !== undefined) script[k + 1].eq = moved + script[k + 1].eq;
+        else script.splice(k + 1, 0, { eq: moved });
+      }
+      if (head) {
+        if (script[k - 1] && script[k - 1].eq !== undefined) script[k - 1].eq += kept;
+        else { script.splice(k, 0, { eq: kept }); k++; }
+      }
+    }
   }
 
   const plain = (text) => [{ text, changed: false }];

@@ -118,13 +118,39 @@
     return outer[4] === 1 ? outer[5].map((goal) => goalText(data, goal)) : goalsBefore(data, p, depth + 1);
   }
 
+  /**
+   * What a recorded tactic is called in the tooltip: its first line, except for two regions
+   * Lean records at a bracket. `simp_rw [` records the state it starts from at its `[` (named
+   * here after the tactic before it on the line), and `rw […]` its closing `rfl` at the `]`
+   * (named after the `rw`, whose state it repeats).
+   */
+  function labelOf(data, index) {
+    const t = data.tactics[index];
+    const label = data.strings[t[6]];
+    if (label === ']') {
+      const p = structureOf(data).parent[index];
+      return p === -1 ? label : data.strings[data.tactics[p][6]];
+    }
+    if (label !== '[') return label;
+    let name = null;
+    const row = (data.lines && data.lines[t[0]]) || [];
+    for (let i = 0; i < row.length; i += 3) {
+      const hover = data.hovers[row[i + 2]];
+      if (row[i + 1] <= t[1] && hover && hover.k === 'doc' && /(^|\.)Tactic\./.test(hover.p || '')) name = hover.n;
+    }
+    return name ? `${name} [` : label;
+  }
+
+  /** Regions not stepped through: a `rw`'s closing `]` shows what the `rw` itself does. */
+  const skipped = (data, index) => data.strings[data.tactics[index][6]] === ']' && structureOf(data).parent[index] !== -1;
+
   /** A recorded tactic as the tooltip shows it. */
   function stepView(data, index) {
     const t = data.tactics[index];
     const at = t[4] === 1;
     return {
       at,
-      tactic: data.strings[t[6]],
+      tactic: labelOf(data, index),
       goals: t[5].map((goal) => goalText(data, goal)),
       before: at ? null : goalsBefore(data, index),
       range: t.slice(0, 4),
@@ -154,7 +180,10 @@
     if (index === -1) return null;
     const view = stepView(data, index);
     const steps = proofSteps(data, index);
-    return Object.assign(view, { step: steps.indices.indexOf(index), steps: steps.indices.length });
+    // (A region not stepped through counts as the step before it.)
+    let step = -1;
+    steps.indices.forEach((i, k) => { if (i <= index) step = k; });
+    return Object.assign(view, { step, steps: steps.indices.length });
   }
 
   /**
@@ -167,7 +196,9 @@
     if (!tactics[index]) return { indices: [] };
     const own = proof[index];
     const indices = [];
-    tactics.forEach((t, i) => { if (proof[i] === own && (own !== -1 || i === index)) indices.push(i); });
+    tactics.forEach((t, i) => {
+      if (proof[i] === own && (own !== -1 || i === index) && !skipped(data, i)) indices.push(i);
+    });
     return { indices };
   }
 

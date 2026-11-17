@@ -19,6 +19,8 @@
   const PREFIX_IN = /^((?:open|omit|include|set_option|variable)\b.*?)\s+in\b\s*(.*)$/;
   const SCOPE_CMDS = /^(namespace|section|end|open|variable|include|omit|universe|set_option|export)\b/;
   const OTHER_CMDS = /^(?:(?:local|scoped)\s+)?(?:notation|infix[lr]?|prefix|postfix|macro|macro_rules|syntax|elab|elab_rules|attribute|initialize|builtin_initialize|deriving|mutual|#\w+)\b/;
+  // The module header: `module`, `prelude`, `import A`, `public import A`, `public meta import A`.
+  const IMPORT = /^(?:module|prelude)\b|^(?:(?:public|private)\s+)?(?:meta\s+)?import\b/;
   // Lines at the start of a line that still belong to the command above.
   const CONTINUES = /^(?:\||where\b|deriving\b|termination_by\b|decreasing_by\b|with\b|:=|\)|\]|\}|⟩|·|<;>)/;
 
@@ -104,7 +106,7 @@
       if (!t) continue;
 
       const depth = frames.length;
-      const entry = { line: lineNo, endLine: lineNo, text: lines[i].trim(), depth };
+      const entry = { line: lineNo, endLine: lineNo, text: raw.trim(), depth };
       if ((m = t.match(DECL_RE))) {
         const attrs = pendingAttrs.concat(m[1].trim() ? [m[1].trim()] : []);
         const declKind = m[3].replace(/\s+/, ' ');
@@ -135,8 +137,8 @@
         entry.kind = 'section';
         entry.name = (t.match(/section\s+(\S+)/) || [])[1] || '';
         frames.push({ kind: 'section', name: entry.name, line: lineNo });
-      } else if (OTHER_CMDS.test(t) || /^import\b|^module\b|^prelude\b/.test(t)) {
-        entry.kind = /^(?:import|module|prelude)\b/.test(t) ? 'import' : 'command';
+      } else if (OTHER_CMDS.test(t) || IMPORT.test(t)) {
+        entry.kind = IMPORT.test(t) ? 'import' : 'command';
       } else {
         continue; // not a command (a stray line)
       }
@@ -156,7 +158,7 @@
     // A command's full text (its continuation lines), for those whose text matters.
     for (const e of entries) {
       if (e.endLine > e.line && /^(variable|include|omit|open|universe|set_option)$/.test(e.kind)) {
-        e.text = lines.slice(e.line - 1, e.endLine).map((l) => l.replace(/\s+$/, '')).join('\n').trim();
+        e.text = code.slice(e.line - 1, e.endLine).filter((l) => l.trim()).join('\n').trim();
       }
     }
     return entries;
@@ -178,7 +180,7 @@
       if (e.kind === 'decl' && e.line <= line && line <= e.endLine) decl = e;
       if (e.line === line && e.kind !== 'decl') continue; // the command being hovered itself
       if (e.kind === 'namespace' || e.kind === 'section') {
-        frames.push({ kind: e.kind, name: e.name, line: e.line });
+        frames.push({ kind: e.kind, name: e.name, line: e.line, text: e.text });
       } else if (e.kind === 'end') {
         frames.pop();
         // What the closed frame brought into scope goes with it.
@@ -212,7 +214,8 @@
     };
     commandsAt(0);
     ctx.frames.forEach((f, i) => {
-      out.push(indentFor() + mark(`${f.kind}${f.name ? ` ${f.name}` : ''}`, f.line));
+      // As written (`noncomputable section`, `@[expose] public section`).
+      out.push(indentFor() + mark(f.text || `${f.kind}${f.name ? ` ${f.name}` : ''}`, f.line));
       depth = i + 1;
       commandsAt(i + 1);
     });

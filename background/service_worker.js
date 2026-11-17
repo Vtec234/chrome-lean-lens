@@ -1404,7 +1404,7 @@ async function fileOutline(fileRef) {
     hints = outline.placementHints(text, new Set(added), entries).filter((h) => h.hints.length);
   }
   const result = {
-    text, entries, added, hints,
+    text, entries, added, hints, sha: await commitOf(fileRef),
     slim: entries.map((e) => ({
       kind: e.kind, line: e.line, endLine: e.endLine, depth: e.depth, text: e.text.split('\n')[0].slice(0, 160),
       name: e.name || '', fullName: e.fullName || '', declKind: e.declKind || '', prefixes: e.prefixes || []
@@ -1544,7 +1544,7 @@ const MESSAGE_HANDLERS = {
   // A file's outline (with the scope commands), the declarations a PR adds, and hints for those.
   FILE_OUTLINE: async (request) => {
     const file = await fileOutline(request.fileRef);
-    return file ? { entries: file.slim, added: file.added, hints: file.hints } : null;
+    return file ? { entries: file.slim, added: file.added, hints: file.hints, sha: file.sha } : null;
   },
   // `#where` at a declaration: its namespaces, `open`s, `variable`s, `include`s and `omit`s.
   DECL_WHERE: (request) => declWhere(request.fileRef),

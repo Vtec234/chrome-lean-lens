@@ -376,7 +376,10 @@
     renderGoals(goals, stepper, titleEl, bodyEl) {
       const esc = (str) => String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       const differ = typeof window !== 'undefined' && window.LeanGoalDiff;
-      const diff = differ && !goals.at && Array.isArray(goals.before) ? differ.diffStates(goals.before, goals.goals) : null;
+      const compared = differ && !goals.at && Array.isArray(goals.before) ? differ.diffStates(goals.before, goals.goals) : null;
+      // (A tactic that left the state as it was: its goals, said to be unchanged.)
+      const unchanged = Boolean(compared && !compared.changed);
+      const diff = unchanged ? null : compared;
       const side = diff && this.goalsSide === 'before' ? 'before' : 'after';
       const steps = stepper && goals.steps > 1 && goals.step >= 0
         ? `<span class="verso-steps"><button class="verso-step-btn" data-step="-1" title="Previous tactic (←)"${goals.step === 0 ? ' disabled' : ''}>◀</button>` +
@@ -388,7 +391,8 @@
           `<button class="verso-side-btn${s === side ? ' verso-side-active' : ''}" data-side="${s}">${s === 'before' ? 'Before' : 'After'}</button>`).join('')}</span>`
         : '';
       const label = goals.at ? 'Goal at' : side === 'before' ? 'Before' : 'After';
-      titleEl.innerHTML = `${steps}<span class="verso-goals-label">${label} <code class="verso-inline-code">${esc(goals.tactic)}</code></span>${switcher}`;
+      titleEl.innerHTML = `${steps}<span class="verso-goals-label">${label} <code class="verso-inline-code">${esc(goals.tactic)}</code>` +
+        `${unchanged ? ' <span class="verso-goals-same">(no change)</span>' : ''}</span>${switcher}`;
 
       const shown = diff ? (side === 'before' ? diff.before : diff.after) : null;
       const texts = side === 'before' ? goals.before : goals.goals;
@@ -401,13 +405,37 @@
           const body = line.segments.map((seg) => (seg.changed && !wholeLine
             ? `<span class="verso-diff-${mark}">${this.highlightLean(seg.text, { binders: false })}</span>`
             : this.highlightLean(seg.text, { binders: false }))).join('');
-          return `<span class="verso-goal-line${wholeLine ? ` verso-diff-line-${mark}` : ''}">${body}</span>`;
+          // A line that changed only by losing something (shown on the other side): a side bar.
+          const touched = line.status === 'changed' && !line.segments.some((seg) => seg.changed);
+          const cls = wholeLine ? ` verso-diff-line-${mark}` : touched ? ` verso-diff-line-touched-${mark}` : '';
+          return `<span class="verso-goal-line${cls}">${body}</span>`;
         }).join('')}</span>`).join('');
       } else {
         bodyEl.innerHTML = texts.map((goal) => `<span class="verso-goal">${goal.split('\n').map((line) =>
           `<span class="verso-goal-line">${this.highlightLean(line, { binders: false })}</span>`).join('')}</span>`).join('');
       }
       this.goalsDiffShown = Boolean(diff && diff.changed);
+      if (this.goalsDiffShown) this.revealChange(bodyEl);
+    }
+
+    /**
+     * Scroll what a tactic changed into view: with many hypotheses, the changed target is
+     * below the fold of the goals (or of their column).
+     */
+    revealChange(bodyEl) {
+      const run = () => {
+        const first = bodyEl.querySelector && bodyEl.querySelector('.verso-diff-ins, .verso-diff-del, .verso-diff-line-ins, ' +
+          '.verso-diff-line-del, .verso-diff-line-touched-ins, .verso-diff-line-touched-del');
+        if (!first || !first.getBoundingClientRect) return;
+        for (let el = first.parentElement; el && el !== this.container; el = el.parentElement) {
+          if (el.scrollHeight <= el.clientHeight + 1 || !/auto|scroll/.test(getComputedStyle(el).overflowY)) continue;
+          const box = el.getBoundingClientRect();
+          const at = first.getBoundingClientRect();
+          if (at.top < box.top || at.bottom > box.bottom) el.scrollTop += at.top - box.top - Math.min(48, box.height / 3);
+          return;
+        }
+      };
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run); else run();
     }
 
     /** The status row's words (and button) for a state of the local helper, or null for no row. */
@@ -595,7 +623,7 @@
       // 4. Typeclass Instance Binders: [...]
       // 5. Implicit Binders: {...}
       // 6. Symbols & Operators: :=, →, ∀, ∃, etc.
-      const tokenRegex = /(--[^\n]*|\/-[\s\S]*?-\/)|("(?:\\[\s\S]|[^"\\])*")|(\b(?:def|theorem|lemma|axiom|inductive|structure|class|instance|where|by|have|let|suffices|show|fun|match|with|if|then|else|namespace|section|variable|include|omit|open|universe|set_option)\b)|(\[[^\]]+\])|(\{[^}]+\})|(:=|→|∀|∃|∧|∨|¬|↔|≤|≥|=|≠|∈|⊆|∪|∩|:)/g;
+      const tokenRegex = /(--[^\n]*|\/-[\s\S]*?-\/)|("(?:\\[\s\S]|[^"\\])*")|(\b(?:def|theorem|lemma|axiom|inductive|structure|class|instance|where|by|have|let|suffices|show|fun|match|with|if|then|else|namespace|section|variable|include|omit|open|universe|set_option)\b)|(@\[[^\]]*\])|(\[[^\]]+\])|(\{[^}]+\})|(:=|→|∀|∃|∧|∨|¬|↔|≤|≥|=|≠|∈|⊆|∪|∩|:)/g;
 
       let result = '';
       let lastIndex = 0;
@@ -607,7 +635,7 @@
           result += escapeHtml(code.slice(lastIndex, match.index));
         }
 
-        const [full, comment, str, kw, inst, implicit, sym] = match;
+        const [full, comment, str, kw, attr, inst, implicit, sym] = match;
 
         if (comment) {
           result += `<span class="v-comment">${escapeHtml(comment)}</span>`;
@@ -615,6 +643,9 @@
           result += `<span class="v-str">${escapeHtml(str)}</span>`;
         } else if (kw) {
           result += `<span class="v-kw">${escapeHtml(kw)}</span>`;
+        } else if (attr) {
+          // An attribute (`@[simp]`, `@[expose]`), not an instance argument.
+          result += `<span class="v-attr">${escapeHtml(attr)}</span>`;
         } else if (inst || implicit) {
           if (binders) {
             result += `<span class="${inst ? 'v-inst' : 'v-implicit'}">${escapeHtml(full)}</span>`;

@@ -351,6 +351,10 @@ body.dark-mode .verso-hover-container,
   color: var(--verso-inst, #7ee787);
 }
 
+.v-attr {
+  color: var(--verso-text-muted, #8b949e);
+}
+
 .v-comment {
   color: var(--verso-text-muted, #8b949e);
   font-style: italic;
@@ -460,14 +464,25 @@ body.dark-mode .verso-hover-container,
 .verso-diff-del { background: rgba(248, 81, 73, 0.28); border-radius: 2px; }
 .verso-diff-line-ins { background: rgba(46, 160, 67, 0.18); box-shadow: inset 2px 0 0 #2ea043; }
 .verso-diff-line-del { background: rgba(248, 81, 73, 0.18); box-shadow: inset 2px 0 0 #f85149; }
+.verso-diff-line-touched-ins { box-shadow: inset 2px 0 0 #2ea043; }
+.verso-diff-line-touched-del { box-shadow: inset 2px 0 0 #f85149; }
+.verso-goals-same { font-weight: 400; font-style: italic; }
 
-/* The title row of the proof state: steps, which tactic, before/after. */
+/* The title row of the proof state: steps, which tactic, before/after. It stays in view
+   while a long state scrolls under it. */
 .verso-goals-title {
   display: flex;
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--verso-bg, #161b22);
+  padding-bottom: 4px;
 }
+/* (In two columns the state column scrolls, under its 10px padding: the row covers that too.) */
+.verso-two-col .verso-goals-title { top: -10px; padding-top: 10px; margin-top: -10px; }
 .verso-goals-label { flex: 1 1 auto; min-width: 0; }
 .verso-steps, .verso-goal-sides { display: inline-flex; align-items: center; gap: 2px; flex: none; }
 .verso-step-count { font-variant-numeric: tabular-nums; padding: 0 3px; }

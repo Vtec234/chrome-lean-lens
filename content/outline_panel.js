@@ -41,19 +41,44 @@
     }
   });
 
-  /** The page's code element for `line` of a file (the PR's side), or null when not shown. */
+  // The containers of a file's diff, as the PR scanner finds them.
+  const FILE_CONTAINERS = '.file, .js-file, [data-details-container-group="file"], [data-file-type=".lean"], ' +
+    '[data-component="diff-file"], [data-tag="diff-entry"], section[data-file-path], div[data-file-path]';
+
+  /** The page's diff containers of the file at `path`, outermost first. */
+  function fileContainers(path) {
+    const scanner = window.LeanPRScanner;
+    let all = Array.from(document.querySelectorAll(FILE_CONTAINERS));
+    if (!all.length) all = Array.from(document.querySelectorAll('[role="region"][aria-labelledby]'));
+    const pathOf = (el) => el.getAttribute('data-tagsearch-path') || (scanner ? scanner.extractFilePath(el) : el.getAttribute('data-file-path'));
+    const mine = all.filter((el) => pathOf(el) === path);
+    return mine.filter((el) => !mine.some((other) => other !== el && other.contains(el)));
+  }
+
+  /**
+   * Where a line-number element is: `{line, side}` as the hover code reads it from the row's
+   * code cell. (A row of GitHub's classic diff has the old and the new line number; only the
+   * code cell says which line of which side the row is.)
+   */
+  function positionOf(el) {
+    const internal = window.VersoBinderContext && window.VersoBinderContext.internal;
+    if (!internal || !internal.lineFor) return null;
+    if (el.hasAttribute('data-diff-side')) return internal.lineFor(el);
+    const row = el.closest('tr, [role="row"]');
+    const code = row && row.querySelector('td.blob-code, .blob-code-inner, [data-code-text], .react-code-text');
+    return code ? internal.lineFor(code) : null;
+  }
+
+  /** The page's row for `line` of a file (the PR's side), or null when it is not shown. */
   function lineElement(fileRef, line) {
-    const files = document.querySelectorAll('[data-file-path], [data-tagsearch-path], [data-path]');
-    const roots = Array.from(files).filter((el) =>
-      [el.getAttribute('data-file-path'), el.getAttribute('data-tagsearch-path'), el.getAttribute('data-path')].includes(fileRef.path));
-    for (const root of roots.length ? roots : [document]) {
-      const scope = root.closest('.file, [data-details-container-group="file"], [data-component="diff-file"], [data-tag="diff-entry"]') || root;
-      for (const cell of scope.querySelectorAll(`[data-line-number="${line}"]`)) {
-        if (cell.getAttribute('data-diff-side') === 'left') continue;
-        const row = cell.closest('tr, [role="row"]') || cell;
-        return row;
+    const roots = fileContainers(fileRef.path);
+    for (const root of roots) {
+      for (const el of root.querySelectorAll(`[data-line-number="${line}"]`)) {
+        const pos = positionOf(el);
+        if (pos && pos.line === line && pos.side !== 'left') return el.closest('tr, [role="row"]') || el;
       }
     }
+    if (roots.length || fileRef.pr) return null;
     // A file page.
     return document.getElementById(`LC${line}`) || document.querySelector(`[data-line-number="${line}"]`);
   }
@@ -139,8 +164,7 @@
       let best = null;
       let bestDistance = Infinity;
       for (const file of this.files) {
-        for (const el of document.querySelectorAll('[data-file-path], [data-tagsearch-path], [data-path]')) {
-          if (![el.getAttribute('data-file-path'), el.getAttribute('data-tagsearch-path'), el.getAttribute('data-path')].includes(file.path)) continue;
+        for (const el of fileContainers(file.path)) {
           const r = el.getBoundingClientRect();
           if (!r.height) continue;
           const distance = r.top <= middle && r.bottom >= middle ? 0 : Math.min(Math.abs(r.top - middle), Math.abs(r.bottom - middle));
@@ -202,7 +226,7 @@
         const label = isDecl ? e.declKind : KIND_LABEL[e.kind] || e.kind;
         const body = isDecl
           ? `<span class="lean-outline-name">${esc(e.name || '(anonymous)')}</span>${e.prefixes && e.prefixes.length ? `<span class="lean-outline-prefix">${esc(e.prefixes.map((p) => `${p} in`).join(' · '))}</span>` : ''}`
-          : `<code>${highlight(e.kind === 'command' ? e.text : e.text.replace(/^\S+\s*/, '') || e.text)}</code>`;
+          : `<code>${highlight(e.text.startsWith(`${e.kind} `) ? e.text.slice(e.kind.length + 1) : e.text === e.kind ? '' : e.text)}</code>`;
         const rowHints = hints.get(e.line) || [];
         const where = this.expanded.get(e.line);
         return `<div class="lean-outline-row lean-outline-${isDecl ? 'decl' : 'cmd'} lean-outline-k-${esc(e.kind)}" role="listitem" style="--depth:${e.depth}" data-line="${e.line}">
@@ -246,13 +270,18 @@
       const file = this.current;
       const el = lineElement(file, line);
       if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        // (At once: a smooth scroll is cut short by any other scrolling.)
+        el.scrollIntoView({ block: 'center' });
         el.classList.add('verso-highlight-target');
         setTimeout(() => el.classList.remove('verso-highlight-target'), 2500);
         return;
       }
+      // (The commit the file was read at: the page does not always say.)
+      const sha = (this.data && this.data.sha) || file.sha;
       const path = file.path.split('/').map(encodeURIComponent).join('/');
-      window.open(`https://github.com/${file.owner}/${file.repo}/blob/${file.sha}/${path}#L${line}`, '_blank', 'noopener');
+      const url = sha ? `https://github.com/${file.owner}/${file.repo}/blob/${sha}/${path}#L${line}`
+        : `https://github.com/${file.owner}/${file.repo}/pull/${file.pr}/files`;
+      window.open(url, '_blank', 'noopener');
     }
   }
 
