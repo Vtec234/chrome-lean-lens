@@ -23,9 +23,9 @@ node scripts/build-firefox.mjs
 
 1. Open `about:debugging#/runtime/this-firefox` and click **Load Temporary Add-on…**.
 2. Pick `dist/firefox/manifest.json`.
-3. If hovers don't appear, open `about:addons` → Lean Lens → **Permissions** and allow access to `github.com` and the other sites listed.
+3. If hovers don't appear, open `about:addons` → Lean Lens → **Permissions** and allow access to `github.com` and the other sites listed (including `127.0.0.1` and `localhost` for [real Lean](#real-lean)).
 
-A temporary add-on stays until Firefox quits. After pulling updates, run the build again and click **Reload** in `about:debugging`. `node scripts/build-firefox.mjs --zip` also packs `dist/lean-lens-firefox-<version>.zip` for submitting to addons.mozilla.org.
+A temporary add-on stays until Firefox quits, and its settings may go with it: paste the helper's token again after loading it anew. After pulling updates, run the build again and click **Reload** in `about:debugging`. `node scripts/build-firefox.mjs --zip` also packs `dist/lean-lens-firefox-<version>.zip` for submitting to addons.mozilla.org.
 
 ## Two kinds of hovers
 
@@ -63,7 +63,7 @@ Lean can run in two places:
 ### Set it up
 
 1. Start the helper with one of the commands above. It prints an address and a token.
-2. Open the extension's options (right-click its icon → **Options**), switch on **Use the local helper**, and paste the address and token.
+2. Open the extension's options (in Chrome, right-click its icon → **Options**; in Firefox, `about:addons` → Lean Lens → **Preferences**), switch on **Use the local helper**, and paste the address and token. They save as you type; **Test Connection** checks them.
 3. On a pull request, hover any name and press **Run Lean** in the tooltip. The first time on a repository, the button asks you to allow it.
 
 The tooltip shows the progress. When the run is done, hovers on those files are Lean's own. Results are kept, so they stay instant afterwards.
@@ -149,7 +149,7 @@ node helper/lean-lens-helper.mjs run --repo owner/repo --sha <full commit hash> 
 
 ## Extension options
 
-Right-click the toolbar icon → **Options**:
+In Chrome, right-click the toolbar icon → **Options**. In Firefox, open `about:addons` → Lean Lens → **Preferences**. Changes save as you make them.
 
 - **Hover delay** and **theme**
 - **Sources** for estimated hovers: the PR's own declarations, Loogle, built-in tactic docs
@@ -164,8 +164,9 @@ node test/run_tests.js
 The tests need no Lean installation. Many expected outputs are Lean's own hovers on the same code, and `test/demo_pr.html` imitates a GitHub diff for trying tooltips offline.
 
 ```
-manifest.json     Manifest V3 configuration
-background/       Service worker: Loogle, caching, the helper's client
+manifest.json     Manifest V3 configuration (Chrome)
+scripts/          build-firefox.mjs: the Firefox copy in dist/firefox/, with its own manifest
+background/       Service worker (an event page in Firefox): Loogle, caching, the helper's client
 content/          Hover handling, the term engine, the PR scanner, the tooltip
 options/, popup/  Settings page and toolbar popup
 helper/           The helper: runs Lean (locally or in a codespace) and converts its output
