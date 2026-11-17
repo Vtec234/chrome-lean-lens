@@ -1545,14 +1545,19 @@ console.log("22. Testing real Lean data (the local helper)...");
     same(lastLine(at(23, 'ih').goals.before), ['⊢ (0 + k).succ = k + 1'], 'the next rule: after the one before');
     same(lastLine(at(14, 'constructor').goals.before), ['⊢ p ∧ q']);
     assert.strictEqual(at(4, 'by').goals.before, null, 'a `by` shows the state there, not a change');
-    // Stepping through a proof: its tactics in order, and where the hovered one is among them.
+    // Stepping through a proof: its tactics in the order they finish (a `have`'s proof before
+    // the `have`, a `rw`'s rules before the `rw`), and where the hovered one is among them.
     const two = at(16, 'exact');
     assert.strictEqual(two.goals.steps, 8);
-    assert.strictEqual(two.goals.step, 6);
+    assert.strictEqual(two.goals.step, 5);
     const steps = exact.stepsOfProof(data, two.goals.index);
-    same(steps.map((st) => st.tactic), ['by', 'constructor', '·', 'exact hp', '·', "have hq' : q := by exact hq", 'exact hq', "exact hq'"]);
+    same(steps.map((st) => st.tactic), ['by', 'constructor', '·', 'exact hp', '·', 'exact hq', "have hq' : q := by exact hq", "exact hq'"]);
     same(steps[1].range, [14, 2, 14, 13]);
     assert.strictEqual(exact.stepsOfProof(data, at(6, 'omega').goals.index).length, 3, 'only the proof the tactic is in');
+    same(exact.stepsOfProof(data, at(23, 'rw').goals.index).map((st) => st.tactic),
+      ['by', '| zero =>', 'rfl', '| succ k ih =>', 'Nat.add_succ,', 'ih', 'rw [Nat.add_succ, ih]']);
+    same(exact.stepsOfProof(data, at(11, 'rw').goals.index).map((st) => st.tactic),
+      ['by', 'Nat.add_comm', 'rw [Nat.add_comm]', 'have h₁ : b + a = a + b := by …', 'h₁', 'rw [h₁]']);
 
     // What a tactic changed, as in Lean's infoview.
     const diff = context.LeanGoalDiff;
@@ -1600,6 +1605,22 @@ console.log("22. Testing real Lean data (the local helper)...");
     same(exact.stepsOfProof(bracket, 0).map((st) => st.tactic), ['by', 'simp_rw [', 'h', 'rw [h]']);
     const closing = exact.tacticAt(bracket, 3, 7);
     same([closing.tactic, closing.step, closing.steps], ['rw [h]', 3, 4], 'the `]` counts as its `rw`');
+    // A `rw` and its rules, with `rfl` at the `]` doing nothing (lines 2, 3) or closing the goal
+    // (line 4): `rw [h]` is its rule over again, so it stands for it; `rw [p, q]` repeats its
+    // last rule, so it is left out; `rw [r]`'s `]` is a step of its own, named after the `rw`.
+    const rws = {
+      hovers: [], lines: {},
+      strings: ['⊢ a', '⊢ b', '⊢ c', '⊢ d', '⊢ e', 'by', 'rw [h]', 'h', 'rw [p, q]', 'p', 'q', ']', 'rw [r]', 'r'],
+      goals: [[0], [1], [2], [3], [4]],
+      tactics: [[1, 15, 1, 17, 1, [0], 5], [2, 2, 2, 8, 0, [1], 6], [2, 6, 2, 7, 0, [1], 7],
+        [3, 2, 3, 11, 0, [3], 8], [3, 6, 3, 7, 0, [2], 9], [3, 9, 3, 10, 0, [3], 10], [3, 10, 3, 11, 0, [3], 11],
+        [4, 2, 4, 8, 0, [], 12], [4, 6, 4, 7, 0, [4], 13], [4, 7, 4, 8, 0, [], 11]]
+    };
+    const rwSteps = exact.stepsOfProof(rws, 0);
+    same(rwSteps.map((st) => st.tactic), ['by', 'rw [h]', 'p', 'q', 'r', 'rw [r]']);
+    same([rwSteps[5].before, rwSteps[5].goals], [['⊢ e'], []], 'what the `rfl` did');
+    same([2, 3, 6, 7, 9].map((i) => { const t = rws.tactics[i]; return exact.tacticAt(rws, t[0], t[1]).step; }), [1, 3, 3, 5, 5],
+      'each counts as the step showing its goals');
 
     // Read like a person would: one change for what replaced a term, shared terms kept whole.
     const differ2 = context.LeanGoalDiff;

@@ -141,9 +141,6 @@
     return name ? `${name} [` : label;
   }
 
-  /** Regions not stepped through: a `rw`'s closing `]` shows what the `rw` itself does. */
-  const skipped = (data, index) => data.strings[data.tactics[index][6]] === ']' && structureOf(data).parent[index] !== -1;
-
   /** A recorded tactic as the tooltip shows it. */
   function stepView(data, index) {
     const t = data.tactics[index];
@@ -180,26 +177,58 @@
     if (index === -1) return null;
     const view = stepView(data, index);
     const steps = proofSteps(data, index);
-    // (A region not stepped through counts as the step before it.)
-    let step = -1;
-    steps.indices.forEach((i, k) => { if (i <= index) step = k; });
-    return Object.assign(view, { step, steps: steps.indices.length });
+    return Object.assign(view, { step: steps.at, steps: steps.indices.length });
   }
 
   /**
-   * The tactics of the proof the tactic `index` is in, in the order they run:
-   * `{indices}`, each an index into `data.tactics`.
+   * The tactics of the proof the tactic `index` is in, in the order they finish, as moving
+   * through the text in the editor shows them: what a tactic contains (the rules of a `rw`, the
+   * proof of a `have`) comes before it. Left out are a bracket that changes nothing (where
+   * `simp_rw [` starts, the `rfl` at a `rw`'s `]` when it fails) and a tactic showing the same
+   * goals as the part of it just before (a `rw` after its last rule), unless it is that part
+   * over again (`rw [h]` after `h`), which it then replaces.
+   * Returns `{indices, at}`: indices into `data.tactics`, and the step tactic `index` counts as.
    */
   function proofSteps(data, index) {
-    const { proof } = structureOf(data);
+    const { parent, proof } = structureOf(data);
     const tactics = data.tactics || [];
-    if (!tactics[index]) return { indices: [] };
+    if (!tactics[index]) return { indices: [], at: -1 };
     const own = proof[index];
-    const indices = [];
-    tactics.forEach((t, i) => {
-      if (proof[i] === own && (own !== -1 || i === index) && !skipped(data, i)) indices.push(i);
+    const order = [];
+    tactics.forEach((t, i) => { if (proof[i] === own && (own !== -1 || i === index)) order.push(i); });
+    // By end, and of two ending together the inner (later starting) one first.
+    order.sort((a, b) => {
+      const s = tactics[a];
+      const t = tactics[b];
+      if (before(s[2], s[3], t[2], t[3])) return -1;
+      if (before(t[2], t[3], s[2], s[3])) return 1;
+      return startsBefore(t, s) ? -1 : startsBefore(s, t) ? 1 : a - b;
     });
-    return { indices };
+    const goals = (i) => tactics[i][5].map((goal) => goalText(data, goal)).join('\u0000');
+    const goalsFirst = (i) => {
+      const found = tactics[i][4] === 1 ? null : goalsBefore(data, i);
+      return found && found.join('\u0000');
+    };
+    const indices = [];
+    const countsAs = new Map();
+    const closing = [];
+    for (const i of order) {
+      const last = indices.length - 1;
+      const label = data.strings[tactics[i][6]];
+      if ((label === '[' || label === ']') && parent[i] !== -1 && goalsFirst(i) === goals(i)) {
+        countsAs.set(i, Math.max(0, last));
+        if (label === ']') closing.push(i);
+      } else if (last >= 0 && contains(tactics[i], tactics[indices[last]]) && goals(i) === goals(indices[last])) {
+        if (goalsFirst(i) === goalsFirst(indices[last])) indices[last] = i;
+        countsAs.set(i, last);
+      } else {
+        indices.push(i);
+        countsAs.set(i, indices.length - 1);
+      }
+    }
+    // (A `rw`'s `]` left out counts as what its `rw` counts as.)
+    closing.forEach((i) => { if (countsAs.has(parent[i])) countsAs.set(i, countsAs.get(parent[i])); });
+    return { indices, at: Math.min(countsAs.has(index) ? countsAs.get(index) : -1, indices.length - 1) };
   }
 
   /** Every step of the proof at tactic `index`, as `stepView` describes them. */
