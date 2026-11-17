@@ -2291,6 +2291,30 @@ console.log("22. Testing real Lean data (the local helper)...");
 }
 console.log("   ✓ Real Lean data verified (asynchronous checks follow).\n");
 
+// Firefox: the background runs as an event page from `background.scripts`, with no importScripts.
+asyncChecks.push(import('../scripts/build-firefox.mjs').then(({ firefoxManifest }) => {
+  const chromeManifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'manifest.json'), 'utf8'));
+  const ff = firefoxManifest(chromeManifest);
+  assert(!ff.background.service_worker && ff.browser_specific_settings.gecko.id, 'Firefox manifest uses an event page and has an id');
+  assert.strictEqual(chromeManifest.background.service_worker, 'background/service_worker.js', 'the Chrome manifest is left as it is');
+  // The event page loads what the service worker imports, then the worker itself.
+  const imported = [...workerSrc.matchAll(/importScripts\(([^)]*)\)/g)]
+    .flatMap(m => [...m[1].matchAll(/'([^']+)'/g)].map(s => path.posix.join('background', s[1])));
+  assert.deepStrictEqual(ff.background.scripts, [...imported, 'background/service_worker.js'], 'Firefox background scripts match importScripts');
+  const listeners = [];
+  const fctx = {
+    console, setTimeout, clearTimeout, setInterval, clearInterval, fetch: () => Promise.reject(new Error('offline')),
+    AbortController, URL, URLSearchParams, TextEncoder, TextDecoder,
+    chrome: { runtime: { onMessage: { addListener: (fn) => listeners.push(fn) } }, storage: { local: { get: (k, cb) => cb({}), set: (v, cb) => cb && cb(), remove: (k, cb) => cb && cb() } } }
+  };
+  fctx.window = fctx; fctx.self = fctx; fctx.globalThis = fctx;
+  vm.createContext(fctx);
+  for (const f of ff.background.scripts) vm.runInContext(fs.readFileSync(path.join(__dirname, '..', f), 'utf8'), fctx, { filename: f });
+  assert(fctx.VersoBinderContext && fctx.LeanPRScanner, 'shared scripts are reachable from the event page');
+  assert.strictEqual(listeners.length, 1, 'the event page listens for messages');
+  console.log("   ✓ Firefox build verified.\n");
+}));
+
 Promise.all(asyncChecks).then(() => {
   console.log("   ✓ Rewrite replay verified.\n");
   console.log("==================================================");

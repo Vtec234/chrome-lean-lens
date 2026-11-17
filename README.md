@@ -1,6 +1,6 @@
 # Lean Lens: Lean 4 hovers on GitHub
 
-A Chrome extension for reviewing **Lean 4** pull requests. Hover a name, a tactic or a term in a GitHub diff and see its type, its docstring and where it comes from, as you would in your editor.
+A Chrome and Firefox extension for reviewing **Lean 4** pull requests. Hover a name, a tactic or a term in a GitHub diff and see its type, its docstring and where it comes from, as you would in your editor.
 
 It works on GitHub's diff views (`/files` and `/changes`) and on file pages.
 
@@ -12,6 +12,20 @@ It works on GitHub's diff views (`/files` and `/changes`) and on file pages.
 4. Open a Lean pull request, go to **Files changed**, and hover.
 
 After pulling updates, click **Reload** on the extension's card and refresh the GitHub tab.
+
+### Firefox
+
+The code is the same; only the manifest differs. Build the Firefox copy with Node 20+:
+
+```bash
+node scripts/build-firefox.mjs
+```
+
+1. Open `about:debugging#/runtime/this-firefox` and click **Load Temporary Add-on…**.
+2. Pick `dist/firefox/manifest.json`.
+3. If hovers don't appear, open `about:addons` → Lean Lens → **Permissions** and allow access to `github.com` and the other sites listed.
+
+A temporary add-on stays until Firefox quits. After pulling updates, run the build again and click **Reload** in `about:debugging`. `node scripts/build-firefox.mjs --zip` also packs `dist/lean-lens-firefox-<version>.zip` for submitting to addons.mozilla.org.
 
 ## Two kinds of hovers
 
