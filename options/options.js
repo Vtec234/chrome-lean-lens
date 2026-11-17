@@ -85,8 +85,14 @@ document.addEventListener('DOMContentLoaded', () => {
   enableBuiltins.addEventListener('change', saveSettings);
   enableLoogle.addEventListener('change', saveSettings);
   enableHelper.addEventListener('change', saveSettings);
-  helperUrl.addEventListener('change', saveSettings);
-  helperToken.addEventListener('change', saveSettings);
+  // Save while typing or pasting too: `change` waits for the field to lose focus, which never
+  // happens when the page is closed right after pasting (Firefox's options sit in about:addons).
+  let typingTimer = null;
+  const saveSoon = () => { clearTimeout(typingTimer); typingTimer = setTimeout(saveSettings, 300); };
+  for (const field of [helperUrl, helperToken]) {
+    field.addEventListener('input', saveSoon);
+    field.addEventListener('change', saveSettings);
+  }
 
   // Test the connection to the local helper
   testHelperBtn.addEventListener('click', () => {
