@@ -163,6 +163,7 @@
         if (sideBtn) {
           this.goalsSide = sideBtn.getAttribute('data-side');
           this.renderExtras(this.currentExtras);
+          this.keepPlace();
         } else {
           this.step(Number(stepBtn.getAttribute('data-step')));
         }
@@ -200,10 +201,12 @@
     /**
      * Show definition in tooltip anchored at boundingRect, shading `shade` (ranges) in the code.
      * `extras` is what the local helper's Lean run adds: `{goals, messages, helper, lean}`.
-     * With no `data`, the card shows the proof state alone.
+     * With no `data`, the card shows the proof state alone. With `opts.inPlace`, a card already
+     * open stays where it is instead (stepping through a proof).
      */
-    show(data, boundingRect, shade, extras = null) {
+    show(data, boundingRect, shade, extras = null, opts = {}) {
       this.clearHideTimer();
+      const inPlace = Boolean(opts.inPlace) && this.isVisible();
       if (!data) {
         data = { name: 'Proof state', kind: 'goal', source: 'lean', lean: extras && extras.lean, bare: true };
       }
@@ -316,7 +319,7 @@
       // Position tooltip near hovered element (shown first, so its height can be measured)
       this.container.classList.remove('verso-hidden');
       this.container.classList.add('verso-visible');
-      this.positionTooltip(boundingRect);
+      if (inPlace) this.keepPlace(); else this.positionTooltip(boundingRect);
     }
 
     /**
@@ -541,6 +544,33 @@
 
       this.container.style.left = `${Math.round(left)}px`;
       this.container.style.top = `${Math.round(top)}px`;
+    }
+
+    /**
+     * Keep the card where it is, by its top-left corner, while what it shows changes (stepping
+     * through a proof: ◀ ▶ stay under the pointer). It stays inside the window: it moves left only
+     * to make room for its widest, and scrolls when it is taller than the room below its top.
+     */
+    keepPlace() {
+      const left = parseFloat(this.container.style.left);
+      const top = parseFloat(this.container.style.top);
+      if (!Number.isFinite(left) || !Number.isFinite(top)) return;
+      const card = this.container.querySelector('.verso-tooltip-card');
+      const margin = 12;
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      const style = typeof getComputedStyle === 'function' ? getComputedStyle(this.container) : null;
+      const widest = (style && parseFloat(style.maxWidth)) || (card && card.offsetWidth) || 460;
+      const x = left + widest > viewportWidth - margin ? Math.max(margin, viewportWidth - margin - widest) : left;
+      if (card && card.style) card.style.maxHeight = '';
+      const natural = Math.min(card ? card.offsetHeight || 280 : 280, 480);
+      // (Moved up only when little of it would show below its top.)
+      const least = Math.min(natural, 240);
+      const y = viewportHeight - margin - top < least ? Math.max(margin, viewportHeight - margin - least) : top;
+      const room = viewportHeight - margin - y;
+      if (card && card.style && natural > room) card.style.maxHeight = `${Math.floor(room)}px`;
+      this.container.style.left = `${Math.round(x)}px`;
+      this.container.style.top = `${Math.round(y)}px`;
     }
 
     /**

@@ -1411,6 +1411,16 @@ console.log("21. Testing cases from sweeping DifferentProofs PRs...");
   assert(CI.isDeclKeyword({ token: 'theorem', linePrefix: 'open Real in ' }));
   assert(!CI.isDeclKeyword({ token: 'def', linePrefix: '  exact foo ' }), 'not after other code');
   assert(!CI.isDeclKeyword({ token: 'have', linePrefix: '  ' }));
+  // Stepping with the card fixed: the tactic stepped to scrolls out from under it (900 high).
+  const line = (top, left = 100) => ({ top, bottom: top + 20, left, right: left + 200 });
+  const cardTop = { top: 40, bottom: 400, left: 50, right: 510 };
+  assert.strictEqual(CI.scrollBeside(line(500), cardTop, 900), 0, 'in view below the card');
+  assert.strictEqual(CI.scrollBeside(line(300), cardTop, 900), -340, 'under the card: to the middle of the room below it');
+  assert.strictEqual(CI.scrollBeside(line(1000), cardTop, 900), 360, 'off the screen');
+  assert.strictEqual(CI.scrollBeside(line(300, 600), cardTop, 900), 0, 'beside the card, not under it');
+  const cardLow = { top: 500, bottom: 860, left: 50, right: 510 };
+  assert.strictEqual(CI.scrollBeside(line(520), cardLow, 900), 280, 'to the room above it, the nearer');
+  assert.strictEqual(CI.scrollBeside(line(30, 600), cardTop, 900, 100), -460, 'under a sticky header');
   const wc = CI.whereCard({ where: 'namespace A  -- line 3', decl: { kind: 'theorem', name: 'b', fullName: 'A.b', line: 5 }, isNew: true,
     similar: [{ name: "b'", line: 9, score: 1 }, { name: 'c', line: 12, score: 0.6 }], hints: [{ kind: 'far', line: 9, text: 'Most like `b\'` at line 9: it may belong next to it.' }] },
   { path: 'A.lean', line: 5 });
@@ -1607,6 +1617,20 @@ console.log("22. Testing real Lean data (the local helper)...");
     // A tactic that changed nothing: its goals, without a before/after switch.
     tooltipView.renderGoals({ at: false, tactic: 'skip', goals: ['⊢ a'], before: ['⊢ a'], step: 0, steps: 1 }, null, titleEl, bodyEl);
     assert(titleEl.innerHTML.includes('(no change)') && !titleEl.innerHTML.includes('data-side'), titleEl.innerHTML);
+
+    // Stepping keeps the card's top-left corner where it is, inside the window: in a 1200×900
+    // window, a 460-wide card at (700, 500) stays, and scrolls in the 388 pixels below its top.
+    const placed = (left, top, height) => {
+      const card = { offsetHeight: height, offsetWidth: 440, style: { maxHeight: '' } };
+      const box = { style: { left: `${left}px`, top: `${top}px` }, querySelector: () => card };
+      Object.assign(context, { innerWidth: 1200, innerHeight: 900, getComputedStyle: () => ({ maxWidth: '460px' }) });
+      try { tooltipView.keepPlace.call({ container: box }); } finally { delete context.getComputedStyle; }
+      return [box.style.left, box.style.top, card.style.maxHeight];
+    };
+    same(placed(700, 500, 600), ['700px', '500px', '388px']);
+    same(placed(700, 100, 300), ['700px', '100px', ''], 'fits as it is');
+    // Moved only when it would not fit: no room for its widest on the right, little below it.
+    same(placed(900, 800, 600), ['728px', '648px', '240px']);
 
     // Lean's messages: an error, and `#check`'s output.
     const failed = at(30, 'rfl');

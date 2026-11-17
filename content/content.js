@@ -790,17 +790,75 @@
       const shade = regionRanges(tokenInfo.textNode, step.range);
       const side = view.goalsSide;
       const pinned = view.isPinned;
-      // The card is now about the tactic stepped to, not the token first hovered.
-      view.show(null, shade.length ? shade[0].getBoundingClientRect() : tokenInfo.boundingRect, shade.length ? shade : tokenInfo.shade, extras);
+      // The card is now about the tactic stepped to, not the token first hovered. Pinned, it
+      // stays where it is, and the page brings that tactic into view beside it.
+      view.show(null, shade.length ? shade[0].getBoundingClientRect() : tokenInfo.boundingRect, shade.length ? shade : tokenInfo.shade, extras,
+        { inPlace: pinned });
       view.goalsSide = side;
       if (pinned && !view.isPinned) view.togglePin();
       view.renderExtras(extras);
-      if (shade.length) {
-        const el = shade[0].startContainer.parentElement;
-        const rect = shade[0].getBoundingClientRect();
-        if (el && (rect.top < 0 || rect.bottom > window.innerHeight)) el.scrollIntoView({ block: 'center' });
-      }
+      if (shade.length) revealBeside(shade, view.container);
     });
+  }
+
+  /**
+   * Scroll the code a step is about (`ranges`) into view where the card (`cardEl`) does not
+   * cover it, as `scrollBeside` says.
+   */
+  function revealBeside(ranges, cardEl) {
+    const boxes = ranges.map((r) => r.getBoundingClientRect()).filter((b) => b.width || b.height);
+    if (!boxes.length) return;
+    const box = {
+      top: Math.min(...boxes.map((b) => b.top)), bottom: Math.max(...boxes.map((b) => b.bottom)),
+      left: Math.min(...boxes.map((b) => b.left)), right: Math.max(...boxes.map((b) => b.right))
+    };
+    const card = cardEl && cardEl.getBoundingClientRect ? cardEl.getBoundingClientRect() : null;
+    const delta = scrollBeside(box, card, window.innerHeight, coveredTop((box.left + box.right) / 2));
+    if (!delta) return;
+    // The page, or whatever scrolls the code inside it. At once: GitHub scrolls its pages
+    // smoothly, and the next step (a key held down) would measure the code mid-scroll.
+    let scroller = ranges[0].startContainer.parentElement;
+    while (scroller && !(scroller.scrollHeight > scroller.clientHeight + 1 && /auto|scroll/.test(getComputedStyle(scroller).overflowY))) {
+      scroller = scroller.parentElement;
+    }
+    (scroller || document.scrollingElement || document.documentElement).scrollBy({ top: delta, behavior: 'instant' });
+  }
+
+  /**
+   * How far to scroll (down positive) so that `box` (the code a step is about) shows on the
+   * screen and not under the card: 0 when it does already; else it goes to the middle of the
+   * room above or below the card, whichever needs less scrolling (the middle of the screen if it
+   * fits in neither). `topInset` is what sticky bars cover at the top of the screen.
+   */
+  function scrollBeside(box, card, height, topInset = 0) {
+    const rooms = card && box.left < card.right && box.right > card.left
+      ? [[topInset, card.top], [card.bottom, height]]
+      : [[topInset, height]];
+    if (rooms.some(([a, b]) => box.top >= a && box.bottom <= b)) return 0;
+    const middle = (box.top + box.bottom) / 2;
+    let best = null;
+    for (const [a, b] of rooms) {
+      if (b - a < box.bottom - box.top + 48) continue;
+      const delta = middle - (a + b) / 2;
+      if (best === null || Math.abs(delta) < Math.abs(best)) best = delta;
+    }
+    return Math.round(best !== null ? best : middle - (topInset + height) / 2);
+  }
+
+  /** How far down the window GitHub's sticky bars (a pull request's header, a file's) reach at `x`. */
+  function coveredTop(x) {
+    let y = 0;
+    for (let k = 0; k < 4 && document.elementsFromPoint; k++) {
+      const bar = document.elementsFromPoint(x, y + 1).find((el) => {
+        if (el.closest && el.closest('#verso-hover-root, .lean-outline')) return false;
+        if (!/sticky|fixed/.test(getComputedStyle(el).position)) return false;
+        const r = el.getBoundingClientRect();
+        return r.top <= y + 1 && r.bottom > y + 1 && r.height < 200;
+      });
+      if (!bar) break;
+      y = bar.getBoundingClientRect().bottom;
+    }
+    return y;
   }
 
   /**
@@ -1255,7 +1313,7 @@
 
   // Exposed for the test suite.
   window.VersoContentInternals = { receiverFor, lookupContext, isInProse, isInAttribute, isInString, refineLocal, triggerTermLookup, versoState, inLeanNames,
-    triggerHoverLookup, exactCard, exactExtras, regionRanges, isDeclKeyword, whereCard, setSettings: (values) => Object.assign(settings, values), hovering: (token) => { lastHoveredToken = token; } };
+    triggerHoverLookup, exactCard, exactExtras, regionRanges, scrollBeside, isDeclKeyword, whereCard, setSettings: (values) => Object.assign(settings, values), hovering: (token) => { lastHoveredToken = token; } };
 
   // Startup
   loadSettings();

@@ -51,7 +51,7 @@ Estimated hovers follow Lean's rules for scopes, `open`, dot notation and sectio
 
 With real Lean, a tactic's tooltip shows what it changed, as Lean's infoview does: in the goals **after** it, what is new is green; switch to **Before** to see what went away in red. Hypotheses are matched by name and goals by their `case`, so only the part of a type or target that changed is marked.
 
-The ◀ ▶ buttons (or ← → once the tooltip is pinned) move to the previous or next tactic of the proof. The tactic is shaded in the diff and the tooltip follows it.
+The ◀ ▶ buttons (or ← → once the tooltip is pinned) move to the previous or next tactic of the proof. Stepping pins the tooltip where it is, so the buttons stay under the pointer; the tactic is shaded in the diff, and the page scrolls when needed to show it beside the tooltip.
 
 ### Outline and placement
 
