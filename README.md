@@ -110,14 +110,14 @@ gh auth refresh -h github.com -s codespace
 
 Then start the helper with `--codespaces`. From there it does the rest:
 
-- The first **Run Lean** on a repository creates a codespace on that repository, installs Lean in it and runs there. Hovering never creates one.
+- The first **Run Lean** on a repository creates a codespace on that repository, installs Lean in it and runs there. Hovering never creates one. The helper notes which codespace that is and uses that one from then on. A codespace an earlier version of the helper used is not used again (code could run in it without a sandbox): a new one is made. The old one is left as it is, since those versions took over a codespace by the name shown for it, so it may be one of yours; `codespaces` below lists it apart, with the `gh codespace delete -c <identifier>` that deletes it.
 - Results are copied to your machine, so hovers keep working after the codespace stops.
 - A codespace is stopped 30 minutes after its last run and when the helper stops. GitHub deletes it after a week unused.
 - If your machine sleeps or loses its network for a short while, the run carries on and is picked up again.
 
 A free GitHub account includes 120 core-hours a month, which is 60 hours of the two-core machine the helper asks for. There is one codespace per repository because GitHub's terms allow a codespace for work on the repository it was started on.
 
-To see, stop or delete the codespaces the helper made (it leaves your others alone):
+To see, stop or delete the codespaces the helper uses. These are the ones its settings name, by the identifier GitHub gave each; a codespace is never picked by the name shown for it, so your others are left alone, and so is one that another running helper made for a run without a sandbox. One an earlier version of the helper used is listed apart and never stopped or deleted by these commands. A codespace made with other settings (another `--cache` folder, another machine) is not among them: `gh codespace list` shows it, and GitHub deletes it a week after it was last used.
 
 ```bash
 node helper/lean-lens-helper.mjs codespaces
@@ -134,7 +134,7 @@ Running Lean on a pull request runs that pull request's code: Lean executes code
 - **The code runs in a sandbox**, on macOS (`sandbox-exec`) and on Linux ([bubblewrap](https://github.com/containers/bubblewrap), which a codespace has). It has no network except while fetching the project's dependencies, cannot read or change your files, and gets none of your environment. Where there is no working sandbox (on Linux, when bubblewrap is missing or may not run), Lean does not run.
 - **In a codespace** the sandbox also keeps the code away from the codespace's GitHub token. Without a working sandbox nothing runs there either.
 
-The sandbox guards against the obvious; it is not a guarantee. `--no-sandbox` turns it off, which a project with private dependencies needs. Lean then runs with your permissions.
+The sandbox guards against the obvious; it is not a guarantee. `--no-sandbox` turns it off, which a project with private dependencies needs. Lean then runs with your permissions. In a codespace, where the code could then change the codespace itself and use its GitHub token, each such run gets a new codespace, deleted when the run is over: slower, since Lean is set up afresh each time. The helper notes the identifier GitHub gives that codespace (in `codespaces/` in its cache folder) before starting anything in it, and deletes that one only, never one found by its name or repository. If the helper stops before it can, the next start deletes what was noted and no running helper is using; failing all that, GitHub deletes it an hour after it stops.
 
 Worth knowing about what you allow:
 
@@ -160,7 +160,7 @@ Worth knowing about what you allow:
 | `--allow owner/repo` | Allow a repository ahead of time |
 | `--here owner/repo` | With `--codespaces`: run this repository on your machine all the same |
 | `--keep-builds` | Keep builds between runs: faster next time, more disk |
-| `--keep-codespaces` | Leave codespaces running when idle and when the helper stops |
+| `--keep-codespaces` | Leave codespaces running when idle and when the helper stops (not with `--no-sandbox`, where each run's codespace is deleted) |
 | `--tidy-after MINUTES` | How long an unused build or codespace stays (default 30) |
 | `--port N` | Listen on another port (default 5326) |
 | `--no-sandbox` | Run a project's code without the sandbox, with your permissions (without this, no sandbox means no run) |

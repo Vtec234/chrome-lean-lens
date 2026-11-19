@@ -2477,6 +2477,282 @@ console.log("22. Testing real Lean data (the local helper)...");
             await spaces.remove('fake-1');
             assert.strictEqual(fakeState().codespaces.map((space) => space.name).join(), 'mine');
             assert.strictEqual(h10.config.codespaces['o/r'], undefined, 'and forgotten');
+            // --- Without a sandbox (--no-sandbox), a run gets a codespace made for it, known by the
+            // identifier GitHub gave it and by nothing else, and deleted after the run.
+            const notesDir = path.join(here, 'codespaces');
+            const notesIn = (dir) => (fs.existsSync(dir) ? fs.readdirSync(dir).sort() : []);
+            const putFake = (change) => { const now = fakeState(); change(now); fs.writeFileSync(path.join(fakeDir, 'state.json'), JSON.stringify(now)); };
+            const namesThere = () => fakeState().codespaces.map((space) => space.name).sort();
+            const callsNaming = (from, name) => fakeState().argv.slice(from).filter((argv) => argv.includes(name));
+            // The helper "in" a deleted codespace takes a moment to stop, and they all listen on one port here.
+            const portFree = async () => {
+              for (let i = 0; i < 500; i++) {
+                const taken = await new Promise((resolve) => {
+                  const socket = require('net').connect(remotePort, '127.0.0.1');
+                  socket.on('connect', () => { socket.destroy(); resolve(true); });
+                  socket.on('error', () => resolve(false));
+                });
+                if (!taken) return;
+                await tick(20);
+              }
+              assert.fail('the port of the helper in the codespace stayed taken');
+            };
+            // `gh` as the helper calls it, with something done before or after a call.
+            const ghWith = ({ before = async () => {}, after = (argv, result) => result }) => (given) => cs.createCodespaces(Object.assign({}, given, {
+              run: async (command, argv, options) => { await before(argv); return after(argv, await given.run(command, argv, options)); },
+            }));
+            // What is there already: the repository's lasting codespace, which sandboxed runs use
+            // (stopped, with a file in it), the reader's own, and one that looks like a codespace
+            // of a run without a sandbox, on the same repository, but is not one this helper noted.
+            const hs = withCodespaces({});
+            hs.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+            await finish(hs, commit);
+            assert.strictEqual(hs.status('o/r', commit).state, 'done', hs.status('o/r', commit).error);
+            const lasting = hs.config.codespaces['o/r'].name;
+            const lastingToken = hs.config.codespaces['o/r'].token;
+            hs.shutdown();
+            await portFree();
+            fs.writeFileSync(path.join(fakeDir, 'homes', lasting, 'kept.txt'), 'kept');
+            putFake((now) => now.codespaces.push({ name: 'lookalike', displayName: cs.unsandboxedNameFor('o/r'), repository: 'o/r', state: 'Available' }));
+            assert.deepStrictEqual(namesThere(), [lasting, 'lookalike', 'mine'].sort());
+            let from = fakeState().argv.length;
+            // Its identifier is noted before anything is started in it.
+            const notedAtFirstConnection = [];
+            const hn = withCodespaces({ sandbox: false, keepCodespaces: true, codespaces: ghWith({
+              before: async (argv) => { if (argv[1] === 'ssh') notedAtFirstConnection.push({ name: argv[argv.indexOf('-c') + 1], notes: notesIn(notesDir) }); },
+            }) });
+            hn.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+            await finish(hn, commit);
+            assert.strictEqual(hn.status('o/r', commit).state, 'done', hn.status('o/r', commit).error);
+            assert.strictEqual(hn.fileState('o/r', commit, 'A.lean').error, 'This file is not inside a Lake project', 'the run was made there');
+            let made = fakeState().argv.slice(from).filter((argv) => argv[1] === 'create');
+            assert.strictEqual(made.length, 1, 'a codespace was made for the run');
+            assert.strictEqual(made[0][made[0].indexOf('--display-name') + 1], 'Lean Lens unsandboxed r');
+            assert.strictEqual(made[0][made[0].indexOf('--retention-period') + 1], '1h', 'should it ever be left behind, GitHub deletes it soon');
+            const fresh = notedAtFirstConnection[0].name;
+            assert(fresh !== lasting && fresh !== 'lookalike' && fresh !== 'mine', fresh);
+            assert.deepStrictEqual(notedAtFirstConnection[0].notes, [`${fresh}.json`], 'noted before the first connection to it');
+            assert(notedAtFirstConnection.every((entry) => entry.name === fresh), 'every connection went to that codespace');
+            assert.deepStrictEqual(namesThere(), [lasting, 'lookalike', 'mine'].sort(), 'only the new one was deleted (--keep-codespaces does not keep it)');
+            assert.deepStrictEqual(fakeState().argv.slice(from).filter((argv) => argv[1] === 'delete').map((argv) => argv[argv.indexOf('-c') + 1]), [fresh]);
+            for (const other of [lasting, 'lookalike', 'mine']) assert.deepStrictEqual(callsNaming(from, other), [], `nothing was asked of ${other}`);
+            assert.strictEqual(fakeState().codespaces.find((space) => space.name === lasting).state, 'Shutdown', 'the lasting codespace was not even started');
+            assert.strictEqual(fs.readFileSync(path.join(fakeDir, 'homes', lasting, 'kept.txt'), 'utf8'), 'kept');
+            assert.deepStrictEqual(hn.config.codespaces['o/r'], { name: lasting, token: lastingToken, confined: true }, 'and it is still the one sandboxed runs use');
+            assert.deepStrictEqual(notesIn(notesDir), [], 'the note goes with the codespace');
+            assert(heard.some((message) => message.includes(`Deleting the codespace ${fresh} for o/r: its run without a sandbox is over`)), heard.join(' | '));
+            hn.shutdown();
+            await portFree();
+            // The next such run gets another new one.
+            from = fakeState().argv.length;
+            const hn2 = withCodespaces({ sandbox: false });
+            hn2.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+            await finish(hn2, commit);
+            assert.strictEqual(hn2.status('o/r', commit).state, 'done', hn2.status('o/r', commit).error);
+            made = fakeState().argv.slice(from).filter((argv) => argv[1] === 'create');
+            assert.strictEqual(made.length, 1);
+            assert.deepStrictEqual(namesThere(), [lasting, 'lookalike', 'mine'].sort());
+            hn2.shutdown();
+            await portFree();
+            // Two helpers on the same repository, each with a run without a sandbox: each keeps
+            // its own codespace. The first is held just before it connects to its codespace, while
+            // a second helper with the same settings folder, then one with another, runs and ends.
+            let release = null;
+            const held = new Promise((resolve) => { release = resolve; });
+            let holding = true;
+            const first = withCodespaces({ sandbox: false, codespaces: ghWith({ before: async (argv) => { if (argv[1] === 'ssh' && holding) await held; } }) });
+            first.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+            for (let i = 0; !notesIn(notesDir).length; i++) { assert(i < 1500, `no codespace noted: ${heard.join(' | ')}`); await tick(20); }
+            const firstName = notesIn(notesDir)[0].replace(/\.json$/, '');
+            assert(namesThere().includes(firstName));
+            // To a helper or a command started in another time zone, the first helper is as much
+            // running as to any: when its process started is noted and asked in one way everywhere.
+            const elsewhere = spawnSync(process.execPath, [path.join(helperDir, 'lean-lens-helper.mjs'), 'codespaces', '--cache', here, '--gh', path.join(__dirname, 'fixtures', 'fake-gh.mjs')],
+              { encoding: 'utf8', env: Object.assign({}, process.env, { TZ: (process.env.TZ || '') === 'Pacific/Kiritimati' ? 'Pacific/Pago_Pago' : 'Pacific/Kiritimati' }) });
+            assert(new RegExp(`${firstName} .*in use by a running helper`).test(elsewhere.stdout), elsewhere.stdout + elsewhere.stderr);
+            if (cs.startOf(process.pid)) assert(/^(proc:[0-9a-f-]+:\d+|ps:\d+)$/.test(JSON.parse(fs.readFileSync(path.join(notesDir, `${firstName}.json`), 'utf8')).started), 'noted with when its process started');
+            // Readings that surely differ, and those that leave a doubt (then the helper is taken to run).
+            assert(cs.startsDiffer('ps:1000', 'ps:1003') && cs.startsDiffer('proc:ab-1:5', 'proc:ab-1:6') && cs.startsDiffer('proc:ab-1:5', 'proc:ab-2:5'));
+            for (const [noted, now] of [['ps:1000', 'ps:1002'], ['ps:1000', 'ps:999'], ['ps:1000', null], [undefined, 'ps:1000'], ['ps:1000', 'proc:ab-1:5'], ['Thu Jan  1 00:00:00 1970', 'ps:1000'], ['proc:ab-1:5', 'proc:ab-1:5']]) {
+              assert(!cs.startsDiffer(noted, now), `${noted} and ${now}`);
+            }
+            for (const cacheDir of [here, path.join(root, 'cache-elsewhere')]) {
+              from = fakeState().argv.length;
+              // (The same commit would wait behind the first helper's run only within one helper.)
+              const second = withCodespaces({ sandbox: false, cacheDir });
+              second.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+              await finish(second, commit);
+              assert.strictEqual(second.status('o/r', commit).state, 'done', second.status('o/r', commit).error);
+              assert.deepStrictEqual(callsNaming(from, firstName), [], "the second helper asked nothing of the first one's codespace");
+              assert.strictEqual(fakeState().argv.slice(from).filter((argv) => argv[1] === 'delete').length, 1, 'and deleted its own only');
+              assert.deepStrictEqual(namesThere(), [firstName, lasting, 'lookalike', 'mine'].sort());
+              assert.deepStrictEqual(notesIn(notesDir), [`${firstName}.json`], "the first helper's note stays");
+              second.shutdown();
+              await portFree();
+            }
+            holding = false;
+            release();
+            await finish(first, commit);
+            assert.strictEqual(first.status('o/r', commit).state, 'done', first.status('o/r', commit).error);
+            assert.deepStrictEqual(namesThere(), [lasting, 'lookalike', 'mine'].sort(), 'the first deleted its own when its run was over');
+            assert.deepStrictEqual(notesIn(notesDir), []);
+            first.shutdown();
+            await portFree();
+            // A helper that stops in the middle of such a run deletes the codespace as it stops.
+            let stopNow = null;
+            const reached = new Promise((resolve) => { stopNow = resolve; });
+            const never = new Promise(() => {});
+            const stopped = withCodespaces({ sandbox: false, codespaces: ghWith({ before: async (argv) => { if (argv[1] === 'ssh') { stopNow(); await never; } } }) });
+            stopped.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+            await reached;
+            assert.strictEqual(notesIn(notesDir).length, 1);
+            stopped.shutdown();
+            assert.deepStrictEqual(namesThere(), [lasting, 'lookalike', 'mine'].sort());
+            assert.deepStrictEqual(notesIn(notesDir), []);
+            // What a helper that stopped without doing so left behind: the next helper deletes what
+            // that one noted, and nothing else. `left-1` was noted by a helper that no longer runs;
+            // `gone-1` too, and is gone already; `busy-1` by one that still runs; and no note names
+            // `lookalike`, for all that it looks like the others.
+            const deadPid = spawnSync(process.execPath, ['-e', '']).pid;
+            const noteOf = (name, pid, more = {}) => fs.writeFileSync(path.join(notesDir, `${name}.json`), JSON.stringify(Object.assign({ name, repo: 'o/r', pid, instance: 'another-helper' }, more)));
+            // (When a process started, as the helper reads it: that may be out of reach where the tests run.)
+            const parentStart = cs.startOf(process.ppid);
+            // A process number alone does not say that a helper still runs. `left-3` was noted
+            // under this process's own number by a helper that is none of this process's (a helper
+            // started anew in a container gets its number again); `left-4` under the number of a
+            // process that runs, but started at another time than the note says (after a restart of
+            // the machine, that number is some other program's).
+            const left = ['left-1', 'left-3'].concat(parentStart ? ['left-4'] : []);
+            putFake((now) => {
+              for (const name of [...left, 'busy-1']) now.codespaces.push({ name, displayName: cs.unsandboxedNameFor('o/r'), repository: 'o/r', state: 'Available' });
+            });
+            noteOf('left-1', deadPid);
+            noteOf('gone-1', deadPid);
+            noteOf('left-3', process.pid);
+            if (parentStart) noteOf('left-4', process.ppid, { started: parentStart.startsWith('ps:') ? 'ps:1' : 'proc:00000000-0000:1' });
+            noteOf('busy-1', process.ppid, parentStart ? { started: parentStart } : {});
+            // (Not notes: these name nothing that is deleted.)
+            fs.writeFileSync(path.join(notesDir, 'mine.json'), JSON.stringify({ name: 'lookalike', repo: 'o/r', pid: deadPid, instance: 'x' }));
+            fs.writeFileSync(path.join(notesDir, 'other.json'), JSON.stringify({ name: '--all', repo: 'o/r', pid: deadPid, instance: 'x' }));
+            from = fakeState().argv.length;
+            const later = withCodespaces({});
+            await later.remote.tidy();
+            assert.deepStrictEqual(namesThere(), ['busy-1', lasting, 'lookalike', 'mine'].sort(), 'only what the stopped helpers noted is deleted');
+            assert.deepStrictEqual(fakeState().argv.slice(from).filter((argv) => argv[1] === 'delete').map((argv) => argv[argv.indexOf('-c') + 1]).sort(), ['gone-1', ...left].sort());
+            assert.deepStrictEqual(notesIn(notesDir), ['busy-1.json', 'mine.json', 'other.json'], 'and forgotten, as is the one that was gone already');
+            later.shutdown();
+            // One that cannot be deleted stays noted, and is tried again.
+            noteOf('left-2', deadPid);
+            putFake((now) => { now.codespaces.push({ name: 'left-2', displayName: 'renamed since', repository: 'o/r', state: 'Available' }); now.undeletable = true; });
+            const again = withCodespaces({});
+            await again.remote.tidy();
+            assert(namesThere().includes('left-2') && notesIn(notesDir).includes('left-2.json'));
+            assert(heard.some((message) => message.includes('The codespace left-2 could not be deleted') && message.includes('gh codespace delete -c left-2')), heard.join(' | '));
+            putFake((now) => { delete now.undeletable; });
+            await again.remote.tidy();
+            assert(!namesThere().includes('left-2') && !notesIn(notesDir).includes('left-2.json'), 'whatever it is called by now');
+            again.shutdown();
+            // `codespaces`, `--stop` and `--delete` act on the codespaces the settings and notes
+            // name, by their identifiers, and not on whatever carries the helper's name: not on
+            // `lookalike`, and not on `busy-1` either, which a helper that still runs is using.
+            const command = (...more) => spawnSync(process.execPath, [path.join(helperDir, 'lean-lens-helper.mjs'), 'codespaces', ...more, '--cache', here, '--gh', path.join(__dirname, 'fixtures', 'fake-gh.mjs')], { encoding: 'utf8' });
+            from = fakeState().argv.length;
+            const listed = command();
+            assert.strictEqual(listed.status, 0, listed.stderr);
+            assert(listed.stdout.includes(lasting) && /busy-1 .*in use by a running helper/.test(listed.stdout) && !/lookalike|mine/.test(listed.stdout), listed.stdout);
+            const stoppedAll = command('--stop');
+            assert(stoppedAll.stdout.includes('Left alone: busy-1'), stoppedAll.stdout + stoppedAll.stderr);
+            const deletedAll = command('--delete');
+            assert.strictEqual(deletedAll.status, 0, deletedAll.stderr);
+            assert(deletedAll.stdout.includes(`Deleted ${lasting}`) && deletedAll.stdout.includes('Left alone: busy-1'), deletedAll.stdout);
+            assert.deepStrictEqual(namesThere(), ['busy-1', 'lookalike', 'mine'].sort(), 'only the lasting codespace, which the settings name');
+            for (const other of ['busy-1', 'lookalike', 'mine']) assert.deepStrictEqual(callsNaming(from, other), [], `the command asked nothing of ${other}`);
+            assert(notesIn(notesDir).includes('busy-1.json'), 'and the running helper keeps its note');
+            // A sandboxed run uses the codespace its own settings name, and no other: not one
+            // that carries the repository's name for it (another helper's lasting codespace, with
+            // other settings: the two would stop each other's runs), not a noted one whatever it
+            // is called, and not the one an earlier version noted without saying that code only
+            // ever ran confined in it. That one is set aside, and `codespaces` lists it.
+            putFake((now) => {
+              now.codespaces.find((space) => space.name === 'busy-1').displayName = cs.displayNameFor('o/r');
+              for (const name of ['theirs-1', 'legacy-1']) now.codespaces.push({ name, displayName: cs.displayNameFor('o/r'), repository: 'o/r', state: 'Shutdown' });
+            });
+            const settings = JSON.parse(fs.readFileSync(path.join(here, 'config.json'), 'utf8'));
+            settings.codespaces['o/r'] = { name: 'legacy-1', token: 'a-token-from-before' };
+            // Right after the upgrade, before any run on o/r, the settings still name legacy-1 as
+            // the earlier version left them: without `confined`, so not known to be a helper's.
+            // `codespaces` lists it apart, and `--stop` and `--delete` leave it alone, while they
+            // stop and delete fresh-1, which this version made for o/s.
+            settings.codespaces['o/s'] = { name: 'fresh-1', token: 'its-own-token', confined: true };
+            fs.writeFileSync(path.join(here, 'config.json'), JSON.stringify(settings));
+            putFake((now) => {
+              now.codespaces.find((space) => space.name === 'legacy-1').state = 'Available';
+              now.codespaces.push({ name: 'fresh-1', displayName: cs.displayNameFor('o/s'), repository: 'o/s', state: 'Available' });
+            });
+            from = fakeState().argv.length;
+            const beforeAnyRun = command();
+            assert(/fresh-1 .*Available[^]*not stopped or deleted here[^]*legacy-1 .*gh codespace delete -c legacy-1/.test(beforeAnyRun.stdout), beforeAnyRun.stdout + beforeAnyRun.stderr);
+            const stoppedBeforeAnyRun = command('--stop');
+            assert(stoppedBeforeAnyRun.stdout.includes('Stopped fresh-1') && !stoppedBeforeAnyRun.stdout.includes('Stopped legacy-1'), stoppedBeforeAnyRun.stdout + stoppedBeforeAnyRun.stderr);
+            const deletedBeforeAnyRun = command('--delete');
+            assert(deletedBeforeAnyRun.stdout.includes('Deleted fresh-1') && !deletedBeforeAnyRun.stdout.includes('Deleted legacy-1'), deletedBeforeAnyRun.stdout + deletedBeforeAnyRun.stderr);
+            assert.deepStrictEqual(callsNaming(from, 'fresh-1').map((argv) => argv[1]), ['stop', 'delete']);
+            assert.deepStrictEqual(callsNaming(from, 'legacy-1'), [], 'nothing was asked of legacy-1');
+            assert.strictEqual(fakeState().codespaces.find((space) => space.name === 'legacy-1').state, 'Available');
+            assert(!namesThere().includes('fresh-1'));
+            const untouched = JSON.parse(fs.readFileSync(path.join(here, 'config.json'), 'utf8'));
+            assert.deepStrictEqual([untouched.codespaces, untouched.retired], [{ 'o/r': { name: 'legacy-1', token: 'a-token-from-before' } }, []], 'and the settings still name it, for the next run to retire');
+            putFake((now) => { now.codespaces.find((space) => space.name === 'legacy-1').state = 'Shutdown'; });
+            from = fakeState().argv.length;
+            const adopting = withCodespaces({});
+            adopting.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+            await finish(adopting, commit);
+            assert.strictEqual(adopting.status('o/r', commit).state, 'done', adopting.status('o/r', commit).error);
+            const ownName = adopting.config.codespaces['o/r'].name;
+            assert(!['busy-1', 'lookalike', 'theirs-1', 'legacy-1'].includes(ownName), ownName);
+            assert.strictEqual(adopting.config.codespaces['o/r'].confined, true);
+            assert.notStrictEqual(adopting.config.codespaces['o/r'].token, 'a-token-from-before');
+            assert.strictEqual(fakeState().argv.slice(from).filter((argv) => argv[1] === 'create').length, 1, 'a codespace of its own was made');
+            for (const other of ['busy-1', 'lookalike', 'theirs-1', 'legacy-1']) assert.deepStrictEqual(callsNaming(from, other), [], `nothing was asked of ${other}`);
+            assert.deepStrictEqual(adopting.config.retired, [{ name: 'legacy-1', repo: 'o/r' }]);
+            assert(heard.some((message) => message.includes('the codespace legacy-1, which an earlier version of the helper used, is not used any more')), heard.join(' | '));
+            // The next run uses the one it made, again.
+            adopting.start({ repo: 'o/r', sha: commit, pr: 3, paths: ['A.lean'] });
+            await finish(adopting, commit);
+            assert.strictEqual(adopting.config.codespaces['o/r'].name, ownName);
+            assert.strictEqual(fakeState().argv.slice(from).filter((argv) => argv[1] === 'create').length, 1);
+            // With a sandbox asked for and none working in the codespace, nothing runs there,
+            // whether or not the reader may push to the repository (they may not, here).
+            adopting.shutdown();
+            await portFree();
+            const unconfined = withCodespaces({ codespaces: ghWith({
+              after: (argv, result) => (argv[1] === 'ssh' ? Object.assign({}, result, { stdout: result.stdout.replace(/^(LEANLENS READY .*"sandbox":)"[a-z]+"/m, '$1"none"') }) : result),
+            }) });
+            from = fakeState().argv.length;
+            unconfined.start({ repo: 'o/r', sha: commit, pr: null, paths: ['A.lean'] });
+            await finish(unconfined, commit);
+            assert(/has no working sandbox, so a pull request's code is not run there.*--no-sandbox/.test(unconfined.status('o/r', commit).error), unconfined.status('o/r', commit).error);
+            assert(!fakeState().argv.slice(from).some((argv) => argv[1] === 'ports' || argv[1] === 'delete' || argv[1] === 'create'), 'no run was handed over, and the codespace stays for when the sandbox works');
+            unconfined.shutdown();
+            await portFree();
+            // The set-aside codespace may be one of the reader's that an earlier version took over
+            // by its name, not one a helper made. The command lists it apart, with what deletes
+            // it, and neither stops nor deletes it with the others; the new one it does.
+            putFake((now) => { now.codespaces.find((space) => space.name === 'legacy-1').state = 'Available'; });
+            from = fakeState().argv.length;
+            const listedApart = command();
+            assert(/not stopped or deleted here/.test(listedApart.stdout) && /legacy-1 .*gh codespace delete -c legacy-1/.test(listedApart.stdout), listedApart.stdout + listedApart.stderr);
+            const stoppedApart = command('--stop');
+            assert(stoppedApart.stdout.includes('Left alone: busy-1') && !stoppedApart.stdout.includes('Stopped legacy-1'), stoppedApart.stdout + stoppedApart.stderr);
+            const cleared = command('--delete');
+            assert(cleared.stdout.includes(`Deleted ${ownName}`) && !cleared.stdout.includes('Deleted legacy-1') && cleared.stdout.includes('Left alone: busy-1'), cleared.stdout + cleared.stderr);
+            assert(/legacy-1 .*gh codespace delete -c legacy-1/.test(cleared.stdout), cleared.stdout);
+            assert.deepStrictEqual(callsNaming(from, 'legacy-1'), [], 'nothing was asked of legacy-1');
+            assert.deepStrictEqual(namesThere(), ['busy-1', 'legacy-1', 'lookalike', 'mine', 'theirs-1'].sort());
+            assert.strictEqual(fakeState().codespaces.find((space) => space.name === 'legacy-1').state, 'Available');
+            assert.deepStrictEqual(JSON.parse(fs.readFileSync(path.join(here, 'config.json'), 'utf8')).retired, [{ name: 'legacy-1', repo: 'o/r' }], 'and it stays listed');
+            for (const name of ['mine.json', 'other.json', 'busy-1.json']) fs.rmSync(path.join(notesDir, name));
+            putFake((now) => { now.codespaces = now.codespaces.filter((space) => space.name === 'mine'); });
             // A repository that allows only a larger machine (mathlib4 does) gets that one, and the
             // log says so. A machine asked for by name is not swapped for another.
             fake = fakeState();

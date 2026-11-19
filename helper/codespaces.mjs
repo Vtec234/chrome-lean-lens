@@ -9,10 +9,14 @@
 //
 // GitHub's terms allow a codespace for developing or testing the repository it was started
 // on, which is why there is one for each repository rather than one for everything.
+//
+// That one codespace is used again and again because the sandbox in it keeps a pull request's
+// code from changing it. Without the sandbox (`--no-sandbox`) nothing does, so then every run
+// gets a codespace of its own, made for it and deleted after it: see `runAlone`.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
@@ -22,6 +26,10 @@ export const REMOTE_PORT = 5326;
 const NODE_VERSION = '22.11.0';
 const MACHINE = 'basicLinux32gb'; // the smallest: 2 cores, 8 GB of memory, 32 GB of disk
 const RETENTION = '168h'; // a stopped codespace nobody comes back to is deleted after a week
+// A codespace made for one run without a sandbox is deleted by the helper after the run. Should
+// that never happen (the helper and its notes both lost), GitHub deletes it soon after it stops.
+const RETENTION_ALONE = '1h';
+const LIST_LIMIT = 200; // as many codespaces as `gh` is asked to list
 // When builds have to go on the disk that is kept, they leave it before GitHub stops the
 // codespace for being idle (30 minutes by default), so a stopped codespace takes little of the
 // reader's storage allowance. On the temporary disk they stay while the codespace runs.
@@ -36,12 +44,68 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const quote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const tail = (text, n = 400) => (text.length > n ? `…${text.slice(-n)}` : text).trim();
+const isRepoName = (repo) => typeof repo === 'string' && /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(repo);
 
 /**
  * The name a repository's codespace is given, so it can be found again. GitHub takes 48
  * characters at most, and refuses some punctuation (a colon, for one).
  */
 export const displayNameFor = (repo) => `${DISPLAY_PREFIX} ${repo.split('/')[1].replace(/[^A-Za-z0-9_-]+/g, '-')}`.slice(0, 48);
+/**
+ * The name shown for a codespace made for one run without a sandbox. It is there for the reader
+ * to recognise it by, and differs from `displayNameFor` so that no such codespace is taken for
+ * a repository's lasting one. The helper itself never looks for one of these by this name: it
+ * goes by the identifier GitHub gave the codespace, which it noted (see `runAlone`).
+ */
+export const unsandboxedNameFor = (repo) => `${DISPLAY_PREFIX} unsandboxed ${repo.split('/')[1].replace(/[^A-Za-z0-9_-]+/g, '-')}`.slice(0, 48);
+
+/** Whether this can be the identifier GitHub gives a codespace (it becomes an argument and a file name). */
+const isCodespaceName = (name) => typeof name === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/.test(name);
+
+/** Whether a process is running (one that may not be signalled is). */
+function alive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+}
+
+/**
+ * When a process started, in a form that reads the same whoever asks and wherever: it tells a
+ * process from a later one that was given the same number (after a restart of the machine or
+ * of a container, numbers come round again). On Linux, `proc:<boot>:<ticks>`: the system's
+ * count of ticks from its start to the process's, with which start of the system that was.
+ * Elsewhere `ps:<seconds>`, from `ps`, asked in UTC: it answers in the asker's time zone, and
+ * two helpers need not share one. Null when it cannot be asked or read.
+ */
+export function startOf(pid) {
+  if (process.platform === 'linux') {
+    try {
+      // (After the name, which is in brackets and may hold anything: the 22nd field is the 20th from there.)
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const ticks = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+      const boot = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+      if (/^\d+$/.test(ticks) && /^[0-9a-f-]{8,}$/i.test(boot)) return `proc:${boot}:${ticks}`;
+    } catch { /* no /proc: ask `ps` */ }
+  }
+  const asked = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 10 * 1000, env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' } });
+  const at = asked.status === 0 ? Date.parse(`${asked.stdout.trim()} UTC`) : NaN;
+  return Number.isFinite(at) ? `ps:${Math.round(at / 1000)}` : null;
+}
+/**
+ * Whether two such readings are surely of different processes. In doubt they are not: one that
+ * cannot be read, or two taken in different ways, say nothing, and `ps` gives whole seconds
+ * that may fall on either side of one. (Calling a running helper stopped would have its
+ * codespace deleted under it; the other mistake leaves a codespace that GitHub deletes.)
+ */
+export function startsDiffer(noted, now) {
+  const read = (value) => /^(proc:[0-9a-f-]+:\d+|ps:\d+)$/i.test(String(value)) ? String(value) : null;
+  const [a, b] = [read(noted), read(now)];
+  if (!a || !b || a.slice(0, 3) !== b.slice(0, 3)) return false;
+  if (a.startsWith('ps:')) return Math.abs(Number(a.slice(3)) - Number(b.slice(3))) > 2;
+  return a !== b;
+}
+let ownStart; // of this process: asked once, when first needed
+// The helpers of this process (their `instance`) that have not stopped.
+const running = new Set();
 
 /** Whether a helper that reports this sandbox keeps a pull request's code away from the rest. */
 export const confines = (sandbox) => sandbox === 'seatbelt' || sandbox === 'bwrap';
@@ -204,14 +268,21 @@ function explain(result) {
  *   `config`, `save`: the helper's settings (the codespace of each repository is remembered there);
  *   `run`: the helper's command runner; `log`; `gh`: the program to call;
  *   `sandbox`: false when the reader accepted running without one (`--no-sandbox`);
- *   `keep`: leave codespaces running when they are idle and when the helper stops.
- * @returns `{check, runJob, rest, shutdown, ours, stop, remove}`
+ *   `keep`: leave codespaces running when they are idle and when the helper stops;
+ *   `recordsDir`: the folder where the codespaces made for runs without a sandbox are noted.
+ * @returns `{check, runJob, rest, shutdown, inventory, ours, stop, remove, tidy}`
  */
-export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = true, keep = false, remotePort = REMOTE_PORT, cloneBase = null, pollMs = 1500, keepAliveMs = KEEP_ALIVE_MS, retryMs = 10 * 1000, machine = MACHINE, helperDir = here }) {
+export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = true, keep = false, recordsDir = null, remotePort = REMOTE_PORT, cloneBase = null, pollMs = 1500, keepAliveMs = KEEP_ALIVE_MS, retryMs = 10 * 1000, machine = MACHINE, helperDir = here }) {
   if (!/^[A-Za-z0-9]+$/.test(machine)) throw new Error(`Not a codespace machine name: ${machine}`);
   if (!config.codespaces || typeof config.codespaces !== 'object') config.codespaces = {};
   const sessions = new Map(); // repo → {name, token, port, tunnel, sandbox}
   const connecting = new Map(); // repo → promise of its session
+  // The codespaces this helper made for runs without a sandbox and has not deleted yet:
+  // identifier → {repo, session}. Each is also noted in `recordsDir` (see `note`).
+  const alone = new Map();
+  const instance = randomBytes(8).toString('hex'); // this helper, among those that share `recordsDir`
+  running.add(instance);
+  if (!Array.isArray(config.retired)) config.retired = [];
 
   async function must(args, options) {
     const result = await run(gh, args, options);
@@ -224,9 +295,37 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
     await must(['codespace', 'list', '--limit', '1', '--json', 'name']);
   }
 
-  const list = async () => JSON.parse((await must(['codespace', 'list', '--limit', '200', '--json', 'name,displayName,repository,state,lastUsedAt'])).stdout || '[]');
-  /** The codespaces this helper made (they carry its name), on whichever repository. */
-  const ours = async () => (await list()).filter((space) => String(space.displayName || '').startsWith(DISPLAY_PREFIX));
+  const list = async () => JSON.parse((await must(['codespace', 'list', '--limit', String(LIST_LIMIT), '--json', 'name,displayName,repository,state,lastUsedAt'])).stdout || '[]');
+  /**
+   * The codespaces this helper's settings and notes name, on whichever repository, found by
+   * the identifier GitHub gave them, never by the name shown for them, which other codespaces
+   * can have too. Resolves to `{ ours, unsure }`. `ours`: each repository's lasting one and
+   * those made for runs without a sandbox, which this version of the helper made; one whose run
+   * is under way in a helper that is still running comes with `busy` set. `unsure`: those an
+   * earlier version used, whether this one has stopped using them (`retire`) or the settings
+   * still name one for its repository because no run there has come since: a lasting one this
+   * version did not make has no `confined`. Those versions took over a codespace by the name
+   * shown for it, so one of these may be a codespace of the reader's that no helper made: they
+   * are listed, and left for the reader to delete one by one.
+   */
+  async function inventory() {
+    const named = new Map(); // identifier → what to add to its listing
+    const earlier = new Set(config.retired.filter((old) => old && isCodespaceName(old.name)).map((old) => old.name));
+    for (const lasting of Object.values(config.codespaces)) {
+      if (lasting && isCodespaceName(lasting.name)) {
+        if (lasting.confined === true) named.set(lasting.name, {}); else earlier.add(lasting.name);
+      }
+    }
+    for (const entry of notes()) named.set(entry.name, entry.instance !== instance && stillRuns(entry) ? { busy: entry.pid } : {});
+    const retired = new Set([...earlier].filter((name) => !named.has(name)));
+    const all = await list();
+    return {
+      ours: all.filter((space) => named.has(space.name)).map((space) => ({ ...space, ...named.get(space.name) })),
+      unsure: all.filter((space) => retired.has(space.name)),
+    };
+  }
+  /** The codespaces this helper made (`inventory().ours`). */
+  const ours = async () => (await inventory()).ours;
 
   /** A request to the helper in the codespace, through the forwarded port. */
   function call(session, method, pathname, body, timeoutMs = 30000) {
@@ -254,12 +353,6 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
       request.on('error', reject);
       request.end(payload || undefined);
     });
-  }
-
-  /** Whether the reader may push to a repository: then the codespace's GitHub token can too. */
-  async function canPush(repo) {
-    const result = await run(gh, ['api', `repos/${repo}`, '--jq', '.permissions.push']);
-    return result.code !== 0 || result.stdout.trim() !== 'false';
   }
 
   /** Set up and start the helper in a codespace (starting the codespace if it was stopped). */
@@ -305,54 +398,99 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
     throw new Error('The helper in the codespace did not answer through the forwarded port');
   }
 
-  async function connect(repo, say) {
-    const all = await list();
-    const known = config.codespaces[repo];
-    let space = (known && all.find((entry) => entry.name === known.name)) ||
-      all.find((entry) => entry.repository === repo && entry.displayName === displayNameFor(repo));
-    if (!space) {
-      say(`Creating a codespace for ${repo}`);
-      const create = (size) => run(gh, ['codespace', 'create', '--repo', repo, '--machine', size, '--display-name', displayNameFor(repo),
-        '--retention-period', RETENTION, '--default-permissions'], { timeoutMs: 15 * 60 * 1000 });
-      let created = await create(machine);
-      // A repository can ask for more than the smallest machine (mathlib4 does). gh then names
-      // the ones it allows: the first of those is taken, unless a machine was asked for by name.
-      const offered = created.code === 0 ? null : /Available machines: \[([^\]]*)\]/.exec(`${created.stderr}\n${created.stdout}`);
-      const larger = offered ? offered[1].split(/[\s,]+/).filter((size) => /^[A-Za-z0-9]+$/.test(size)) : [];
-      if (larger.length && machine === MACHINE) {
-        say(`${repo} needs a larger codespace than the smallest: using ${larger[0]}, which uses your allowance faster`);
-        created = await create(larger[0]);
-      }
-      if (created.code !== 0) throw new Error(explain(created));
-      space = { name: created.stdout.trim().split('\n').pop().trim(), state: 'Available' };
-      if (!space.name) throw new Error('`gh codespace create` did not say which codespace it made');
-      // gh says whose allowance the codespace is charged to: worth passing on.
-      const payer = (created.stderr || '').split('\n').find((line) => /paid for by/.test(line));
-      if (payer) log(`${repo}: ${payer.replace(/^[\s✓]+/, '')}`);
+  /** Create a codespace on a repository. Resolves to the identifier GitHub gave it. */
+  async function create(repo, displayName, retention, say) {
+    say(`Creating a codespace for ${repo}`);
+    const make = (size) => run(gh, ['codespace', 'create', '--repo', repo, '--machine', size, '--display-name', displayName,
+      '--retention-period', retention, '--default-permissions'], { timeoutMs: 15 * 60 * 1000 });
+    let created = await make(machine);
+    // A repository can ask for more than the smallest machine (mathlib4 does). gh then names
+    // the ones it allows: the first of those is taken, unless a machine was asked for by name.
+    const offered = created.code === 0 ? null : /Available machines: \[([^\]]*)\]/.exec(`${created.stderr}\n${created.stdout}`);
+    const larger = offered ? offered[1].split(/[\s,]+/).filter((size) => /^[A-Za-z0-9]+$/.test(size)) : [];
+    if (larger.length && machine === MACHINE) {
+      say(`${repo} needs a larger codespace than the smallest: using ${larger[0]}, which uses your allowance faster`);
+      created = await make(larger[0]);
     }
-    const token = known && known.name === space.name && typeof known.token === 'string' ? known.token : randomBytes(24).toString('base64url');
-    config.codespaces[repo] = { name: space.name, token };
-    save();
-    // A repository's own dev container can take many minutes to build, longer than gh waits
-    // when asked to connect. So the wait is here.
+    if (created.code !== 0) throw new Error(explain(created));
+    const name = created.stdout.trim().split('\n').pop().trim();
+    if (!name) throw new Error('`gh codespace create` did not say which codespace it made');
+    // gh says whose allowance the codespace is charged to: worth passing on.
+    const payer = (created.stderr || '').split('\n').find((line) => /paid for by/.test(line));
+    if (payer) log(`${repo}: ${payer.replace(/^[\s✓]+/, '')}`);
+    return name;
+  }
+
+  /**
+   * Wait for GitHub to set a codespace up. A repository's own dev container can take many
+   * minutes to build, longer than gh waits when asked to connect. So the wait is here.
+   */
+  async function settled(name, say) {
     for (let waited = 0; waited < 45 * 60 * 1000; waited += retryMs) {
-      const now = (await list()).find((entry) => entry.name === space.name);
+      const now = (await list()).find((entry) => entry.name === name);
       if (!now || now.state !== 'Provisioning') break;
-      if (!waited) say(`Waiting for GitHub to set up the codespace ${space.name}`);
+      if (!waited) say(`Waiting for GitHub to set up the codespace ${name}`);
       await sleep(retryMs);
     }
+  }
+
+  /**
+   * Stop using the codespace the settings name for a repository. One that is still there and
+   * that an earlier version of the helper used is kept in the settings as retired, so that
+   * `codespaces` lists it: under those versions, code could run in it without a sandbox (with
+   * --no-sandbox, or where the codespace had none and the reader could not push to the
+   * repository), and may have changed it. It is not deleted, here or by `codespaces --delete`:
+   * those versions also took over a codespace by its name, so it need not be one the helper made.
+   */
+  function retire(repo, all) {
+    const known = config.codespaces[repo];
+    delete config.codespaces[repo];
+    // (A listing that is cut short does not say that a codespace is gone: then it is set aside
+    // whichever version made it, since it may well be there.)
+    const there = Boolean(known) && all.some((entry) => entry.name === known.name);
+    if (known && isCodespaceName(known.name) && !there && all.length >= LIST_LIMIT) {
+      if (!config.retired.some((old) => old && old.name === known.name)) config.retired.push({ name: known.name, repo });
+      log(`${repo}: the codespace ${known.name} is not among the ${LIST_LIMIT} codespaces GitHub listed, so it is not used any more, and a new one is made. If it is still there, delete it with: gh codespace delete -c ${known.name}`);
+    } else if (known && isCodespaceName(known.name) && known.confined !== true && there) {
+      if (!config.retired.some((old) => old && old.name === known.name)) config.retired.push({ name: known.name, repo });
+      log(`${repo}: the codespace ${known.name}, which an earlier version of the helper used, is not used any more: code may have run in it without a sandbox. A new one is made. It may be a codespace of yours that the earlier version took over by its name, so it is left as it is; if you do not need it, delete it with: gh codespace delete -c ${known.name}`);
+    }
+    save();
+  }
+
+  /** Connect to a repository's lasting codespace, where the sandbox confines each run. */
+  async function connect(repo, say) {
+    const all = await list();
+    // The codespace these settings name for the repository, by the identifier GitHub gave it,
+    // and only one that this version made (`confined`): in such a one, a pull request's code
+    // has only ever run in the sandbox. No codespace is taken over because of its repository
+    // and the name shown for it: that could be another helper's (the two would stop each
+    // other's runs), or one in which code ran without a sandbox. Nor one noted as made for a
+    // run without a sandbox, whatever it is called by now.
+    let known = config.codespaces[repo];
+    const noted = new Set(notes().map((entry) => entry.name));
+    let space = known && known.confined === true && !noted.has(known.name) ? all.find((entry) => entry.name === known.name) : null;
+    if (known && !space) {
+      retire(repo, all);
+      known = null;
+    }
+    if (!space) space = { name: await create(repo, displayNameFor(repo), RETENTION, say), state: 'Available' };
+    if (!isCodespaceName(space.name)) throw new Error(`\`gh codespace create\` answered with something that is no codespace's identifier, so nothing is run: ${tail(space.name, 80)}`);
+    const token = known && typeof known.token === 'string' ? known.token : randomBytes(24).toString('base64url');
+    config.codespaces[repo] = { name: space.name, token, confined: true };
+    save();
+    await settled(space.name, say);
     say(space.state === 'Available' ? `Setting up Lean in the codespace ${space.name}` : `Starting the codespace ${space.name}`);
     const status = await boot(space.name, repo, token, say).catch(async (error) => {
       // A codespace in recovery mode is of no use: it is stopped rather than left running.
       if (error.recovery) await run(gh, ['codespace', 'stop', '-c', space.name], { timeoutMs: 3 * 60 * 1000 });
       throw error;
     });
+    // Without a working sandbox there, no run: the code could use the codespace's GitHub token
+    // and change the codespace, which later runs use. (The helper there refuses as well.)
     if (!confines(status.sandbox)) {
-      if (sandbox && await canPush(repo)) {
-        await run(gh, ['codespace', 'ssh', '-c', space.name, '--', STOP_COMMAND], { timeoutMs: 60 * 1000 });
-        throw new Error(`The codespace for ${repo} has no sandbox, and its GitHub token can push to ${repo}, so a pull request's code is not run there. Starting the helper with --no-sandbox runs it all the same.`);
-      }
-      log(`${repo}: the codespace has no sandbox${sandbox ? '; its GitHub token can only read the repository' : ''}`);
+      await run(gh, ['codespace', 'ssh', '-c', space.name, '--', STOP_COMMAND], { timeoutMs: 60 * 1000 });
+      throw new Error(`The codespace for ${repo} has no working sandbox, so a pull request's code is not run there. Starting the helper with --no-sandbox runs it all the same, in a new codespace for each run.`);
     }
     const { port, tunnel } = await forward(space.name, token);
     const session = { name: space.name, token, port, tunnel, sandbox: status.sandbox };
@@ -375,13 +513,148 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
     sessions.delete(repo);
   }
 
+  // --- Runs without a sandbox (`--no-sandbox`).
+  //
+  // Such a run can use its codespace's GitHub token and change anything in the codespace, the
+  // helper there included. So it gets a codespace nothing else has used or will use: made for
+  // the run, and deleted after it. Which codespace that is, is known by one thing only: the
+  // identifier GitHub answered with when it was made. It is noted on disk before anything is
+  // started in the codespace, used for every connection of the run, and is what is deleted.
+  // Nothing here looks a codespace up by its repository or by the name shown for it, which
+  // anyone with the account can change and other codespaces can share: those may be another
+  // helper's run under way, a repository's lasting codespace, or the reader's own work.
+
+  const noteFile = (name) => path.join(recordsDir, `${name}.json`);
+  /** Note a codespace made for a run without a sandbox, with the helper that made it. */
+  function note(name, repo) {
+    mkdirSync(recordsDir, { recursive: true, mode: 0o700 });
+    if (ownStart === undefined) ownStart = startOf(process.pid);
+    writeFileSync(noteFile(name), `${JSON.stringify({ name, repo, pid: process.pid, started: ownStart, instance, created: new Date().toISOString() })}\n`, { mode: 0o600 });
+  }
   /**
-   * Run a job in the repository's codespace: what the helper does itself when Lean is here.
+   * Whether the helper that wrote a note is still running. Its process number alone does not
+   * say: a helper started anew in a container gets the same number again, and after a restart
+   * of the machine the number is some other program's. So a note with this process's number
+   * is of a running helper only if that helper is one of this process's; and for another
+   * process, when it started must not differ from what the note says (see `startsDiffer`).
+   */
+  function stillRuns(entry) {
+    if (running.has(entry.instance)) return true;
+    if (entry.pid === process.pid || !alive(entry.pid)) return false;
+    return !startsDiffer(entry.started, startOf(entry.pid));
+  }
+  const forgetNote = (name) => { if (recordsDir && isCodespaceName(name)) rmSync(noteFile(name), { force: true }); };
+  /** What is noted: `[{name, repo, pid, started, instance}]`. A file that is not such a note is passed over. */
+  function notes() {
+    if (!recordsDir) return [];
+    let files = [];
+    try { files = readdirSync(recordsDir); } catch { return []; }
+    const found = [];
+    for (const file of files) {
+      try {
+        const entry = JSON.parse(readFileSync(path.join(recordsDir, file), 'utf8'));
+        if (entry && isCodespaceName(entry.name) && file === `${entry.name}.json`) found.push(entry);
+      } catch { /* not a note */ }
+    }
+    return found;
+  }
+
+  /**
+   * Delete a codespace this helper's notes name, and forget it once it is gone. When it cannot
+   * be deleted, the note stays, and `tidy` tries again.
+   */
+  async function discard(name, repo, why) {
+    const mine = alone.get(name);
+    if (mine && mine.session) stopChild(mine.session.tunnel);
+    alone.delete(name);
+    log(`Deleting the codespace ${name}${repo ? ` for ${repo}` : ''}: ${why}. The results stay.`);
+    const deleted = await run(gh, ['codespace', 'delete', '-c', name, '--force'], { timeoutMs: 3 * 60 * 1000 });
+    if (deleted.code === 0) { forgetNote(name); return; }
+    // Gone already (deleted by hand, or by GitHub): nothing is left to delete, only to forget.
+    // (Only a listing that holds all the account's codespaces says so.)
+    const all = await list().catch(() => null);
+    if (all && all.length < LIST_LIMIT && !all.some((space) => space.name === name)) { forgetNote(name); return; }
+    log(`The codespace ${name} could not be deleted (${explain(deleted)}). It is tried again at the next run and the next start; or delete it with: gh codespace delete -c ${name}`);
+  }
+
+  /**
+   * Delete the noted codespaces that no running helper is using: those of a helper that stopped
+   * before it could delete its own, and those this helper failed to delete. Only what is noted
+   * in `recordsDir` is ever deleted here, by the identifier noted; a codespace that merely looks
+   * like one of these is left alone, and so is one whose helper is still running.
+   */
+  let tidying = null;
+  function tidy() {
+    if (!tidying) {
+      tidying = (async () => {
+        for (const entry of notes()) {
+          if (alone.has(entry.name)) continue; // this helper's run, under way
+          if (entry.instance !== instance && stillRuns(entry)) continue; // another helper's, still running
+          await discard(entry.name, isRepoName(entry.repo) ? entry.repo : null, entry.instance === instance
+            ? 'it ran code without a sandbox, and could not be deleted before'
+            : 'a helper that has stopped made it for a run without a sandbox');
+        }
+      })().catch((error) => log(`Codespaces left from runs without a sandbox could not be looked through: ${error.message}`)).finally(() => { tidying = null; });
+    }
+    return tidying;
+  }
+
+  /**
+   * Run a job without a sandbox, in a codespace made for it and deleted after it. `--keep-codespaces`
+   * does not apply: a codespace that ran code without a sandbox is not used again.
+   */
+  async function runAlone(job, outcomes) {
+    const say = (message) => job.say(message);
+    if (!recordsDir) throw new Error('There is nowhere to note the codespace of a run without a sandbox, so none is made');
+    await tidy();
+    const name = await create(job.repo, unsandboxedNameFor(job.repo), RETENTION_ALONE, say);
+    if (!isCodespaceName(name)) throw new Error(`\`gh codespace create\` answered with something that is no codespace's identifier, so nothing is run: ${tail(name, 80)}`);
+    const mine = { repo: job.repo, session: null };
+    alone.set(name, mine);
+    try {
+      // Noted before anything is started in it. A codespace that cannot be noted is not used.
+      note(name, job.repo);
+      const token = randomBytes(24).toString('base64url');
+      await settled(name, say);
+      log(`${job.repo}: the codespace ${name} runs the code without a sandbox (--no-sandbox), and is deleted after the run`);
+      const close = () => {
+        if (mine.session) stopChild(mine.session.tunnel);
+        mine.session = null;
+      };
+      await runThere(job, outcomes, {
+        // The same codespace each time the connection has to be made again, by its identifier.
+        async open() {
+          if (mine.session && mine.session.tunnel.exitCode === null && mine.session.tunnel.signalCode === null) return mine.session;
+          close();
+          say(`Setting up Lean in the codespace ${name}`);
+          const status = await boot(name, job.repo, token, say);
+          const { port, tunnel } = await forward(name, token);
+          mine.session = { name, token, port, tunnel, sandbox: status.sandbox };
+          // (The helper stopped while the connection was being made: `shutdown` has deleted the codespace.)
+          if (!alone.has(name)) { stopChild(tunnel); throw new Error('The helper is stopping'); }
+          return mine.session;
+        },
+        close,
+      });
+    } finally {
+      if (alone.has(name)) await discard(name, job.repo, 'its run without a sandbox is over');
+    }
+  }
+
+  /**
+   * Run a job in a codespace: what the helper does itself when Lean is here.
    * `store(file, data)` and `fail(file, error)` take each file's outcome.
    */
-  async function runJob(job, { store, fail }) {
+  function runJob(job, outcomes) {
+    if (!sandbox) return runAlone(job, outcomes);
     const say = (message) => job.say(message);
-    let session = await ensure(job.repo, say);
+    return runThere(job, outcomes, { open: () => ensure(job.repo, say), close: () => drop(job.repo) });
+  }
+
+  /** The run itself, over a connection that `link.open()` makes (again) and `link.close()` ends. */
+  async function runThere(job, { store, fail }, link) {
+    const say = (message) => job.say(message);
+    let session = await link.open();
     // When a request fails, the connection went (this machine slept, its network changed) or the
     // codespace stopped. It is made again, a few times over: a network takes a moment to come
     // back. The helper there is left running if it still is, and the run with it.
@@ -393,9 +666,9 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
         } catch (error) {
           failure = error;
         }
-        drop(job.repo);
+        link.close();
         if (attempt) await sleep(retryMs * attempt);
-        try { session = await ensure(job.repo, say); } catch (error) { failure = error; }
+        try { session = await link.open(); } catch (error) { failure = error; }
       }
       throw failure;
     };
@@ -445,12 +718,22 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
 
   /** When the helper stops: close the connections, and stop the codespaces it was using. */
   function shutdown() {
+    running.delete(instance);
     for (const [repo, session] of [...sessions]) {
       drop(repo);
       if (keep) continue;
       log(`Stopping the codespace for ${repo}`);
       spawnSync(gh, ['codespace', 'ssh', '-c', session.name, '--', STOP_COMMAND], { stdio: 'ignore', timeout: 45 * 1000 });
       spawnSync(gh, ['codespace', 'stop', '-c', session.name], { stdio: 'ignore', timeout: 90 * 1000 });
+    }
+    // A codespace made for a run without a sandbox is deleted, whatever `keep` says. If that
+    // fails, its note stays, and the next start deletes it (`tidy`).
+    for (const [name, mine] of [...alone]) {
+      if (mine.session) stopChild(mine.session.tunnel);
+      alone.delete(name);
+      log(`Deleting the codespace ${name} for ${mine.repo}: its run was without a sandbox`);
+      const deleted = spawnSync(gh, ['codespace', 'delete', '-c', name, '--force'], { stdio: 'ignore', timeout: 90 * 1000 });
+      if (deleted.status === 0) forgetNote(name);
     }
   }
 
@@ -459,9 +742,11 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
   /** Delete one of this helper's codespaces by name, and forget it. */
   async function remove(name) {
     await must(['codespace', 'delete', '-c', name, '--force'], { timeoutMs: 3 * 60 * 1000 });
-    for (const [repo, known] of Object.entries(config.codespaces)) if (known.name === name) delete config.codespaces[repo];
+    for (const [repo, known] of Object.entries(config.codespaces)) if (!known || known.name === name) delete config.codespaces[repo];
+    config.retired = config.retired.filter((old) => old && old.name !== name);
     save();
+    forgetNote(name);
   }
 
-  return { check, runJob, rest, shutdown, ours, stop, remove, run };
+  return { check, runJob, rest, shutdown, inventory, ours, stop, remove, tidy, run };
 }

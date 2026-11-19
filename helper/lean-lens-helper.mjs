@@ -580,7 +580,7 @@ export function createHelper(options = {}) {
   const keepCodespaces = Boolean(options.keepCodespaces);
   const remote = options.codespaces
     ? options.codespaces({
-      config, save, run, log, gh: options.gh, sandbox: sandboxWanted, keep: keepCodespaces,
+      config, save, run, log, gh: options.gh, sandbox: sandboxWanted, keep: keepCodespaces, recordsDir: path.join(cacheDir, 'codespaces'),
       remotePort: options.remotePort, cloneBase: options.cloneBase, pollMs: options.pollMs, keepAliveMs: options.keepAliveMs, retryMs: options.retryMs,
       machine: options.machine,
     })
@@ -1291,7 +1291,7 @@ const USAGE = `Lean Lens helper: real Lean hovers and proof states for the exten
   node lean-lens-helper.mjs clean [--all]              remove what the helper keeps on disk
                                                        (--all: the results of earlier runs too)
   node lean-lens-helper.mjs codespaces [--stop | --delete]
-                                                       list, stop or delete the codespaces it made
+                                                       list, stop or delete the codespaces its settings name
 
 Options
   --port N                  port on 127.0.0.1 (default ${DEFAULT_PORT})
@@ -1309,6 +1309,7 @@ Options
   --here owner/repo         with --codespaces: run this repository on this machine all the same
                             (can be repeated). For one whose codespace cannot be set up
   --keep-codespaces         leave codespaces running when idle and when the helper stops
+                            (not with --no-sandbox: each run's codespace is deleted after it)
   --codespace-machine NAME  the machine for codespaces it creates (default basicLinux32gb, two
                             cores; standardLinux32gb has four and uses the allowance twice as fast)
   --gh PATH                 the \`gh\` program to use
@@ -1340,20 +1341,30 @@ async function clean(values) {
 
 async function codespacesCommand(values) {
   const { createCodespaces } = await import('./codespaces.mjs');
-  const { config, save } = loadConfig(path.resolve(values.cache || defaultCacheDir()));
-  const spaces = createCodespaces({ config, save, run, log: say, gh: values.gh });
-  const ours = await spaces.ours();
-  if (!ours.length) console.log('There are no Lean Lens codespaces.');
+  const cacheDir = path.resolve(values.cache || defaultCacheDir());
+  const { config, save } = loadConfig(cacheDir);
+  const spaces = createCodespaces({ config, save, run, log: say, gh: values.gh, recordsDir: path.join(cacheDir, 'codespaces') });
+  const { ours, unsure } = await spaces.inventory();
+  if (!ours.length && !unsure.length) console.log("There are no codespaces that this helper's settings name.");
   for (const space of ours) {
-    if (values.delete) {
+    if (space.busy && (values.delete || values.stop)) {
+      // (Made for a run without a sandbox by a helper that is still running: it deletes it itself.)
+      say(`Left alone: ${space.name} (${space.repository}) is in use by a running helper (process ${space.busy})`);
+    } else if (values.delete) {
       await spaces.remove(space.name);
       say(`Deleted ${space.name} (${space.repository})`);
     } else if (values.stop && space.state !== 'Shutdown') {
       await spaces.stop(space.name);
       say(`Stopped ${space.name} (${space.repository})`);
     } else {
-      say(`${space.name}  ${space.repository}  ${space.state}  last used ${space.lastUsedAt || 'never'}`);
+      say(`${space.name}  ${space.repository}  ${space.state}  last used ${space.lastUsedAt || 'never'}${space.busy ? `  (in use by a running helper, process ${space.busy})` : ''}`);
     }
+  }
+  // (Used by an earlier version of the helper, which may have taken it over by the name shown
+  // for it: it need not be one a helper made, so it is never stopped or deleted here.)
+  if (unsure.length) {
+    console.log(`\nUsed by an earlier version of the helper, which may have taken ${unsure.length === 1 ? 'it' : 'them'} over from you by the name shown, so not stopped or deleted here:`);
+    for (const space of unsure) say(`${space.name}  ${space.repository}  ${space.state}  last used ${space.lastUsedAt || 'never'}  (to delete: gh codespace delete -c ${space.name})`);
   }
 }
 
@@ -1389,8 +1400,10 @@ async function main() {
   for (const repo of values.here || []) if (!isRepo(repo)) throw new Error(`--here takes owner/repo, not ${repo}`);
   stop = () => { helper.shutdown(); process.exit(130); };
   if (helper.remote) await helper.remote.check(); // `gh` is there and may use codespaces
+  // Codespaces an earlier helper made for runs without a sandbox and did not get to delete.
+  if (helper.remote) helper.remote.tidy();
   const sandboxLine = helper.remote
-    ? `Lean runs in GitHub Codespaces on your account, one for each repository, and not on this machine${(values.here || []).length ? ` (except for ${values.here.join(', ')})` : ''}`
+    ? `Lean runs in GitHub Codespaces on your account, ${values['no-sandbox'] ? 'without a sandbox (--no-sandbox): each run gets a new codespace, deleted after it' : 'one for each repository'}, and not on this machine${(values.here || []).length ? ` (except for ${values.here.join(', ')})` : ''}`
     : `Sandbox ${{
       seatbelt: "on: the project's code runs without network access and cannot read or change your files",
       bwrap: "on: the project's code runs without network access and sees none of your files",
@@ -1443,7 +1456,8 @@ async function main() {
   });
   stop = () => {
     console.log(`\nStopping.${helper.remote
-      ? (helper.keepCodespaces ? '' : ' Stopping the codespaces that were used; the results stay here.')
+      ? (values['no-sandbox'] ? ' Deleting the codespace of a run under way, if there is one; the results stay here.'
+        : helper.keepCodespaces ? '' : ' Stopping the codespaces that were used; the results stay here.')
       : (helper.keepBuilds ? '' : ' Removing the builds; the results stay.')}`);
     server.close();
     helper.shutdown();
@@ -1460,7 +1474,9 @@ ${sandboxLine}.
 Allowed repositories: ${helper.config.allow.length ? helper.config.allow.join(', ') : 'none yet (allow one from the extension, or with --allow owner/repo)'}
 Kept in: ${helper.cacheDir} (${formatBytes(await sizeOf(helper.cacheDir))} now)${helper.buildsDir === helper.cacheDir ? '' : `\nBuilds go to: ${helper.buildsDir}`}
 ${helper.remote
-    ? `Codespaces: ${helper.keepCodespaces
+    ? `Codespaces: ${values['no-sandbox']
+      ? 'each run gets a new one, deleted when the run is over and when the helper stops (--no-sandbox). The results are kept here.'
+      : helper.keepCodespaces
       ? 'left running (--keep-codespaces); GitHub stops an idle one by itself.'
       : `one is stopped ${helper.tidyMinutes ? `after ${minutes} without a run` : 'when its run is over'}, and when the helper stops. The results are kept here.`}`
     : `Builds: ${helper.keepBuilds
