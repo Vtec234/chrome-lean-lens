@@ -32,20 +32,283 @@ const DEFAULT_SETTINGS = {
 const memoryCache = new Map();
 let queryStats = { totalQueries: 0, cacheHits: 0, loogleHits: 0, leanHits: 0 };
 
+// ---------------------------------------------------------------------------------------------
+// Where the settings are kept.
+//
+// The settings about the helper (whether it is used, its address, its token) decide where the
+// token goes and whether Lean runs, so no web page's content script may read or change them.
+// `chrome.storage.local` does not promise that: content scripts may use it unless the browser
+// can be told otherwise (`setAccessLevel`, below), which Firefox cannot. So those three are kept
+// in the extension's own IndexedDB instead. That belongs to the extension's origin, which only
+// this worker and the extension's pages have: a content script's `indexedDB` is the web page's.
+// Only this worker uses it; the options page and the popup ask the worker. The other settings
+// (delays, what is shown) stay in `chrome.storage.local`.
+
+const HELPER_SETTINGS = ['enableHelper', 'helperUrl', 'helperToken'];
+const PRIVATE_DB = 'lean_lens_private';
+const PRIVATE_STORE = 'values';
+const HELPER_SETTINGS_KEY = 'helper_settings';
+
+// How long an operation on the private store may take. Every read of the settings waits for
+// one, so a database that never answers (it can stay blocked, or its storage be stuck) is given
+// up on, as one that fails is.
+const PRIVATE_STORE_TIMEOUT_MS = 3000;
+
+/** One operation on the private store (`act` gets the store and returns a request). */
+function privateStore(mode, act) {
+  return new Promise((resolve, reject) => {
+    let over = false;
+    let underway = null;
+    const end = (settle, value) => { if (!over) { over = true; clearTimeout(timer); settle(value); } };
+    const timer = setTimeout(() => {
+      end(reject, new Error('The private store did not answer'));
+      try { if (underway) underway.abort(); } catch (err) { /* over already */ }
+    }, PRIVATE_STORE_TIMEOUT_MS);
+    const opening = indexedDB.open(PRIVATE_DB, 1);
+    opening.onupgradeneeded = () => opening.result.createObjectStore(PRIVATE_STORE);
+    opening.onerror = () => end(reject, opening.error);
+    opening.onblocked = () => end(reject, new Error('The private store is blocked'));
+    opening.onsuccess = () => {
+      const db = opening.result;
+      if (over) { db.close(); return; } // it answered too late
+      try {
+        const transaction = db.transaction(PRIVATE_STORE, mode);
+        underway = transaction;
+        const request = act(transaction.objectStore(PRIVATE_STORE));
+        transaction.oncomplete = () => { db.close(); end(resolve, request.result); };
+        transaction.onabort = () => { db.close(); end(reject, transaction.error); };
+      } catch (err) {
+        db.close();
+        end(reject, err);
+      }
+    };
+  });
+}
+
+// Where the helper's settings go when the browser has no IndexedDB for the extension (some
+// private modes), or it fails: `chrome.storage.session`, which lasts until the browser closes
+// and which content scripts cannot use (it is closed to them unless `setAccessLevel` opens it,
+// which this extension never calls and Firefox does not have); without that, this worker's
+// memory, which lasts until the browser stops the worker, as it does after a short while
+// without use. Never `chrome.storage.local`. This should be rare, and its cost is only that
+// the address and token are pasted again, after a restart or, in memory, sooner (the options
+// page says which): a lesser evil than keeping them where a page's script can read them.
+const sessionArea = () => {
+  try { return (chrome.storage && chrome.storage.session) || null; } catch (err) { return null; }
+};
+const inArea = (area, method, argument) => new Promise((resolve, reject) => {
+  try {
+    area[method](argument, (result) => (chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(result)));
+  } catch (err) { reject(err); }
+});
+
+// The private store's record, once read or written there: `{ values }`, `values` null when it
+// has none. Remembered while the worker lives, since only this worker writes it. A read that
+// failed is not remembered: the store is tried again, though not at once.
+let helperSaved;
+let privateFailedAt = 0; // when the private store last failed or did not answer
+const PRIVATE_STORE_RETRY_MS = 30 * 1000;
+
+const readRecord = (store) => store.get(HELPER_SETTINGS_KEY);
+/** An operation on the private store, unless it failed a moment ago (see `PRIVATE_STORE_TIMEOUT_MS`). */
+function privateStoreNow(mode, act) {
+  if (Date.now() - privateFailedAt < PRIVATE_STORE_RETRY_MS) return Promise.reject(new Error('The private store failed a moment ago'));
+  return privateStore(mode, act).catch((err) => { privateFailedAt = Date.now(); throw err; });
+}
+/** The private store's record, `{ values }`; rejects when the store cannot be read. */
+async function storeRecord() {
+  if (!helperSaved) helperSaved = { values: (await privateStoreNow('readonly', readRecord)) || null };
+  return helperSaved;
+}
+async function writeRecord(values) {
+  await privateStoreNow('readwrite', (store) => store.put(values, HELPER_SETTINGS_KEY));
+  helperSaved = { values };
+}
+
+// Something noted for want of the private store, in `chrome.storage.session` and, when that
+// cannot hold it, in this worker's memory: `{ value, kept }` ('session' or 'memory'), or null.
+// Read once per worker, since only this worker writes it.
+const noted = {};
+async function readNote(key) {
+  if (noted[key] === undefined) {
+    try {
+      const found = await inArea(sessionArea(), 'get', [key]);
+      noted[key] = Object.prototype.hasOwnProperty.call(found, key) ? { value: found[key], kept: 'session' } : null;
+    } catch (err) { noted[key] = null; }
+  }
+  return noted[key];
+}
+async function writeNote(key, value) {
+  try {
+    await inArea(sessionArea(), 'set', { [key]: value });
+    noted[key] = { value, kept: 'session' };
+  } catch (err) { noted[key] = { value, kept: 'memory' }; }
+  return noted[key].kept;
+}
+async function clearNote(key) {
+  if (noted[key] === null) return;
+  noted[key] = null;
+  try { await inArea(sessionArea(), 'remove', key); } catch (err) { /* it was in memory */ }
+}
+// The helper's settings as last saved, when the private store did not take them. They are the
+// newest, so they come before the store's record, and are written to the store when it works
+// again.
+const UNSAVED_KEY = HELPER_SETTINGS_KEY;
+// That settings saved by an earlier version are still to be moved (see `settleEarlier`):
+// 'install' or 'update' as `runtime.onInstalled` said, and then `{ values }`, the settings to
+// move, once taken from `chrome.storage.local`.
+const MOVE_KEY = 'helper_settings_move';
+
+/**
+ * The helper's settings as saved (null when none are), and where they were read from: 'saved'
+ * (the private store), 'session' or 'memory' (saved there for want of it, as
+ * `writeHelperSettings` resolves to), or 'unread' when the store could not be read and nothing
+ * was saved meanwhile: there may be settings, and what they are is not known.
+ */
+async function readHelperSettings() {
+  const unsaved = await readNote(UNSAVED_KEY);
+  if (unsaved) {
+    try {
+      await writeRecord(unsaved.value);
+      await clearNote(UNSAVED_KEY);
+    } catch (err) {
+      return { values: unsaved.value, kept: unsaved.kept };
+    }
+  }
+  try {
+    return { values: (await storeRecord()).values, kept: 'saved' };
+  } catch (err) {
+    return { values: null, kept: 'unread' };
+  }
+}
+
+/**
+ * Saves the helper's settings. Resolves to how long they are kept: 'saved' (for good),
+ * 'session' (until the browser closes) or 'memory' (until this worker stops, which a browser
+ * makes it do after a short while without use). Kept either of those ways, they are still what
+ * is read from then on, and go to the private store once it takes them.
+ */
+async function writeHelperSettings(values) {
+  await clearNote(MOVE_KEY); // what is saved now is newer than anything still to be moved
+  try {
+    await writeRecord(values);
+    await clearNote(UNSAVED_KEY);
+    return 'saved';
+  } catch (err) {
+    return writeNote(UNSAVED_KEY, values);
+  }
+}
+
+const pick = (from, keys) => Object.fromEntries(keys.filter((key) => from && Object.prototype.hasOwnProperty.call(from, key)).map((key) => [key, from[key]]));
+const without = (from, keys) => Object.fromEntries(Object.entries(from || {}).filter(([key]) => !keys.includes(key)));
+
+// One read or write of the settings at a time: a read may have to move the helper's settings
+// (below), and must not put back old ones over what is being saved.
+let settingsTurn = Promise.resolve();
+const inTurn = (work) => {
+  const result = settingsTurn.then(work);
+  settingsTurn = result.catch(() => {});
+  return result;
+};
+
+/**
+ * What to do with settings for the helper found in `chrome.storage.local` (`earlier`), where a
+ * version of the extension before this one kept them, and where a page's script may be able
+ * to write. They are taken from there only when the extension has just been updated
+ * (`runtime.onInstalled`, noted under `MOVE_KEY`): that is the one moment they can be ours.
+ * They are taken once, into the note, which no page's script can read, and then the private
+ * store gets them if it has no record yet; an installation takes an empty record. The store
+ * then has a record, so later updates move nothing. At any other time they are never used.
+ * While the store cannot be written, the note keeps them and the move is tried again; a note
+ * kept in memory goes when the worker stops, and the token is then pasted again.
+ * Resolves to `{ moved, remove }`: the settings that were moved, if any, and whether those in
+ * `chrome.storage.local` are to be removed now. They are, except while the store is empty and
+ * nothing says an update is under way (the event may be about to come).
+ */
+async function settleEarlier(earlier) {
+  let move = await readNote(MOVE_KEY);
+  if (move && typeof move.value === 'string') {
+    await writeNote(MOVE_KEY, { values: move.value === 'update' ? earlier : {} });
+    move = noted[MOVE_KEY];
+  }
+  let record;
+  try {
+    record = await storeRecord();
+  } catch (err) {
+    return { moved: null, remove: true };
+  }
+  if (record.values) {
+    await clearNote(MOVE_KEY);
+    return { moved: null, remove: true };
+  }
+  if (!move) return { moved: null, remove: false };
+  try {
+    const { values } = move.value;
+    await writeRecord(values);
+    await clearNote(MOVE_KEY);
+    return { moved: values, remove: true };
+  } catch (err) {
+    helperSaved = undefined;
+    return { moved: null, remove: true };
+  }
+}
+
+/** The settings merged with defaults, and where the helper's were read from (see `readHelperSettings`). */
+function readSettings() {
+  return inTurn(async () => {
+    const stored = await inArea(chrome.storage.local, 'get', [SETTINGS_KEY, LEGACY_SETTINGS_KEY]).catch(() => ({}));
+    let saved = stored[SETTINGS_KEY];
+    // One-time migration from the extension's former name ("Verso").
+    if (!saved && stored[LEGACY_SETTINGS_KEY]) {
+      saved = stored[LEGACY_SETTINGS_KEY];
+      await inArea(chrome.storage.local, 'set', { [SETTINGS_KEY]: saved }).catch(() => {});
+      await inArea(chrome.storage.local, 'remove', LEGACY_SETTINGS_KEY).catch(() => {});
+    }
+    let { values: helper, kept } = await readHelperSettings();
+    const earlier = pick(saved, HELPER_SETTINGS);
+    if (Object.keys(earlier).length || await readNote(MOVE_KEY)) {
+      const { moved, remove } = await settleEarlier(earlier);
+      if (moved) { helper = moved; kept = 'saved'; }
+      if (remove && Object.keys(earlier).length) {
+        await inArea(chrome.storage.local, 'set', { [SETTINGS_KEY]: without(saved, HELPER_SETTINGS) }).catch(() => {});
+      }
+    }
+    return { settings: Object.assign({}, DEFAULT_SETTINGS, without(saved, HELPER_SETTINGS), pick(helper, HELPER_SETTINGS)), helperKept: kept };
+  });
+}
+
 /**
  * Get stored settings merged with defaults.
  */
-async function getSettings() {
-  return new Promise((resolve) => {
-    chrome.storage.local.get([SETTINGS_KEY, LEGACY_SETTINGS_KEY], (res) => {
-      let saved = res[SETTINGS_KEY];
-      // One-time migration from the extension's former name ("Verso").
-      if (!saved && res[LEGACY_SETTINGS_KEY]) {
-        saved = res[LEGACY_SETTINGS_KEY];
-        chrome.storage.local.set({ [SETTINGS_KEY]: saved }, () => chrome.storage.local.remove(LEGACY_SETTINGS_KEY));
-      }
-      resolve(Object.assign({}, DEFAULT_SETTINGS, saved || {}));
-    });
+const getSettings = () => readSettings().then((read) => read.settings);
+
+// Installed or updated: note it, for the one move of settings an update may make (see
+// `settleEarlier`), and read the settings, which makes it. Settings taken for a move not yet
+// made stay as they are: `chrome.storage.local` has none of the helper's by then.
+try {
+  chrome.runtime.onInstalled.addListener((details) => {
+    if (!details || (details.reason !== 'install' && details.reason !== 'update')) return;
+    inTurn(async () => {
+      const move = await readNote(MOVE_KEY);
+      if (!move || typeof move.value === 'string') await writeNote(MOVE_KEY, details.reason);
+    }).then(readSettings).catch(() => {});
+  });
+} catch (err) { /* no such event here */ }
+
+/**
+ * Save the settings: the helper's privately, the others in `chrome.storage.local`. A page that
+ * was not shown the helper's settings (they could not be read) and did not change them sends
+ * none, and those saved are left as they are. Resolves to how long the helper's are kept (see
+ * `writeHelperSettings`), or undefined when none were sent.
+ */
+function setSettings(settings) {
+  return inTurn(async () => {
+    const helper = pick(settings, HELPER_SETTINGS);
+    const kept = Object.keys(helper).length ? await writeHelperSettings(helper) : undefined;
+    // (What `chrome.storage.local` has for the helper stays as it is: see `settleEarlier`.)
+    const stored = await inArea(chrome.storage.local, 'get', [SETTINGS_KEY]).catch(() => ({}));
+    await inArea(chrome.storage.local, 'set', { [SETTINGS_KEY]: Object.assign(without(settings, HELPER_SETTINGS), pick(stored[SETTINGS_KEY], HELPER_SETTINGS)) }).catch(() => {});
+    return kept;
   });
 }
 
@@ -1316,19 +1579,35 @@ async function handleLookupToken(token, subToken, fileRef, contextText, tacticPo
 // The local helper: real Lean, run on this machine (helper/lean-lens-helper.mjs).
 
 /**
+ * The helper's address, when it is one on this machine (the hosts the manifest grants), or null.
+ * The helper only ever listens there, and the token goes with every request: an address
+ * elsewhere would send it to whoever is there.
+ */
+function localHelperUrl(url) {
+  let parsed;
+  try { parsed = new URL(url); } catch (err) { return null; }
+  return parsed.protocol === 'http:' && (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost') ? parsed : null;
+}
+
+/**
  * One request to the helper. Resolves to its JSON answer, or to `{state}` when there is none:
- * 'off' (not set up), 'offline' (not running), 'unauthorized' (wrong token), 'not_allowed'
- * (the repository is not allowed yet), 'error'.
+ * 'off' (not set up), 'not_local' (its address is not on this machine), 'offline' (not
+ * running), 'unauthorized' (wrong token), 'not_allowed' (the repository is not allowed yet),
+ * 'error'.
  */
 async function helperRequest(path, { body, settings, timeout = 6000 } = {}) {
   const s = settings || await getSettings();
   if (!s.enableHelper || !s.helperUrl || !s.helperToken) return { state: 'off' };
+  if (!localHelperUrl(s.helperUrl)) return { state: 'not_local' };
   let timer = null;
   try {
     const controller = new AbortController();
     timer = setTimeout(() => controller.abort(), timeout);
     const res = await fetch(new URL(path, s.helperUrl).toString(), {
       method: body ? 'POST' : 'GET',
+      // The token goes to the address checked above and no further: the helper never redirects,
+      // and whatever else answers there must not send the request, token and all, elsewhere.
+      redirect: 'error',
       headers: Object.assign({ 'X-Lean-Lens-Token': s.helperToken }, body ? { 'Content-Type': 'application/json' } : {}),
       body: body ? JSON.stringify(body) : undefined,
       signal: controller.signal
@@ -1537,10 +1816,21 @@ const MESSAGE_HANDLERS = {
     const f = await structureField(request.type, request.index, request.rest);
     return f ? { field: { name: f.name, type: f.type }, structure: f.structure } : null;
   },
-  GET_SETTINGS: async () => ({ success: true, settings: await getSettings(), stats: queryStats }),
-  SET_SETTINGS: (request) => new Promise((resolve) => {
-    chrome.storage.local.set({ [SETTINGS_KEY]: request.settings }, () => resolve({ success: true }));
-  }),
+  // The settings. Pages on GitHub get them without the helper's token, which only the worker
+  // itself needs.
+  // The extension's pages are also told where the helper's settings were read from: when
+  // that is 'unread', they are not known, and a page does not send back the ones it was shown.
+  GET_SETTINGS: async (request, sender) => {
+    const { settings, helperKept } = await readSettings();
+    if (!fromExtensionPage(sender)) {
+      delete settings.helperToken;
+      return { success: true, settings, stats: queryStats };
+    }
+    return { success: true, settings, helperKept, stats: queryStats };
+  },
+  // `helperKept` says how long the helper's settings last, when some were sent: 'saved', or
+  // 'session' or 'memory' when the private store did not take them (see `writeHelperSettings`).
+  SET_SETTINGS: async (request) => ({ success: true, helperKept: await setSettings(request.settings || {}) }),
   CLEAR_CACHE: () => new Promise((resolve) => {
     memoryCache.clear();
     rawQueryCache.clear();
@@ -1567,11 +1857,6 @@ const MESSAGE_HANDLERS = {
   DECL_WHERE: (request) => declWhere(request.fileRef),
   // The proof a hovered tactic is in, step by step, for stepping through it in the tooltip.
   EXACT_STEPS: (request) => exactSteps(request),
-  HELPER_ALLOW: async (request) => {
-    const res = await helperRequest('/allow', { body: { repo: request.repo } });
-    exactCache.clear();
-    return res;
-  },
   TEST_HELPER: async (request) => {
     const res = await helperRequest('/status', { settings: { enableHelper: true, helperUrl: request.url, helperToken: request.token }, timeout: 2500 });
     return { success: Boolean(res && res.ok), state: res && res.state, details: res };
@@ -1581,11 +1866,38 @@ const MESSAGE_HANDLERS = {
 // What the page gets when a handler fails, so it never waits forever.
 const MESSAGE_FALLBACKS = { LOOKUP_TOKEN: { success: false, data: null }, PROJECT_DECLARATIONS: { declarations: [] } };
 
+// Content scripts never read storage themselves, and should not be able to: only the extension's
+// own pages and this worker may. Not every browser can be told so (Firefox cannot), which is why
+// the helper's settings are not kept there at all (see `HELPER_SETTINGS`); where it can, this
+// also keeps pages from the other settings and the cached lookups.
+try {
+  const local = chrome.storage && chrome.storage.local;
+  if (local && typeof local.setAccessLevel === 'function') {
+    Promise.resolve(local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })).catch(() => {});
+  }
+} catch (err) { /* not supported here */ }
+
+// Messages only the extension's own pages (the options page and the popup) send. Content
+// scripts run inside GitHub's pages; should one of those ever be taken over, it must not be
+// able to change the settings (and so send the helper's token elsewhere), or make the worker
+// reach an address of its choosing.
+const EXTENSION_PAGE_ONLY = new Set(['SET_SETTINGS', 'CLEAR_CACHE', 'TEST_HELPER']);
+
+/** Whether a message comes from one of the extension's own pages, not from a content script. */
+function fromExtensionPage(sender) {
+  return Boolean(sender && sender.id === chrome.runtime.id && typeof sender.url === 'string' &&
+    sender.url.startsWith(chrome.runtime.getURL('')));
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   const handler = request && Object.prototype.hasOwnProperty.call(MESSAGE_HANDLERS, request.action) && MESSAGE_HANDLERS[request.action];
   if (!handler) return false;
+  if (EXTENSION_PAGE_ONLY.has(request.action) && !fromExtensionPage(sender)) {
+    sendResponse({ success: false, error: 'Only the extension\'s own pages may send this' });
+    return false;
+  }
   Promise.resolve()
-    .then(() => handler(request)) // also catches errors thrown synchronously
+    .then(() => handler(request, sender)) // also catches errors thrown synchronously
     .then(sendResponse, (err) => {
       console.warn('[Lean Lens] message handler failed:', request.action, err);
       sendResponse(Object.prototype.hasOwnProperty.call(MESSAGE_FALLBACKS, request.action) ? MESSAGE_FALLBACKS[request.action] : null);

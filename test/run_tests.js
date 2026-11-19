@@ -201,21 +201,93 @@ const mockLoogleHits = [
 // A working in-memory chrome.storage and a captured message listener (exercised in section 17).
 const fakeStorage = {};
 const workerListeners = [];
+const storageAccessLevels = [];
+// Who sends a message: the extension's own options page, or the content script in a GitHub tab.
+const EXTENSION_PAGE = { id: 'lean-lens-test', url: 'chrome-extension://lean-lens-test/options/options.html' };
+const GITHUB_TAB = { id: 'lean-lens-test', url: 'https://github.com/o/r/pull/7/files', tab: { id: 1 } };
+// An in-memory storage area (`chrome.storage.local`, `.session`) over `kept`.
+const fakeArea = (kept) => ({
+  get: (keys, cb) => {
+    const out = {};
+    const wanted = keys === null ? Object.keys(kept) : [].concat(keys);
+    wanted.forEach(k => { if (k in kept) out[k] = JSON.parse(JSON.stringify(kept[k])); });
+    if (cb) cb(out);
+  },
+  set: (obj, cb) => { Object.assign(kept, JSON.parse(JSON.stringify(obj))); if (cb) cb(); },
+  remove: (keys, cb) => { [].concat(keys).forEach(k => delete kept[k]); if (cb) cb(); },
+  clear: (cb) => { Object.keys(kept).forEach(k => delete kept[k]); if (cb) cb(); }
+});
+// The extension's own IndexedDB, as far as the worker uses it: databases of stores of values, in
+// `kept`, with requests and transactions that end later, as the real ones do.
+const fakeIndexedDB = (kept, trouble = {}) => ({
+  open(name) {
+    const opening = {};
+    if (trouble.silent) return opening; // a database that never answers
+    if (trouble.failing) { setTimeout(() => opening.onerror && opening.onerror(), 0); return opening; }
+    setTimeout(() => {
+      const isNew = !kept[name];
+      if (isNew) kept[name] = {};
+      const stores = kept[name];
+      opening.result = {
+        createObjectStore: (store) => { stores[store] = {}; },
+        close() {},
+        transaction(store) {
+          if (!stores[store]) throw new Error(`no object store ${store}`);
+          const transaction = {};
+          const request = (act) => { const made = {}; setTimeout(() => { made.result = act(); }, 0); return made; };
+          transaction.objectStore = () => ({
+            get: (key) => request(() => (key in stores[store] ? JSON.parse(JSON.stringify(stores[store][key])) : undefined)),
+            put: (value, key) => request(() => { stores[store][key] = JSON.parse(JSON.stringify(value)); return key; }),
+            delete: (key) => request(() => { delete stores[store][key]; })
+          });
+          setTimeout(() => setTimeout(() => transaction.oncomplete && transaction.oncomplete(), 0), 0);
+          return transaction;
+        }
+      };
+      if (isNew && opening.onupgradeneeded) opening.onupgradeneeded();
+      if (opening.onsuccess) opening.onsuccess();
+    }, 0);
+    return opening;
+  }
+});
+const fakePrivate = {};
+context.indexedDB = fakeIndexedDB(fakePrivate);
 context.chrome = {
-  runtime: { onMessage: { addListener: (fn) => workerListeners.push(fn) } },
-  storage: { local: {
-    get: (keys, cb) => {
-      const out = {};
-      const wanted = keys === null ? Object.keys(fakeStorage) : [].concat(keys);
-      wanted.forEach(k => { if (k in fakeStorage) out[k] = fakeStorage[k]; });
-      if (cb) cb(out);
-    },
-    set: (obj, cb) => { Object.assign(fakeStorage, obj); if (cb) cb(); },
-    remove: (keys, cb) => { [].concat(keys).forEach(k => delete fakeStorage[k]); if (cb) cb(); },
-    clear: (cb) => { Object.keys(fakeStorage).forEach(k => delete fakeStorage[k]); if (cb) cb(); }
-  } }
+  runtime: {
+    id: 'lean-lens-test',
+    getURL: (file) => `chrome-extension://lean-lens-test/${file}`,
+    onMessage: { addListener: (fn) => workerListeners.push(fn) }
+  },
+  storage: { local: Object.assign(fakeArea(fakeStorage), {
+    setAccessLevel: (options) => { storageAccessLevels.push(options.accessLevel); return Promise.resolve(); }
+  }) }
 };
 loadScript('background/service_worker.js');
+/**
+ * Another worker, started on what a browser has kept: `local` (`chrome.storage.local`), `idb`
+ * (the extension's IndexedDB; null where the browser has none for it) and `session`
+ * (`chrome.storage.session`; null where there is none). `setAccessLevel` is there only when
+ * asked for: Firefox has none. `installed` says the worker starts because the extension was
+ * installed ('install') or updated ('update'). Resolves messages sent as the options page, or as `sender`.
+ */
+function startWorker({ local = {}, idb = {}, trouble = {}, session = {}, setAccessLevel = false, fetch = null, clock = { ahead: 0 }, installed = null } = {}) {
+  const listeners = [];
+  const installs = [];
+  class WorkerDate extends Date { static now() { return Date.now() + clock.ahead; } } // `clock.ahead`: milliseconds the worker's clock is ahead
+  // (The worker's seconds pass as hundredths here, so that its time limits can be waited for.)
+  const worker = { console, setTimeout: (fn, ms) => setTimeout(fn, ms >= 1000 ? ms / 100 : ms), clearTimeout, Date: WorkerDate, URL, AbortController, addEventListener: () => {} };
+  worker.self = worker;
+  if (idb) worker.indexedDB = fakeIndexedDB(idb, trouble);
+  if (fetch) worker.fetch = fetch;
+  worker.chrome = {
+    runtime: { id: 'lean-lens-test', getURL: (file) => `chrome-extension://lean-lens-test/${file}`, onMessage: { addListener: (fn) => listeners.push(fn) }, onInstalled: { addListener: (fn) => installs.push(fn) } },
+    storage: Object.assign({ local: Object.assign(fakeArea(local), setAccessLevel ? { setAccessLevel: () => Promise.resolve() } : {}) },
+      session ? { session: fakeArea(session) } : {})
+  };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'background/service_worker.js'), 'utf8'), worker);
+  if (installed) installs.forEach((fn) => fn({ reason: installed })); // `installed`: 'install' or 'update', when the worker starts for that
+  return (message, sender = EXTENSION_PAGE) => new Promise((resolve) => listeners[0](message, sender, resolve));
+}
 const selectLoogleHit = context.selectLoogleHit;
 assert(typeof selectLoogleHit === "function", "selectLoogleHit should be defined by service_worker.js");
 
@@ -842,7 +914,6 @@ const sampleRequests = {
   TEST_HELPER: { url: 'http://127.0.0.1:9', token: 'x' },
   EXACT_HOVER: { fileRef: null },
   HELPER_RUN: { owner: 'o', repo: 'r', paths: ['A.lean'] },
-  HELPER_ALLOW: { repo: 'o/r' },
   FILE_VARIABLE: { name: 'hT', fileRef: null },
   FILE_INSTANCES: { fileRef: null },
   NOTATION_DOC: { name: '«term_+_»' },
@@ -860,7 +931,7 @@ const handlerRuns = handled.map(action => new Promise((resolve, reject) => {
   const timer = setTimeout(() => reject(new Error(`${action}: no response`)), 10000);
   let keptOpen;
   try {
-    keptOpen = workerListeners[0](Object.assign({ action }, sampleRequests[action] || {}), {}, (res) => { clearTimeout(timer); resolve(res); });
+    keptOpen = workerListeners[0](Object.assign({ action }, sampleRequests[action] || {}), EXTENSION_PAGE, (res) => { clearTimeout(timer); resolve(res); });
   } catch (err) {
     clearTimeout(timer);
     reject(new Error(`${action} threw: ${err.message}`));
@@ -873,6 +944,16 @@ asyncChecks.push(Promise.all(handlerRuns).then(() => {
   assert.deepStrictEqual(handlerFailures, [], `message handlers failed:\n${handlerFailures.join('\n')}`);
 }, (err) => { console.warn = realWarn; throw err; }));
 assert.strictEqual(workerListeners[0]({ action: 'NO_SUCH_ACTION' }, {}, () => {}), false, "unknown actions are ignored");
+assert.deepStrictEqual(storageAccessLevels, ['TRUSTED_CONTEXTS'], 'content scripts cannot read the stored settings themselves');
+// What a GitHub page may not do: change the settings, clear the cache, have the worker reach an
+// address it names, or read the helper's token.
+for (const action of ['SET_SETTINGS', 'CLEAR_CACHE', 'TEST_HELPER']) {
+  for (const sender of [GITHUB_TAB, {}, { id: 'other-extension', url: 'chrome-extension://other-extension/x.html' }]) {
+    let answer = null;
+    const kept = workerListeners[0](Object.assign({ action }, sampleRequests[action]), sender, (res) => { answer = res; });
+    assert(kept === false && answer && answer.success === false && /extension's own pages/.test(answer.error), `${action} is refused from ${sender.url || 'an unknown sender'}`);
+  }
+}
 
 // 18. Hovering a gap shows the term there with its type, as Lean's infoview does (`a b : Y`).
 //     Expected outputs were checked against Lean's own hovers (lean-lsp) on the same code.
@@ -2320,8 +2401,9 @@ console.log("22. Testing real Lean data (the local helper)...");
     }
 
     // --- The worker: asks the helper, keeps a file's data once Lean has run.
-    const send = (message) => new Promise((resolve) => workerListeners[0](message, {}, resolve));
+    const send = (message, sender = EXTENSION_PAGE) => new Promise((resolve) => workerListeners[0](message, sender, resolve));
     const calls = [];
+    const redirectable = []; // requests to the helper that would follow a redirect
     let fileAnswer = { state: 'missing' };
     context.URL = URL;
     context.AbortController = AbortController;
@@ -2330,6 +2412,7 @@ console.log("22. Testing real Lean data (the local helper)...");
       if (u.host !== '127.0.0.1:5326') return { ok: false, status: 404, json: async () => null, text: async () => '' };
       const body = init.body ? JSON.parse(init.body) : null;
       calls.push({ path: u.pathname, body });
+      if (init.redirect !== 'error') redirectable.push(u.pathname);
       if ((init.headers || {})['X-Lean-Lens-Token'] !== 'tok') return { ok: false, status: 401, json: async () => ({ error: 'no' }) };
       const answers = {
         '/file': body && body.path === 'Old.lean' ? { state: 'ready', data: { version: 1 } } : fileAnswer,
@@ -2368,6 +2451,218 @@ console.log("22. Testing real Lean data (the local helper)...");
       assert.strictEqual(res.state, 'error', 'data in another format is not used');
       assert.strictEqual((await send({ action: 'TEST_HELPER', url: 'http://127.0.0.1:5326', token: 'tok' })).success, true);
       assert.strictEqual((await send({ action: 'TEST_HELPER', url: 'http://127.0.0.1:5326', token: 'bad' })).state, 'unauthorized');
+      // The token goes only to a helper on this machine, and only the extension's pages see it.
+      for (const url of ['https://evil.example:5326', 'http://127.0.0.1.evil.example:5326', 'http://192.168.1.2:5326', 'file:///x']) {
+        assert.strictEqual((await send({ action: 'TEST_HELPER', url, token: 'tok' })).state, 'not_local', url);
+      }
+      assert.strictEqual((await send({ action: 'GET_SETTINGS' })).settings.helperToken, 'tok', 'the options page sees the token');
+      const inPage = (await send({ action: 'GET_SETTINGS' }, GITHUB_TAB)).settings;
+      assert(inPage.enableHelper && !('helperToken' in inPage), 'a GitHub page gets the settings without the token');
+      // Nor is the token where a page's script could read it itself (`chrome.storage.local`),
+      // or anything else that decides where the token goes: those are in the extension's own
+      // IndexedDB, and the other settings stay where they were.
+      await settingsWith({ theme: 'dark' });
+      assert.deepStrictEqual(fakeStorage.lean_lens_settings, { theme: 'dark' });
+      assert.deepStrictEqual(fakePrivate.lean_lens_private.values.helper_settings, { enableHelper: true, helperUrl: 'http://127.0.0.1:5326', helperToken: 'tok' });
+      assert(!JSON.stringify(fakeStorage).includes('tok'), 'the token is nowhere in chrome.storage.local');
+      // A redirect from the helper's address is an error, not somewhere else to send the token:
+      // the request fails as the browser makes it fail.
+      const fetchBefore = context.fetch;
+      context.fetch = async (url, init) => { if (init.redirect === 'error') throw new TypeError('Failed to fetch'); return fetchBefore('http://127.0.0.1:5326/status', init); };
+      assert.strictEqual((await send({ action: 'TEST_HELPER', url: 'http://127.0.0.1:5326', token: 'tok' })).state, 'offline');
+      context.fetch = fetchBefore;
+      assert(calls.length > 5);
+      assert.deepStrictEqual(redirectable, [], 'no request that carries the token follows a redirect');
+
+      // --- A browser that had the token in `chrome.storage.local` (saved by an earlier version)
+      // and cannot close that to content scripts (Firefox has no `setAccessLevel`): when the
+      // extension is updated, the token is moved out of there, and still used.
+      {
+        const HELPER = { enableHelper: true, helperUrl: 'http://127.0.0.1:5326', helperToken: 'tok' };
+        const earlier = () => ({ lean_lens_settings: Object.assign({ theme: 'dark' }, HELPER), cache_x: { kept: true } });
+        const recordIn = (idb) => idb.lean_lens_private && idb.lean_lens_private.values.helper_settings;
+        const settingsOf = async (worker, sender) => (await worker({ action: 'GET_SETTINGS' }, sender)).settings;
+        const local = earlier();
+        const idb = {};
+        const asked = [];
+        const helperFetch = async (url, init) => { asked.push(init.headers['X-Lean-Lens-Token']); return fetchBefore(url, init); };
+        let worker = startWorker({ local, idb, fetch: helperFetch, installed: 'update' });
+        const [first, second] = await Promise.all([worker({ action: 'GET_SETTINGS' }), worker({ action: 'GET_SETTINGS' }, GITHUB_TAB)]);
+        assert.deepStrictEqual([first.settings.helperToken, first.helperKept], ['tok', 'saved'], 'the options page still shows the token');
+        assert(second.settings.enableHelper && second.settings.theme === 'dark' && !('helperToken' in second.settings) && !('helperKept' in second));
+        assert.deepStrictEqual(local, { lean_lens_settings: { theme: 'dark' }, cache_x: { kept: true } }, 'the old copy is gone, the rest is as it was');
+        assert.deepStrictEqual(recordIn(idb), HELPER);
+        // The worker stops and starts again (an event page does): the token is read from there.
+        worker = startWorker({ local, idb, fetch: helperFetch });
+        assert.strictEqual((await worker({ action: 'HELPER_RUN', owner: 'o', repo: 'r', sha: 'a'.repeat(40), paths: ['Sample.lean'] })).state, 'pending');
+        assert.deepStrictEqual(asked, ['tok'], 'and goes to the helper as before');
+        // What a page's script writes there afterwards is not taken for the helper's settings,
+        // now or at the next update.
+        const planted = { enableHelper: true, helperUrl: 'http://127.0.0.1:9999', helperToken: 'theirs' };
+        for (const installed of [undefined, 'update']) {
+          local.lean_lens_settings = Object.assign({ theme: 'light' }, planted);
+          const after = await settingsOf(startWorker({ local, idb, installed }));
+          assert.deepStrictEqual([after.theme, after.helperUrl, after.helperToken], ['light', 'http://127.0.0.1:5326', 'tok']);
+          assert.deepStrictEqual(local.lean_lens_settings, { theme: 'light' });
+        }
+        // Saved under the extension's former name: moved the same way.
+        const former = { verso_settings: earlier().lean_lens_settings };
+        const formerIdb = {};
+        assert.strictEqual((await settingsOf(startWorker({ local: former, idb: formerIdb, installed: 'update' }))).helperToken, 'tok');
+        assert.deepStrictEqual(former, { lean_lens_settings: { theme: 'dark' } });
+        assert.strictEqual(recordIn(formerIdb).helperToken, 'tok');
+
+        // Only an update moves anything. A new installation gives the private store an empty
+        // record, and what a page's script then plants is not used, by that worker, by a later
+        // one, or at an update. Nor is it when the store is found empty with no update under
+        // way (its data were cleared, say).
+        const fresh = {};
+        const freshIdb = {};
+        worker = startWorker({ local: fresh, idb: freshIdb, installed: 'install' });
+        await tick(20);
+        assert.deepStrictEqual(recordIn(freshIdb), {}, 'the private store has its record from installation');
+        for (const reader of [worker, startWorker({ local: fresh, idb: freshIdb }), startWorker({ local: fresh, idb: freshIdb, installed: 'update' })]) {
+          fresh.lean_lens_settings = Object.assign({ theme: 'light' }, planted);
+          const got = await settingsOf(reader);
+          assert.deepStrictEqual([got.theme, got.enableHelper, got.helperUrl, got.helperToken], ['light', false, 'http://127.0.0.1:5326', ''], 'planted settings are not adopted');
+          assert.deepStrictEqual(recordIn(freshIdb), {});
+        }
+        const cleared = { lean_lens_settings: Object.assign({ theme: 'light' }, planted) };
+        const clearedIdb = {};
+        worker = startWorker({ local: cleared, idb: clearedIdb });
+        assert.deepStrictEqual([(await settingsOf(worker)).helperToken, (await settingsOf(worker)).enableHelper], ['', false], 'nor with the private store empty');
+        assert.strictEqual(recordIn(clearedIdb), undefined);
+
+        // An update during which the private store fails: the settings are taken out of
+        // `chrome.storage.local` at once, kept where no page's script reads them (session
+        // storage, else the worker's memory), and moved from there once the store works. What
+        // a page's script plants meanwhile is not taken, nor is it by a second update.
+        {
+          const late = earlier();
+          const lateIdb = {};
+          const flaky = { failing: true };
+          const clock = { ahead: 0 };
+          const session = {};
+          worker = startWorker({ local: late, idb: lateIdb, trouble: flaky, clock, session, installed: 'update' });
+          const shown = await worker({ action: 'GET_SETTINGS' });
+          assert.deepStrictEqual([shown.settings.helperToken, shown.helperKept], ['', 'unread']);
+          assert.deepStrictEqual(late, { lean_lens_settings: { theme: 'dark' }, cache_x: { kept: true } }, 'the token is out of chrome.storage.local at once');
+          assert.strictEqual((await worker({ action: 'SET_SETTINGS', settings: { theme: 'light' } })).helperKept, undefined);
+          assert.deepStrictEqual(late.lean_lens_settings, { theme: 'light' });
+          late.lean_lens_settings = Object.assign({ theme: 'light' }, planted);
+          worker = startWorker({ local: late, idb: lateIdb, trouble: flaky, clock, session, installed: 'update' });
+          assert.strictEqual((await settingsOf(worker)).helperToken, '');
+          assert.deepStrictEqual(late.lean_lens_settings, { theme: 'light' }, 'and what is planted there goes too');
+          flaky.failing = false;
+          clock.ahead = 60 * 1000;
+          worker = startWorker({ local: late, idb: lateIdb, trouble: flaky, clock, session }); // (also after the worker restarted)
+          assert.strictEqual((await settingsOf(worker)).helperToken, 'tok', 'the settings taken at the update are moved');
+          assert.deepStrictEqual(late.lean_lens_settings, { theme: 'light' });
+          assert.deepStrictEqual(recordIn(lateIdb), HELPER);
+          assert.deepStrictEqual(session, {});
+          // Without session storage they are held in the worker's memory: moved by that worker
+          // once the store works, and lost if it stops first (the token is then pasted again).
+          for (const stops of [false, true]) {
+            const bareLocal = earlier();
+            const bareIdb = {};
+            const down = { failing: true };
+            const later = { ahead: 0 };
+            worker = startWorker({ local: bareLocal, idb: bareIdb, trouble: down, clock: later, session: null, installed: 'update' });
+            assert.strictEqual((await settingsOf(worker)).helperToken, '');
+            assert.deepStrictEqual(bareLocal.lean_lens_settings, { theme: 'dark' }, 'out of chrome.storage.local at once here too');
+            down.failing = false;
+            later.ahead = 60 * 1000;
+            if (stops) worker = startWorker({ local: bareLocal, idb: bareIdb, trouble: down, clock: later, session: null });
+            assert.strictEqual((await settingsOf(worker)).helperToken, stops ? '' : 'tok');
+            assert.deepStrictEqual(recordIn(bareIdb), stops ? undefined : HELPER);
+          }
+        }
+
+        // A private store that never answers is given up on after a few seconds, like one that
+        // fails: the settings are still read, and saved for the session.
+        const stuck = { silent: true };
+        const stuckLocal = { lean_lens_settings: { theme: 'dark' } };
+        worker = startWorker({ local: stuckLocal, idb: {}, trouble: stuck, session: {} });
+        const answered = await Promise.race([worker({ action: 'GET_SETTINGS' }), tick(2000).then(() => null)]);
+        assert(answered && answered.settings.theme === 'dark' && answered.settings.helperToken === '' && answered.helperKept === 'unread', 'the settings are read although the private store is silent');
+        assert.strictEqual((await worker({ action: 'SET_SETTINGS', settings: { theme: 'dark', helperToken: 'new' } })).helperKept, 'session');
+
+        // A private store that fails for a while, with the helper's settings in it. The options
+        // page, opened then, is told they could not be read, and so sends none when it saves
+        // the others: the record stays, whichever worker gets that save, and is read again once
+        // the store works.
+        {
+          const flakyIdb = { lean_lens_private: { values: { helper_settings: Object.assign({}, HELPER) } } };
+          const flakyLocal = { lean_lens_settings: { theme: 'dark' } };
+          const flaky = { failing: true };
+          const clock = { ahead: 0 };
+          worker = startWorker({ local: flakyLocal, idb: flakyIdb, trouble: flaky, clock });
+          const blank = await worker({ action: 'GET_SETTINGS' });
+          assert.deepStrictEqual([blank.settings.enableHelper, blank.settings.helperToken, blank.helperKept], [false, '', 'unread']);
+          flaky.failing = false;
+          assert.strictEqual((await settingsOf(worker)).helperToken, '', 'not tried again at once');
+          // (The page's save reaches a worker started since, which never saw the failure.)
+          const next = startWorker({ local: flakyLocal, idb: flakyIdb, trouble: flaky, clock });
+          assert.strictEqual((await settingsOf(next)).helperToken, 'tok');
+          assert.strictEqual((await next({ action: 'SET_SETTINGS', settings: { theme: 'light', hoverDelay: 300 } })).helperKept, undefined);
+          assert.deepStrictEqual(recordIn(flakyIdb), HELPER, 'the record is not replaced by the blanks that were shown');
+          clock.ahead = 60 * 1000;
+          const again = await settingsOf(worker);
+          assert.deepStrictEqual([again.theme, again.enableHelper, again.helperToken], ['light', true, 'tok']);
+        }
+
+        // A save the private store does not take, after it was read: what was saved is what is
+        // read from then on (the helper switched off stays off), by this worker and the next,
+        // and it reaches the store when the store works again.
+        {
+          const downIdb = { lean_lens_private: { values: { helper_settings: Object.assign({}, HELPER) } } };
+          const down = {};
+          const clock = { ahead: 0 };
+          const session = {};
+          const changed = { enableHelper: false, helperUrl: 'http://127.0.0.1:5326', helperToken: 'new' };
+          worker = startWorker({ local: {}, idb: downIdb, trouble: down, clock, session, fetch: helperFetch });
+          assert.strictEqual((await settingsOf(worker)).helperToken, 'tok');
+          down.failing = true;
+          assert.strictEqual((await worker({ action: 'SET_SETTINGS', settings: Object.assign({ theme: 'dark' }, changed) })).helperKept, 'session');
+          for (const reader of [worker, startWorker({ local: {}, idb: downIdb, trouble: down, clock, session })]) {
+            const got = await reader({ action: 'GET_SETTINGS' });
+            assert.deepStrictEqual([got.settings.enableHelper, got.settings.helperToken, got.helperKept], [false, 'new', 'session'], 'the save is not undone by the older record');
+          }
+          assert.deepStrictEqual(recordIn(downIdb), HELPER);
+          down.failing = false;
+          clock.ahead = 60 * 1000;
+          const got = await worker({ action: 'GET_SETTINGS' });
+          assert.deepStrictEqual([got.settings.helperToken, got.helperKept], ['new', 'saved']);
+          assert.deepStrictEqual(recordIn(downIdb), changed);
+          assert.deepStrictEqual(session, {});
+        }
+
+        // No IndexedDB for the extension. What `chrome.storage.local` has for the helper is not
+        // used, and is removed at once: after an update it is kept for the session in case the
+        // store comes back, until the helper's settings are saved anew or the browser restarts.
+        // What is saved is kept for the session, where content scripts cannot read, and the
+        // page is told.
+        const bare = earlier();
+        const session = {};
+        worker = startWorker({ local: bare, idb: null, session, installed: 'update' });
+        assert.strictEqual((await settingsOf(worker)).helperToken, '');
+        assert.strictEqual((await worker({ action: 'SET_SETTINGS', settings: Object.assign({ theme: 'dark' }, HELPER, { helperToken: 'new' }) })).helperKept, 'session');
+        assert.strictEqual((await settingsOf(startWorker({ local: bare, idb: null, session }))).helperToken, 'new');
+        assert.deepStrictEqual(bare.lean_lens_settings, { theme: 'dark' });
+        assert(!JSON.stringify(bare).includes('new'));
+        const restarted = earlier();
+        assert.strictEqual((await settingsOf(startWorker({ local: restarted, idb: null, session: {} }))).helperToken, '');
+        assert.deepStrictEqual(restarted.lean_lens_settings, { theme: 'dark' });
+        // Not even session storage: what is saved lasts as long as the worker does.
+        const none = earlier();
+        worker = startWorker({ local: none, idb: null, session: null });
+        assert.strictEqual((await settingsOf(worker)).helperToken, '');
+        assert.deepStrictEqual(none.lean_lens_settings, { theme: 'dark' });
+        assert.strictEqual((await worker({ action: 'SET_SETTINGS', settings: { helperToken: 'new' } })).helperKept, 'memory');
+        assert.strictEqual((await settingsOf(worker)).helperToken, 'new');
+        assert.strictEqual((await settingsOf(startWorker({ local: none, idb: null, session: null }))).helperToken, '');
+        assert.strictEqual((await startWorker({ local: {}, idb: {} })({ action: 'SET_SETTINGS', settings: { helperToken: 'kept' } })).helperKept, 'saved');
+      }
       // Switched off: the helper is not contacted.
       await settingsWith({ enableHelper: false });
       const quiet = calls.length;

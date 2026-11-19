@@ -23,6 +23,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const statLoogle = document.getElementById('stat-loogle');
 
   let currentSettings = {};
+  // The helper's settings are kept apart, and now and then cannot be read: the fields then show
+  // none, and what they show is not sent back as the settings unless it was changed here.
+  const HELPER_SETTINGS = ['enableHelper', 'helperUrl', 'helperToken'];
+  let helperUnread = false;
 
   // Load existing settings and stats
   chrome.runtime.sendMessage({ action: "GET_SETTINGS" }, (res) => {
@@ -38,6 +42,10 @@ document.addEventListener('DOMContentLoaded', () => {
       enableHelper.checked = Boolean(currentSettings.enableHelper);
       helperUrl.value = currentSettings.helperUrl || 'http://127.0.0.1:5326';
       helperToken.value = currentSettings.helperToken || '';
+      helperUnread = res.helperKept === 'unread';
+      if (helperUnread) {
+        helperTestResult.textContent = 'The helper\'s saved address and token could not be read just now. Open this page again in a moment to see them; what you enter here replaces them.';
+      }
     }
 
     if (res && res.stats) {
@@ -61,10 +69,20 @@ document.addEventListener('DOMContentLoaded', () => {
       helperUrl: helperUrl.value.trim(),
       helperToken: helperToken.value.trim()
     };
+    const toSave = { ...currentSettings };
+    if (helperUnread) for (const key of HELPER_SETTINGS) delete toSave[key];
 
-    chrome.runtime.sendMessage({ action: "SET_SETTINGS", settings: currentSettings }, () => {
+    chrome.runtime.sendMessage({ action: "SET_SETTINGS", settings: toSave }, (res) => {
       saveStatus.classList.add('visible');
       setTimeout(() => saveStatus.classList.remove('visible'), 1500);
+      // The helper's address and token are kept where no web page can reach them. Where the
+      // browser gives the extension no such place that lasts, they are not saved for good.
+      if (res && res.helperKept && res.helperKept !== 'saved' && currentSettings.enableHelper) {
+        helperTestResult.textContent = 'This browser gives the extension no private storage that lasts, so the helper\'s address and token are kept only '
+          + (res.helperKept === 'session' ? 'until the browser closes' : 'for a short while (until the browser stops the extension\'s background, as it does when it is not in use)')
+          + ': paste them again after that.';
+        helperTestResult.style.color = '';
+      }
 
       // Notify all tabs
       chrome.tabs.query({}, (tabs) => {
@@ -88,12 +106,16 @@ document.addEventListener('DOMContentLoaded', () => {
   enableBuiltins.addEventListener('change', saveSettings);
   showOutline.addEventListener('change', saveSettings);
   enableLoogle.addEventListener('change', saveSettings);
+  // (Changed here, the helper's settings are this page's to save, whatever it was shown.)
+  const helperChanged = () => { helperUnread = false; };
+  enableHelper.addEventListener('change', helperChanged);
   enableHelper.addEventListener('change', saveSettings);
   // Save while typing or pasting too: `change` waits for the field to lose focus, which never
   // happens when the page is closed right after pasting (Firefox's options sit in about:addons).
   let typingTimer = null;
   const saveSoon = () => { clearTimeout(typingTimer); typingTimer = setTimeout(saveSettings, 300); };
   for (const field of [helperUrl, helperToken]) {
+    field.addEventListener('input', helperChanged);
     field.addEventListener('input', saveSoon);
     field.addEventListener('change', saveSettings);
   }
@@ -119,6 +141,9 @@ document.addEventListener('DOMContentLoaded', () => {
           helperTestResult.style.color = '#3fb950';
         } else if (res && res.state === 'unauthorized') {
           helperTestResult.textContent = '✗ The helper is running but rejected this token.';
+          helperTestResult.style.color = '#f85149';
+        } else if (res && res.state === 'not_local') {
+          helperTestResult.textContent = '✗ The helper runs on this machine: its address starts with http://127.0.0.1 or http://localhost.';
           helperTestResult.style.color = '#f85149';
         } else {
           helperTestResult.textContent = '✗ Could not reach the helper. Start it with: node helper/lean-lens-helper.mjs';
