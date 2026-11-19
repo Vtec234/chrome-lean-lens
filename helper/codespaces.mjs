@@ -205,13 +205,14 @@ function explain(result) {
  *   `run`: the helper's command runner; `log`; `gh`: the program to call;
  *   `sandbox`: false when the reader accepted running without one (`--no-sandbox`);
  *   `keep`: leave codespaces running when they are idle and when the helper stops.
- * @returns `{check, runJob, rest, shutdown, ours, stop, remove}`
+ * @returns `{check, runJob, request, notify, touch, rest, shutdown, ours, stop, remove}`
  */
 export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = true, keep = false, remotePort = REMOTE_PORT, cloneBase = null, pollMs = 1500, keepAliveMs = KEEP_ALIVE_MS, retryMs = 10 * 1000, machine = MACHINE, helperDir = here }) {
   if (!/^[A-Za-z0-9]+$/.test(machine)) throw new Error(`Not a codespace machine name: ${machine}`);
   if (!config.codespaces || typeof config.codespaces !== 'object') config.codespaces = {};
   const sessions = new Map(); // repo → {name, token, port, tunnel, sandbox}
   const connecting = new Map(); // repo → promise of its session
+  let stopping = false;
 
   async function must(args, options) {
     const result = await run(gh, args, options);
@@ -265,7 +266,7 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
   /** Set up and start the helper in a codespace (starting the codespace if it was stopped). */
   async function boot(name, repo, token, say) {
     const script = bootstrapScript({
-      files: Object.fromEntries(['lean-lens-helper.mjs', 'convert.mjs'].map((file) => [file, readFileSync(path.join(helperDir, file), 'utf8')])),
+      files: Object.fromEntries(['lean-lens-helper.mjs', 'convert.mjs', 'live.mjs'].map((file) => [file, readFileSync(path.join(helperDir, file), 'utf8')])),
       token, repo, port: remotePort, sandbox, cloneBase,
     });
     const result = await run(gh, ['codespace', 'ssh', '-c', name, '--', BOOT_COMMAND], {
@@ -362,6 +363,8 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
 
   /** The connection to a repository's codespace, made if there is none (or it went away). */
   function ensure(repo, say) {
+    // (Not once the helper is stopping: that would start a codespace it has just stopped.)
+    if (stopping) return Promise.reject(new Error('The helper is stopping'));
     const live = sessions.get(repo);
     if (live && live.tunnel.exitCode === null && live.tunnel.signalCode === null) return Promise.resolve(live);
     drop(repo);
@@ -376,29 +379,52 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
   }
 
   /**
+   * A request to the helper in a repository's codespace, which is connected to first if it is
+   * not. When a request fails, the connection went (this machine slept, its network changed) or
+   * the codespace stopped. It is made again, a few times over: a network takes a moment to come
+   * back. The helper there is left running if it still is, and what it has under way with it.
+   */
+  async function request(repo, say, method, pathname, body, timeoutMs) {
+    let session = await ensure(repo, say);
+    let failure = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        return await call(session, method, pathname, body, timeoutMs);
+      } catch (error) {
+        failure = error;
+      }
+      if (stopping) break;
+      drop(repo);
+      if (attempt) await sleep(retryMs * attempt);
+      try { session = await ensure(repo, say); } catch (error) { failure = error; }
+    }
+    throw failure;
+  }
+
+  /**
+   * Something said to the helper in a repository's codespace that need not arrive: sent if the
+   * codespace is connected, and not at all if it is not (no codespace is started for it).
+   */
+  async function notify(repo, pathname, body) {
+    const session = sessions.get(repo);
+    if (!session || stopping) return;
+    try { await call(session, 'POST', pathname, body, 10000); } catch { /* it need not arrive */ }
+  }
+
+  /** A sign of use for a repository's codespace, so GitHub does not stop it (see KEEP_ALIVE_MS). */
+  function touch(repo) {
+    const session = sessions.get(repo);
+    if (session) run(gh, ['codespace', 'ssh', '-c', session.name, '--', 'true'], { timeoutMs: 60 * 1000 });
+  }
+
+  /**
    * Run a job in the repository's codespace: what the helper does itself when Lean is here.
    * `store(file, data)` and `fail(file, error)` take each file's outcome.
    */
   async function runJob(job, { store, fail }) {
     const say = (message) => job.say(message);
-    let session = await ensure(job.repo, say);
-    // When a request fails, the connection went (this machine slept, its network changed) or the
-    // codespace stopped. It is made again, a few times over: a network takes a moment to come
-    // back. The helper there is left running if it still is, and the run with it.
-    const send = async (method, pathname, body) => {
-      let failure = null;
-      for (let attempt = 0; attempt < 4; attempt++) {
-        try {
-          return await call(session, method, pathname, body);
-        } catch (error) {
-          failure = error;
-        }
-        drop(job.repo);
-        if (attempt) await sleep(retryMs * attempt);
-        try { session = await ensure(job.repo, say); } catch (error) { failure = error; }
-      }
-      throw failure;
-    };
+    const send = (method, pathname, body) => request(job.repo, say, method, pathname, body);
+    await ensure(job.repo, say);
     const order = { repo: job.repo, sha: job.sha, pr: job.pr, paths: job.paths };
     let answer = await send('POST', '/run', order);
     if (answer.status === 403) {
@@ -413,7 +439,7 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
       if (Date.now() - touched >= keepAliveMs) {
         // (See KEEP_ALIVE_MS: without this GitHub would stop the codespace under a long run.)
         touched = Date.now();
-        run(gh, ['codespace', 'ssh', '-c', session.name, '--', 'true'], { timeoutMs: 60 * 1000 });
+        touch(job.repo);
       }
       if (status.message && status.message !== last && status.phase !== 'queued') { last = status.message; say(status.message); }
       job.phase = status.phase === 'queued' ? 'preparing' : (status.phase || job.phase);
@@ -445,6 +471,7 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
 
   /** When the helper stops: close the connections, and stop the codespaces it was using. */
   function shutdown() {
+    stopping = true;
     for (const [repo, session] of [...sessions]) {
       drop(repo);
       if (keep) continue;
@@ -463,5 +490,5 @@ export function createCodespaces({ config, save, run, log, gh = 'gh', sandbox = 
     save();
   }
 
-  return { check, runJob, rest, shutdown, ours, stop, remove, run };
+  return { check, runJob, request, notify, touch, rest, shutdown, ours, stop, remove, run };
 }

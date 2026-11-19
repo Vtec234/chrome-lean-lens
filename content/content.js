@@ -10,7 +10,8 @@
     hoverDelay: 250,
     enablePRScanner: true,
     enableBuiltins: true,
-    showOutline: true
+    showOutline: true,
+    showInfoview: true
   };
 
   /** Show or hide the outline button for the Lean files on this page. */
@@ -22,6 +23,16 @@
       return;
     }
     panel.refresh();
+  }
+
+  /**
+   * Show or hide the infoview's tab: there when the local helper is in use (Lean's infoview
+   * needs Lean running) and the page has Lean files.
+   */
+  function refreshInfoview() {
+    const panel = window.LeanInfoviewPanel;
+    if (!panel) return;
+    panel.refresh(Boolean(settings.enabled && settings.enableHelper && settings.showInfoview !== false));
   }
 
   let hoverTimer = null;
@@ -43,6 +54,7 @@
         if (res && res.settings) {
           settings = Object.assign(settings, res.settings);
           refreshOutline();
+          refreshInfoview();
         }
       });
     } catch (err) {
@@ -60,6 +72,7 @@
       window.LeanPRScanner.scanPage();
       indexProjectFiles();
       refreshOutline();
+      refreshInfoview();
     }, 350);
   }
 
@@ -90,10 +103,12 @@
    */
   function initPRScanner() {
     refreshOutline();
+    refreshInfoview();
     if (!settings.enablePRScanner) return;
     window.LeanPRScanner.scanPage();
     indexProjectFiles();
     refreshOutline();
+    refreshInfoview();
 
     // Re-scan when GitHub mounts new virtualized diff chunks
     const observer = new MutationObserver((mutations) => {
@@ -1278,6 +1293,7 @@
     const handleNavigation = () => {
       window.VersoTooltipView.hide(true);
       setTimeout(refreshOutline, 500);
+      setTimeout(refreshInfoview, 500);
       setTimeout(() => {
         initPRScanner();
       }, 500);

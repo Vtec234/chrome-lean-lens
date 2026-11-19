@@ -25,6 +25,8 @@ const DEFAULT_SETTINGS = {
   helperToken: "",
   // The outline button beside a Lean file (declarations, `open`, `variable`, placement hints).
   showOutline: true,
+  // Lean's infoview in a panel beside the code, when the helper is in use.
+  showInfoview: true,
   theme: "auto"
 };
 
@@ -1482,6 +1484,27 @@ async function helperRun(request) {
   return Object.assign({ repo, sha }, res);
 }
 
+// Keys for the infoview's panels (see INFOVIEW_KEY), by the frame's name. Kept for the browser
+// session where the browser can, so that a worker restarted between the two askers gives both
+// the same key.
+const infoviewKeys = new Map();
+async function infoviewKey(id) {
+  if (typeof id !== 'string' || !/^[0-9a-f]{16,64}$/.test(id)) return { key: null };
+  const name = `infoview_key_${id}`;
+  const session = chrome.storage && chrome.storage.session;
+  if (!infoviewKeys.has(id)) {
+    infoviewKeys.set(id, (async () => {
+      const kept = session ? await new Promise((resolve) => session.get([name], (res) => resolve(chrome.runtime.lastError ? null : res && res[name]))) : null;
+      if (typeof kept === 'string') return kept;
+      const key = Array.from(crypto.getRandomValues(new Uint8Array(24)), (b) => b.toString(16).padStart(2, '0')).join('');
+      if (session) await new Promise((resolve) => session.set({ [name]: key }, () => resolve(chrome.runtime.lastError)));
+      return key;
+    })());
+    if (infoviewKeys.size > 200) infoviewKeys.delete(infoviewKeys.keys().next().value);
+  }
+  return { key: await infoviewKeys.get(id) };
+}
+
 /**
  * Message Dispatcher
  */
@@ -1558,6 +1581,11 @@ const MESSAGE_HANDLERS = {
   EXACT_HOVER: (request) => exactHover(request),
   // Ask the helper to run Lean on files of a commit (only ever after a click in the page).
   HELPER_RUN: (request) => helperRun(request),
+  // The key by which the infoview's panel knows the content script of its page (and not the
+  // page's own scripts, which cannot send messages here): one for each frame, given to both.
+  INFOVIEW_KEY: (request) => infoviewKey(request.id),
+  // The commit a pull request's page shows, when the page itself does not say (for the infoview).
+  PAGE_COMMIT: async (request) => ({ sha: request.fileRef ? await commitOf(request.fileRef) : null }),
   // A file's outline (with the scope commands), the declarations a PR adds, and hints for those.
   FILE_OUTLINE: async (request) => {
     const file = await fileOutline(request.fileRef);
