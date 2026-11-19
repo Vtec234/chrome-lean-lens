@@ -2415,6 +2415,22 @@ console.log("22. Testing real Lean data (the local helper)...");
             assert(!fs.existsSync(path.join(here, 'repos')), 'no copy of the repository on this machine');
             const pid = therePid();
             assert(running(pid));
+            // The infoview's requests go to the helper in the codespace too, and what it says
+            // comes back: here, why Lean's server cannot open this file.
+            const liveAsk = async (pathname, body) => JSON.parse((await h7.handle('POST', pathname, Object.assign({ repo: 'o/r', sha: commit }, body))).body);
+            assert.strictEqual((await liveAsk('/live/open', { path: 'A.lean' })).state, 'not_allowed', 'a repository is allowed here first, as for a run');
+            h7.allow('o/r');
+            let relayed = await liveAsk('/live/open', { path: 'A.lean' });
+            assert.strictEqual(relayed.state, 'preparing');
+            const relayedId = relayed.session;
+            for (let i = 0; relayed.state === 'preparing'; i++) {
+              assert(i < 400, `the relayed session is still preparing: ${JSON.stringify(relayed)}`);
+              relayed = await liveAsk('/live/poll', { session: relayedId, rev: relayed.rev, wait: 200 });
+            }
+            assert.strictEqual(relayed.session, relayedId, 'under the name this helper gave it');
+            assert.strictEqual(relayed.state, 'error');
+            assert(/not inside a Lake project/.test(relayed.error), relayed.error);
+            assert.strictEqual((await liveAsk('/live/send', { session: relayedId, messages: [] })).state, 'closed');
             // Stopping the helper stops the codespace.
             h7.shutdown();
             assert.strictEqual(fakeState().codespaces[0].state, 'Shutdown');
@@ -3272,6 +3288,13 @@ asyncChecks.push(import('../scripts/build-firefox.mjs').then(({ firefoxManifest 
   const ff = firefoxManifest(chromeManifest);
   assert(!ff.background.service_worker && ff.browser_specific_settings.gecko.id, 'Firefox manifest uses an event page and has an id');
   assert.strictEqual(chromeManifest.background.service_worker, 'background/service_worker.js', 'the Chrome manifest is left as it is');
+  // The infoview: Chrome's sandboxed frame is no page of Firefox's, where only the panel's page is open to GitHub.
+  assert(chromeManifest.sandbox.pages.includes('infoview/frame.html') && /blob:/.test(chromeManifest.content_security_policy.sandbox));
+  assert(!/unsafe-eval'|https?:|\*/.test(chromeManifest.content_security_policy.sandbox.replace("'wasm-unsafe-eval'", '')), 'the frame gets no eval and no network');
+  assert.deepStrictEqual(chromeManifest.web_accessible_resources[0].resources, ['infoview/host.html', 'infoview/frame.html']);
+  assert(!ff.sandbox && !ff.content_security_policy);
+  assert.deepStrictEqual(ff.web_accessible_resources, [{ resources: ['infoview/host.html'], matches: ['https://github.com/*'] }]);
+  assert(chromeManifest.content_scripts[0].js.includes('content/infoview_panel.js'));
   // The event page loads what the service worker imports, then the worker itself.
   const imported = [...workerSrc.matchAll(/importScripts\(([^)]*)\)/g)]
     .flatMap(m => [...m[1].matchAll(/'([^']+)'/g)].map(s => path.posix.join('background', s[1])));
@@ -3438,6 +3461,347 @@ console.log("24. Testing the commits a pull request's page names...");
   assert.deepStrictEqual(revisionAt('/o/r/pull/12', `{"route":"/o/r/pull/12","headOid":"${H460}"`), [null, null]);
   assert.deepStrictEqual(revisionAt('/o/r/blob/main/A.lean', conversation(437, H437)), [null, null]);
   console.log("   ✓ Pull request commits verified.\n");
+}
+
+// 25. The infoview: Lean's server kept running by the helper, the page that is its editor, and
+// the files from NPM.
+console.log("25. Testing the infoview...");
+{
+  const os = require('os');
+  const { spawnSync } = require('child_process');
+  const { pathToFileURL } = require('url');
+  const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // --- The helper's side (helper/live.mjs), with test/fixtures/fake-lake.mjs for `lake`.
+  // (After the other checks of the helper: a helper that stops, stops the commands of every
+  // helper in this process, and this check has a server running.)
+  const earlier = Promise.allSettled(asyncChecks.slice());
+  asyncChecks.push((async () => {
+    const live = await import('../helper/live.mjs');
+    const helper = await import('../helper/lean-lens-helper.mjs');
+    await earlier;
+    // A server's messages, however its output is cut into chunks.
+    const got = [];
+    const feed = live.lspReader((text) => got.push(JSON.parse(text)));
+    const frames = Buffer.concat([live.lspFrame({ a: 'é∀' }), live.lspFrame({ b: 2 }), live.lspFrame('{"c":3}')]);
+    feed(frames.subarray(0, 7));
+    feed(frames.subarray(7, 30));
+    feed(frames.subarray(30));
+    assert.deepStrictEqual(got, [{ a: 'é∀' }, { b: 2 }, { c: 3 }]);
+    assert(live.lspFrame({ a: 'é∀' }).toString('latin1').startsWith('Content-Length: 13\r\n\r\n'), 'the length is in bytes');
+
+    if (spawnSync('git', ['--version']).status !== 0) return;
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'lean-lens-live-')));
+    const made = [];
+    try {
+      const git = (cwd, ...args) => {
+        const result = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', '-c', 'init.defaultBranch=main', ...args], { cwd, encoding: 'utf8' });
+        assert.strictEqual(result.status, 0, result.stderr);
+        return result.stdout.trim();
+      };
+      const origin = path.join(root, 'origin');
+      fs.mkdirSync(path.join(origin, 'Sub'), { recursive: true });
+      git(origin, 'init', '--quiet');
+      fs.writeFileSync(path.join(origin, 'lakefile.toml'), 'name = "p"\n');
+      fs.writeFileSync(path.join(origin, 'lean-toolchain'), 'fake/lean:1\n');
+      fs.writeFileSync(path.join(origin, 'A.lean'), 'theorem a : True := trivial\n');
+      fs.writeFileSync(path.join(origin, 'Sub', 'B.lean'), 'def b := 2\n');
+      for (const name of ['C', 'D', 'E']) fs.writeFileSync(path.join(origin, `${name}.lean`), `def ${name.toLowerCase()} := 0\n`);
+      fs.writeFileSync(path.join(root, 'secret.txt'), 'not the repository\'s');
+      fs.symlinkSync(path.join(root, 'secret.txt'), path.join(origin, 'Link.lean'));
+      git(origin, 'add', '-A');
+      git(origin, 'commit', '--quiet', '-m', 'one');
+      const first = git(origin, 'rev-parse', 'HEAD');
+      fs.writeFileSync(path.join(origin, 'A.lean'), 'theorem a : True := by trivial\n');
+      git(origin, 'commit', '--quiet', '-am', 'two');
+      const second = git(origin, 'rev-parse', 'HEAD');
+      fs.mkdirSync(path.join(root, 'remotes', 'o'), { recursive: true });
+      git(root, 'clone', '--quiet', '--bare', origin, path.join(root, 'remotes', 'o', 'r.git'));
+      const options = {
+        cacheDir: path.join(root, 'cache'), cloneBase: pathToFileURL(path.join(root, 'remotes')).href, sandbox: false,
+        lake: path.join(__dirname, 'fixtures', 'fake-lake.mjs'), log: () => {}, liveTickMs: 10,
+      };
+      const h = helper.createHelper(options);
+      made.push(h);
+      const ask = async (pathname, body, sha = first) => {
+        const answer = await h.handle('POST', pathname, Object.assign({ repo: 'o/r', sha }, body));
+        return Object.assign(JSON.parse(answer.body), { status: answer.status });
+      };
+      assert.strictEqual(JSON.parse(h.handle('GET', '/status').body).live, live.LIVE_VERSION);
+      assert.strictEqual((await ask('/live/open', { path: 'A.lean' })).status, 403, 'only on a repository that is allowed');
+      h.allow('o/r');
+      assert.strictEqual((await ask('/live/open', { path: '../A.lean' })).status, 400);
+
+      // What a session says, read as the page reads it: `until` picks the event waited for.
+      const reader = (session, sha = first) => {
+        const state = { after: 0, rev: -1, events: [], last: null };
+        state.until = async (found, what) => {
+          for (let i = 0; i < 400; i++) {
+            const hit = state.events.find(found);
+            if (hit) return hit;
+            const answer = await ask('/live/poll', { session, after: state.after, rev: state.rev, wait: 100 }, sha);
+            state.last = answer;
+            state.rev = answer.rev;
+            for (const event of answer.events) { state.after = event.seq; state.events.push(event); }
+            if ((answer.state === 'closed' || answer.state === 'error') && !state.events.find(found)) return null;
+          }
+          throw new Error(`never came: ${what}`);
+        };
+        return state;
+      };
+      const opened = await ask('/live/open', { path: 'A.lean' });
+      assert.strictEqual(opened.state, 'preparing', 'answered at once');
+      const page = reader(opened.session);
+      const server = await page.until((e) => e.t === 'server', 'the server');
+      assert.strictEqual(server.initialize.serverInfo.name, 'fake Lean');
+      assert.strictEqual(server.initialize.hasWidgets, true, 'the server is told its client shows widgets');
+      const doc = await page.until((e) => e.t === 'opened', 'the file');
+      const copy = path.join(root, 'cache', 'repos', 'o', 'r');
+      assert.strictEqual(doc.uri, pathToFileURL(path.join(copy, 'A.lean')).href);
+      assert.strictEqual(doc.dir, pathToFileURL(copy + path.sep).href);
+      const diagnostics = await page.until((e) => e.t === 'lsp' && e.m.method === 'textDocument/publishDiagnostics', 'diagnostics');
+      assert.strictEqual(diagnostics.m.params.diagnostics[0].message, 'read 28 characters', 'the file as the commit has it');
+      assert.strictEqual(page.last.state, 'ready');
+      assert(!page.events.some((e) => e.t === 'lsp' && e.m.method === 'client/registerCapability'), 'what the server asks of its client is answered here');
+
+      // The page's messages reach the server, and its answers come back. Not everything may be sent.
+      const sent = await ask('/live/send', { session: opened.session, messages: [
+        { id: 1, method: '$/lean/plainGoal', params: { textDocument: { uri: doc.uri }, position: { line: 0, character: 3 } } },
+        { id: 2, method: 'textDocument/didOpen', params: { textDocument: { uri: 'file:///etc/passwd', text: '' } } },
+        { id: 'h:1', method: '$/lean/plainGoal', params: {} },
+        { method: '$/lean/rpc/keepAlive', params: {} },
+        'not a message',
+      ] });
+      assert.strictEqual(sent.sent, 2);
+      assert.deepStrictEqual((await page.until((e) => e.t === 'lsp' && e.m.id === 1, 'an answer')).m.result.goals, ['⊢ at 0:3']);
+      assert.strictEqual((await page.until((e) => e.t === 'lsp' && e.m.id === 2, 'a refusal')).m.error.code, -32601, 'documents are the helper\'s to open');
+      // A poll waits for something to say, and answers when there is.
+      const before = Date.now();
+      const waiting = ask('/live/poll', { session: opened.session, after: page.after, rev: page.rev, wait: 20000 });
+      await ask('/live/send', { session: opened.session, messages: [{ id: 3, method: '$/lean/rpc/connect', params: { uri: doc.uri } }] });
+      const woken = await waiting;
+      assert(Date.now() - before < 5000 && woken.events.some((e) => e.m && e.m.id === 3 && e.m.result.sessionId), JSON.stringify(woken));
+      page.after = woken.events[woken.events.length - 1].seq;
+      assert.deepStrictEqual((await ask('/live/poll', { session: opened.session, after: page.after, rev: page.rev })).events, [], 'what was read is not sent again');
+
+      // Another file, in the same session. A link out of the copy is not read.
+      const again = await ask('/live/open', { path: 'Sub/B.lean' });
+      assert.strictEqual(again.session, opened.session);
+      assert.strictEqual((await page.until((e) => e.t === 'opened' && e.path === 'Sub/B.lean', 'the second file')).uri, pathToFileURL(path.join(copy, 'Sub', 'B.lean')).href);
+      await ask('/live/open', { path: 'Link.lean' });
+      assert.strictEqual((await page.until((e) => e.t === 'failed', 'a refusal')).error, 'This file is not a plain file of the repository');
+      await ask('/live/open', { path: 'Gone.lean' });
+      assert.strictEqual((await page.until((e) => e.t === 'failed' && e.path === 'Gone.lean', 'a refusal')).error, 'This file does not exist at that commit');
+      // Restarting a file closes and opens it.
+      page.events.length = 0;
+      await ask('/live/open', { path: 'A.lean', restart: true });
+      await page.until((e) => e.t === 'opened' && e.path === 'A.lean', 'the file again');
+      assert.strictEqual(page.events.filter((e) => e.t === 'closed' || e.t === 'opened').map((e) => e.t).join(), 'closed,opened');
+      assert(fs.existsSync(path.join(copy, 'A.lean')), 'the copy stays while the session lasts');
+      // Four files stay open. A fifth closes the one used longest ago: here `Sub/B.lean`, as
+      // `A.lean` was opened again after it.
+      page.events.length = 0;
+      for (const name of ['C', 'D', 'E']) await ask('/live/open', { path: `${name}.lean` });
+      await page.until((e) => e.t === 'opened' && e.path === 'E.lean', 'the fifth file');
+      assert.deepStrictEqual(page.events.filter((e) => e.t === 'closed').map((e) => e.path), ['Sub/B.lean']);
+      assert.deepStrictEqual([...h.live.sessions.get('o/r').server.docs.keys()], ['A.lean', 'C.lean', 'D.lean', 'E.lean']);
+
+      // A run on another commit takes the copy: the server on this one stops first.
+      h.start({ repo: 'o/r', sha: second, pr: null, paths: ['Gone.lean'] });
+      assert.strictEqual(await page.until(() => false, 'the end'), null);
+      assert.strictEqual(page.last.state, 'closed');
+      assert(/another commit/.test(page.last.error), page.last.error);
+      assert(page.events.some((e) => e.t === 'stopped'));
+      assert.strictEqual((await ask('/live/send', { session: opened.session, messages: [] })).state, 'closed');
+      // A session on the other commit, which opening the first one again ends.
+      const other = await ask('/live/open', { path: 'A.lean' }, second);
+      assert.notStrictEqual(other.session, opened.session);
+      const otherPage = reader(other.session, second);
+      assert.strictEqual((await otherPage.until((e) => e.t === 'lsp' && e.m.method === 'textDocument/publishDiagnostics', 'diagnostics')).m.params.diagnostics[0].message, 'read 31 characters');
+      const back = await ask('/live/open', { path: 'A.lean' });
+      assert.strictEqual(await otherPage.until(() => false, 'the end'), null);
+      assert(/another commit/.test(otherPage.last.error), otherPage.last.error);
+      // A server that stops says why, and the session is over.
+      const backPage = reader(back.session);
+      await backPage.until((e) => e.t === 'opened', 'the file');
+      await ask('/live/send', { session: back.session, messages: [{ method: 'crash' }] });
+      assert.strictEqual(await backPage.until(() => false, 'the end'), null);
+      assert.strictEqual(backPage.last.state, 'error');
+      assert(/the server fell over/.test(backPage.last.error), backPage.last.error);
+      // Closing ends it, and the helper's stopping removes the copy.
+      const last = await ask('/live/open', { path: 'A.lean' });
+      await reader(last.session).until((e) => e.t === 'opened', 'the file');
+      assert.strictEqual((await ask('/live/close', { session: last.session })).state, 'closed');
+      assert.strictEqual((await ask('/live/poll', { session: last.session })).state, 'closed');
+      assert.strictEqual(h.live.sessions.size, 0);
+      await h.idle();
+      h.shutdown();
+      assert(!fs.existsSync(copy), 'stopping removes the copy');
+
+      // A session nobody reads any more ends by itself, and one nothing is asked of.
+      const h2 = helper.createHelper(Object.assign({}, options, { liveGoneMs: 60 }));
+      made.push(h2);
+      const left = JSON.parse((await h2.handle('POST', '/live/open', { repo: 'o/r', sha: first, path: 'A.lean' })).body);
+      for (let i = 0; h2.live.sessions.size && i < 400; i++) await tick(20);
+      const gone = JSON.parse((await h2.handle('POST', '/live/poll', { repo: 'o/r', sha: first, session: left.session })).body);
+      assert.strictEqual(gone.state, 'closed');
+      assert.strictEqual(gone.error, 'The page is no longer open');
+      h2.shutdown();
+    } finally {
+      for (const h of made) { try { h.shutdown(); } catch (err) { /* stopped already */ } }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  })());
+
+  // --- The editor's side (infoview/host.js): what the infoview is told, and what it may ask.
+  asyncChecks.push((async () => {
+    const hctx = { console, setTimeout, clearTimeout, setInterval, clearInterval };
+    hctx.self = hctx;
+    vm.createContext(hctx);
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'infoview', 'host.js'), 'utf8'), hctx, { filename: 'infoview/host.js' });
+    const { Editor, pathInRepo } = hctx.LeanLensInfoviewHost;
+    const dir = 'file:///cache/repos/o/r/';
+    assert.strictEqual(pathInRepo(dir, `${dir}Sub/B%20C.lean`), 'Sub/B C.lean');
+    assert.strictEqual(pathInRepo(dir, `${dir}.lake/packages/mathlib/Mathlib.lean`), null, 'a dependency is not the repository');
+    assert.strictEqual(pathInRepo(dir, 'file:///home/me/.elan/toolchains/x/src/lean/Init.lean'), null);
+    assert.strictEqual(pathInRepo(dir, `${dir}../../secret`), null);
+
+    // A helper played by a queue of answers to `/live/poll`.
+    const asked = [];
+    const polls = [];
+    let pollWaiting = null;
+    const answerPoll = (answer) => { if (pollWaiting) { const go = pollWaiting; pollWaiting = null; go(answer); } else polls.push(answer); };
+    const toFrame = [];
+    const toPanel = [];
+    let fromFrame = null;
+    let frameLoaded = null;
+    let shown = null;
+    let allowed = false;
+    const editor = new Editor({
+      request: (pathname, body) => {
+        asked.push([pathname, body]);
+        if (pathname === '/allow') { allowed = true; return Promise.resolve({ ok: true }); }
+        if (pathname === '/live/open') return Promise.resolve(allowed ? { session: 's1', state: 'preparing', message: 'Cloning', rev: 0 } : { state: 'not_allowed', repo: body.repo });
+        if (pathname === '/live/poll') return polls.length ? Promise.resolve(polls.shift()) : new Promise((resolve) => { pollWaiting = resolve; });
+        if (pathname === '/live/send') return Promise.resolve({ sent: body.messages.length });
+        return Promise.resolve({ state: 'closed' });
+      },
+      frame: { create: (onMessage, onReady) => { fromFrame = onMessage; frameLoaded = onReady; }, destroy: () => { fromFrame = null; }, post: (message) => toFrame.push(message) },
+      panel: (message) => toPanel.push(message),
+      loadConfig: () => Promise.resolve({ showGoalNames: false }),
+      saveConfig: () => {},
+      render: (view) => { shown = view; },
+    });
+    const settle = async () => { for (let i = 0; i < 20; i++) await tick(); };
+    editor.render();
+    assert(/Click in the Lean code/.test(shown.intro) && !shown.button, 'nothing to start without a page');
+    const sha = 'a'.repeat(40);
+    editor.setPage({ repo: 'o/r', sha, pr: '7', current: 'A.lean' });
+    assert.strictEqual(shown.button.label, 'Start Lean');
+    assert(shown.intro.includes('o/r at commit aaaaaaa') && shown.detail.includes('A.lean'));
+    // A click in the code before Lean runs chooses the file, and starts nothing.
+    editor.setCursor({ repo: 'o/r', sha, pr: '7', path: 'Sub/B.lean', line: 4, character: 2 });
+    assert.strictEqual(asked.length, 0, 'Lean starts from its button only');
+    assert(shown.detail.includes('Sub/B.lean'));
+    // The repository has to be allowed first, and the button says so.
+    await editor.start(false);
+    assert.strictEqual(shown.button.label, 'Allow o/r and start Lean');
+    assert.strictEqual(shown.button.allow, true);
+    await editor.start(true);
+    assert.deepStrictEqual(asked.filter(([p]) => p !== '/live/poll').map(([p]) => p), ['/live/open', '/allow', '/live/open']);
+    assert.strictEqual(asked[2][1].path, 'Sub/B.lean');
+    assert.strictEqual(shown.dot, 'busy');
+    assert.strictEqual(shown.intro, 'Cloning');
+    // Lean's server starts and opens the file: the infoview hears of the place first, then the server.
+    const init = { capabilities: {}, serverInfo: { name: 'Lean', version: '1' } };
+    const uri = `${dir}Sub/B.lean`;
+    answerPoll({ session: 's1', state: 'ready', rev: 1, events: [{ seq: 1, t: 'server', initialize: init }, { seq: 2, t: 'opened', path: 'Sub/B.lean', uri, dir },
+      { seq: 3, t: 'lsp', m: { method: 'textDocument/publishDiagnostics', params: { uri, diagnostics: [] } } }] });
+    await settle();
+    assert.strictEqual(toFrame.length, 0, 'nothing is said to a frame that has not loaded');
+    await frameLoaded();
+    assert.deepStrictEqual(toFrame.map((m) => m.api), ['changedInfoviewConfig', 'initialize', 'serverRestarted']);
+    const at = { uri, range: { start: { line: 4, character: 2 }, end: { line: 4, character: 2 } } };
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(toFrame[1].args)), [at]);
+    assert.strictEqual(shown.dot, 'ready');
+    assert.strictEqual(shown.frame, true);
+    // What Lean said before the infoview asked for it is said again when it asks.
+    toFrame.length = 0;
+    fromFrame({ call: 1, method: 'subscribeServerNotifications', args: ['textDocument/publishDiagnostics'] });
+    assert.deepStrictEqual(toFrame.map((m) => m.api || m.result), [1, 'gotServerNotification']);
+    // A click moves the cursor. In a file not open yet, the helper is asked to open it first.
+    toFrame.length = 0;
+    editor.setCursor({ repo: 'o/r', sha, pr: '7', path: 'Sub/B.lean', line: 9, character: 0 });
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(toFrame)), [{ api: 'changedCursorLocation', args: [{ uri, range: { start: { line: 9, character: 0 }, end: { line: 9, character: 0 } } }] }]);
+    toFrame.length = 0;
+    editor.setCursor({ repo: 'o/r', sha, pr: '7', path: 'A.lean', line: 0, character: 5 });
+    await settle();
+    assert.deepStrictEqual(asked[asked.length - 1][0] === '/live/open' ? asked[asked.length - 1][1].path : asked.filter(([p]) => p === '/live/open').pop()[1].path, 'A.lean');
+    assert.strictEqual(toFrame.length, 0, 'the cursor waits for its file');
+    answerPoll({ session: 's1', state: 'ready', rev: 1, events: [{ seq: 4, t: 'opened', path: 'A.lean', uri: `${dir}A.lean`, dir }] });
+    await settle();
+    assert.strictEqual(toFrame[0].api, 'changedCursorLocation');
+    assert.strictEqual(toFrame[0].args[0].uri, `${dir}A.lean`);
+    // The infoview's requests go to Lean, and the answers to the calls that made them.
+    toFrame.length = 0;
+    fromFrame({ call: 2, method: 'sendClientRequest', args: [uri, '$/lean/plainGoal', { position: { line: 1, character: 1 } }] });
+    await settle();
+    const sentMessages = asked.filter(([p]) => p === '/live/send').pop()[1].messages;
+    assert.strictEqual(sentMessages[0].method, '$/lean/plainGoal');
+    answerPoll({ session: 's1', state: 'ready', rev: 1, events: [{ seq: 5, t: 'lsp', m: { id: sentMessages[0].id, result: { goals: ['⊢ True'] } } }] });
+    await settle();
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(toFrame)), [{ result: 2, value: { goals: ['⊢ True'] } }]);
+    // An RPC session is opened with Lean and kept alive by the editor.
+    toFrame.length = 0;
+    fromFrame({ call: 3, method: 'createRpcSession', args: [uri] });
+    await settle();
+    const connect = asked.filter(([p]) => p === '/live/send').pop()[1].messages[0];
+    assert.strictEqual(connect.method, '$/lean/rpc/connect');
+    answerPoll({ session: 's1', state: 'ready', rev: 1, events: [{ seq: 6, t: 'lsp', m: { id: connect.id, result: { sessionId: '42' } } }] });
+    await settle();
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(toFrame)), [{ result: 3, value: '42' }]);
+    // Going to a definition in the repository is the page's to show; elsewhere there is nothing to show.
+    fromFrame({ call: 4, method: 'showDocument', args: [{ uri: `${dir}A.lean`, selection: { start: { line: 13, character: 4 }, end: { line: 13, character: 9 } } }] });
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(toPanel)), [{ type: 'reveal', repo: 'o/r', sha, pr: '7', path: 'A.lean', line: 14, character: 4 }]);
+    fromFrame({ call: 5, method: 'showDocument', args: [{ uri: `${dir}.lake/packages/x/X.lean` }] });
+    assert.strictEqual(toPanel.length, 1);
+    assert(/outside this repository/.test(shown.notice));
+    // What the infoview would insert is copied instead, and the reader is told.
+    fromFrame({ call: 6, method: 'copied', args: [true] });
+    assert(/Copied to the clipboard/.test(shown.notice));
+    toFrame.length = 0;
+    fromFrame({ call: 7, method: 'runTestScript', args: ['alert(1)'] });
+    assert.strictEqual(toFrame[0].error.code, -32603, 'the editor does only what it knows');
+    // The page moves to another commit: Lean is stopped there.
+    editor.setPage({ repo: 'o/r', sha: 'b'.repeat(40), pr: '7', current: 'A.lean' });
+    assert.strictEqual(asked[asked.length - 1][0], '/live/close');
+    assert.strictEqual(fromFrame, null, 'and the infoview goes with it');
+    assert.strictEqual(shown.button.label, 'Start Lean again');
+    // Without the files from NPM there is nothing to start.
+    editor.setInstalled(false);
+    assert(/npm install/.test(shown.detail) && !shown.button);
+  })());
+
+  // --- The files from NPM: names of modules become the files next to them, and nothing else changes.
+  asyncChecks.push(import('../scripts/build-infoview.mjs').then(({ rewriteImports, MODULES }) => {
+    const source = 'import{jsx as e}from"react/jsx-runtime";import*as r from"react";const s="from\\"react\\"";const d=()=>import(u);export{d};';
+    // (As es-module-lexer reports them: where each name starts and ends, and -1 for a static import.)
+    const found = [
+      { n: 'react/jsx-runtime', s: source.indexOf('react/jsx-runtime'), e: source.indexOf('react/jsx-runtime') + 17, d: -1 },
+      { n: 'react', s: source.indexOf('"react";') + 1, e: source.indexOf('"react";') + 6, d: -1 },
+      { n: undefined, s: source.indexOf('(u)') + 1, e: source.indexOf('(u)') + 2, d: source.indexOf('import(u)') },
+    ];
+    const targets = Object.fromEntries(Object.entries(MODULES).map(([name, [, file]]) => [name, `./${file}`]));
+    assert.strictEqual(rewriteImports(source, found, targets),
+      'import{jsx as e}from"./react-jsx-runtime.js";import*as r from"./react.js";const s="from\\"react\\"";const d=()=>import(u);export{d};');
+    assert.throws(() => rewriteImports('import"lodash";', [{ n: 'lodash', s: 7, e: 13, d: -1 }], targets), /No file for the import "lodash"/);
+    // The frame's page loads only what is in the extension.
+    const frame = fs.readFileSync(path.join(__dirname, '..', 'infoview', 'frame.html'), 'utf8');
+    assert(!/https?:\/\//.test(frame) && !/<script(?![^>]*\ssrc=)/.test(frame), 'no script from elsewhere, and none inline');
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    assert(/^\d+\.\d+\.\d+$/.test(pkg.devDependencies['@leanprover/infoview']), 'the infoview is one known version');
+    console.log("   ✓ Infoview verified.\n");
+  }));
 }
 
 Promise.all(asyncChecks).then(() => {
