@@ -1320,9 +1320,10 @@ async function handleLookupToken(token, subToken, fileRef, contextText, tacticPo
 /**
  * One request to the helper. Resolves to its JSON answer, or to `{state}` when there is none:
  * 'off' (not set up), 'offline' (not running), 'unauthorized' (wrong token), 'not_allowed'
- * (the repository is not allowed yet), 'error'.
+ * (the repository is not allowed yet), 'error'; and to `{state: missing}` when the helper does
+ * not know the request at all, if `missing` is given.
  */
-async function helperRequest(path, { body, settings, timeout = 6000 } = {}) {
+async function helperRequest(path, { body, settings, timeout = 6000, missing = null } = {}) {
   const s = settings || await getSettings();
   if (!s.enableHelper || !s.helperUrl || !s.helperToken) return { state: 'off' };
   let timer = null;
@@ -1338,6 +1339,7 @@ async function helperRequest(path, { body, settings, timeout = 6000 } = {}) {
     if (res.status === 401) return { state: 'unauthorized' };
     const json = await res.json().catch(() => null);
     if (res.status === 403) return { state: 'not_allowed', repo: json && json.repo };
+    if (res.status === 404 && missing) return { state: missing };
     if (!res.ok || !json) return { state: 'error', error: (json && json.error) || `The helper answered ${res.status}` };
     return json;
   } catch (err) {
@@ -1484,6 +1486,22 @@ async function helperRun(request) {
   return Object.assign({ repo, sha }, res);
 }
 
+/**
+ * A request of the infoview's panel to the helper, made here for it when the panel's own does not
+ * get through (see infoview/host.js). Only the panel's page may ask, and only for what it does
+ * itself: allowing a repository is its button's doing, and not something a page's content script
+ * may ask for.
+ */
+const PANEL_REQUESTS = new Set(['/allow', '/live/open', '/live/poll', '/live/send', '/live/close']);
+function helperForPanel(request, sender) {
+  const panel = chrome.runtime.getURL('infoview/host.html');
+  const from = (sender && sender.url) || '';
+  if (from !== panel && !from.startsWith(`${panel}#`)) return { state: 'error', error: 'Not asked by the infoview' };
+  if (!PANEL_REQUESTS.has(request.path) || !request.body || typeof request.body !== 'object') return { state: 'error', error: 'Unknown request' };
+  const timeout = Math.min(Math.max(Number(request.timeout) || 8000, 1000), 40000);
+  return helperRequest(request.path, { body: request.body, timeout, missing: 'old' });
+}
+
 // Keys for the infoview's panels (see INFOVIEW_KEY), by the frame's name. Kept for the browser
 // session where the browser can, so that a worker restarted between the two askers gives both
 // the same key.
@@ -1584,6 +1602,7 @@ const MESSAGE_HANDLERS = {
   // The key by which the infoview's panel knows the content script of its page (and not the
   // page's own scripts, which cannot send messages here): one for each frame, given to both.
   INFOVIEW_KEY: (request) => infoviewKey(request.id),
+  HELPER_LIVE: (request, sender) => helperForPanel(request, sender),
   // The commit a pull request's page shows, when the page itself does not say (for the infoview).
   PAGE_COMMIT: async (request) => ({ sha: request.fileRef ? await commitOf(request.fileRef) : null }),
   // A file's outline (with the scope commands), the declarations a PR adds, and hints for those.
@@ -1613,7 +1632,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   const handler = request && Object.prototype.hasOwnProperty.call(MESSAGE_HANDLERS, request.action) && MESSAGE_HANDLERS[request.action];
   if (!handler) return false;
   Promise.resolve()
-    .then(() => handler(request)) // also catches errors thrown synchronously
+    .then(() => handler(request, sender)) // also catches errors thrown synchronously
     .then(sendResponse, (err) => {
       console.warn('[Lean Lens] message handler failed:', request.action, err);
       sendResponse(Object.prototype.hasOwnProperty.call(MESSAGE_FALLBACKS, request.action) ? MESSAGE_FALLBACKS[request.action] : null);

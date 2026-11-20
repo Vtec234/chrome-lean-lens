@@ -202,7 +202,7 @@ const mockLoogleHits = [
 const fakeStorage = {};
 const workerListeners = [];
 context.chrome = {
-  runtime: { onMessage: { addListener: (fn) => workerListeners.push(fn) } },
+  runtime: { onMessage: { addListener: (fn) => workerListeners.push(fn) }, getURL: (file) => `moz-extension://lean-lens-test/${file}` },
   storage: { local: {
     get: (keys, cb) => {
       const out = {};
@@ -873,6 +873,22 @@ asyncChecks.push(Promise.all(handlerRuns).then(() => {
   assert.deepStrictEqual(handlerFailures, [], `message handlers failed:\n${handlerFailures.join('\n')}`);
 }, (err) => { console.warn = realWarn; throw err; }));
 assert.strictEqual(workerListeners[0]({ action: 'NO_SUCH_ACTION' }, {}, () => {}), false, "unknown actions are ignored");
+// The infoview panel's requests to the helper, made by the worker for it (Firefox does not let a
+// frame in a tab of github.com reach this machine): only the panel's page may ask, and only for its own.
+{
+  // (Answers come from the worker's own realm: they are compared as plain copies.)
+  const askAs = (url, request) => new Promise((resolve) => workerListeners[0](Object.assign({ action: 'HELPER_LIVE' }, request), { url }, (res) => resolve(JSON.parse(JSON.stringify(res)))));
+  const panelUrl = 'moz-extension://lean-lens-test/infoview/host.html#0123456789abcdef';
+  const open = { path: '/live/open', body: { repo: 'o/r', sha: 'a'.repeat(40), path: 'A.lean' } };
+  asyncChecks.push((async () => {
+    assert.deepStrictEqual(await askAs('https://github.com/o/r/pull/1/files', open), { state: 'error', error: 'Not asked by the infoview' }, 'a page\'s content script cannot use the panel\'s requests');
+    assert.deepStrictEqual(await askAs(undefined, { path: '/allow', body: { repo: 'o/r' } }), { state: 'error', error: 'Not asked by the infoview' }, 'nor can a sender without an address');
+    assert.deepStrictEqual(await askAs('moz-extension://lean-lens-test/infoview/host.html.evil', open), { state: 'error', error: 'Not asked by the infoview' }, 'nor a page whose address only starts like the panel\'s');
+    assert.deepStrictEqual(await askAs(panelUrl, { path: '/clean', body: {} }), { state: 'error', error: 'Unknown request' }, 'the panel gets only its own requests made');
+    assert.deepStrictEqual(await askAs(panelUrl, { path: '/live/open' }), { state: 'error', error: 'Unknown request' }, 'a request without a body is refused');
+    assert.deepStrictEqual(await askAs(panelUrl, open), { state: 'off' }, 'the panel\'s request goes to the helper (which is off here)');
+  })());
+}
 
 // 18. Hovering a gap shows the term there with its type, as Lean's infoview does (`a b : Y`).
 //     Expected outputs were checked against Lean's own hovers (lean-lsp) on the same code.
