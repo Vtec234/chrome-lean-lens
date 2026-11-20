@@ -133,6 +133,8 @@ With the Lean helper switched on, an **InfoView** tab at the right edge of the p
 
 The panel can be widened or narrowed by dragging its left edge, and hidden with **⟩**. Lean keeps running while it is hidden.
 
+While the panel is open, hovers show at its bottom, under the InfoView, instead of in a tooltip beside the code: the type and docstring of what the pointer last rested on, estimated (and marked so) or Lean's own, as the tooltip would show them. Such a hover stays when the pointer moves on, so it can be read and scrolled; the next hover replaces it, **Esc** clears it, and the pin (or **Alt**) keeps it while the pointer rests elsewhere. Drag the line above it to share the panel's height differently. With the panel hidden, hovers are tooltips again.
+
 The InfoView panel behaves differently than in the editor in the following cases:
 
 - **Go to definition** (Ctrl-click a name) scrolls to the right line when the definition is in the pull request's files, or opens it on GitHub when it is elsewhere in the repository. Definitions in Lean core or an upstream package are not opened.

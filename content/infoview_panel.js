@@ -12,6 +12,9 @@
   const STATE_KEY = 'lean_lens_infoview_panel';
   const MIN_WIDTH = 280;
   const DEFAULT_WIDTH = 440;
+  // The hovers at the bottom of the panel: how low they may get, and how much they leave the infoview.
+  const MIN_HOVER = 60;
+  const MIN_INFOVIEW = 120;
 
   /**
    * The position a click in the code means: `{ref, line, character, container, offset}` with
@@ -55,6 +58,7 @@
       this.port = null;
       this.open = false;
       this.width = DEFAULT_WIDTH;
+      this.hoverHeight = null; // in pixels once the reader has set it; until then a share of the panel
       this.page = null;
       this.sent = '';
       this.restored = false;
@@ -109,25 +113,39 @@
       if (!page) {
         if (this.root) this.root.classList.add('lean-infoview-gone');
         this.shift(false);
+        this.dockHover();
         this.tell();
         return;
       }
       this.ensureDom();
       this.root.classList.remove('lean-infoview-gone');
       this.shift(this.open);
+      this.dockHover();
       if (!this.restored) {
-        // As it was left on the last page: open or hidden, and how wide.
+        // As it was left on the last page: open or hidden, how wide, and how much the hovers take.
         this.restored = true;
         try {
           chrome.storage.local.get([STATE_KEY], (res) => {
             const kept = res && res[STATE_KEY];
             if (!kept) return;
             if (Number(kept.width) >= MIN_WIDTH) this.setWidth(Number(kept.width));
+            if (Number(kept.hover) >= MIN_HOVER) this.setHoverHeight(Number(kept.hover));
             if (kept.open && this.page) this.setOpen(true, false);
           });
         } catch (err) { /* starts hidden */ }
       }
       this.tell();
+    }
+
+    /**
+     * While the panel is open, hovers are shown at its bottom, under the infoview, instead of in
+     * a tooltip beside the code; while it is hidden (or not on the page), beside the code again.
+     */
+    dockHover() {
+      const view = window.VersoTooltipView;
+      if (!view || typeof view.dockIn !== 'function') return;
+      const on = Boolean(this.root && this.open && !this.root.classList.contains('lean-infoview-gone'));
+      view.dockIn(on ? this.root.querySelector('.lean-infoview-hover') : null);
     }
 
     ensureDom() {
@@ -144,6 +162,10 @@
             <button class="lean-infoview-hide" title="Hide the infoview (Lean keeps running)">⟩</button>
           </div>
           <div class="lean-infoview-body"></div>
+          <div class="lean-infoview-split" title="Drag to share the height between the infoview and the hovers"></div>
+          <div class="lean-infoview-hover" role="region" aria-label="Hover">
+            <div class="lean-infoview-hover-empty">Rest the pointer on Lean code to see what it is: its type and docstring show here.</div>
+          </div>
         </div>`;
       document.body.appendChild(this.root);
       this.root.querySelector('.lean-infoview-tab').addEventListener('click', () => this.setOpen(true));
@@ -151,7 +173,42 @@
       // The tooltip's hovers stay out of the panel.
       this.root.addEventListener('mousemove', (e) => e.stopPropagation());
       this.bindGrip(this.root.querySelector('.lean-infoview-grip'));
+      this.bindSplit(this.root.querySelector('.lean-infoview-split'));
       this.setWidth(this.width);
+      this.setHoverHeight(this.hoverHeight);
+    }
+
+    /** The line between the infoview and the hovers under it: dragged, it moves. */
+    bindSplit(split) {
+      let from = null;
+      split.addEventListener('pointerdown', (e) => {
+        const hover = this.root.querySelector('.lean-infoview-hover');
+        from = { y: e.clientY, height: hover.getBoundingClientRect().height };
+        split.setPointerCapture(e.pointerId);
+        this.root.classList.add('lean-infoview-splitting');
+        e.preventDefault();
+      });
+      split.addEventListener('pointermove', (e) => { if (from) this.setHoverHeight(from.height + from.y - e.clientY); });
+      const done = () => {
+        if (!from) return;
+        from = null;
+        this.root.classList.remove('lean-infoview-splitting');
+        this.save();
+      };
+      split.addEventListener('pointerup', done);
+      split.addEventListener('pointercancel', done);
+    }
+
+    /** How tall the hovers are (null: the share of the panel they start with). */
+    setHoverHeight(height) {
+      if (height === null || height === undefined || !Number.isFinite(Number(height))) {
+        this.hoverHeight = null;
+        if (this.root) this.root.style.removeProperty('--lean-infoview-hover-height');
+        return;
+      }
+      const room = Math.max(MIN_HOVER, (window.innerHeight || 800) - MIN_INFOVIEW);
+      this.hoverHeight = Math.round(Math.max(MIN_HOVER, Math.min(Number(height), room)));
+      if (this.root) this.root.style.setProperty('--lean-infoview-hover-height', `${this.hoverHeight}px`);
     }
 
     bindGrip(grip) {
@@ -188,7 +245,7 @@
     }
 
     save() {
-      try { chrome.storage.local.set({ [STATE_KEY]: { open: this.open, width: this.width } }); } catch (err) { /* not kept */ }
+      try { chrome.storage.local.set({ [STATE_KEY]: { open: this.open, width: this.width, hover: this.hoverHeight } }); } catch (err) { /* not kept */ }
     }
 
     setOpen(open, remember = true) {
@@ -196,6 +253,7 @@
       this.open = open;
       this.root.classList.toggle('lean-infoview-closed', !open);
       this.shift(open && !this.root.classList.contains('lean-infoview-gone'));
+      this.dockHover();
       if (open) {
         this.ensureFrame();
         document.addEventListener('click', this.onClick, true);

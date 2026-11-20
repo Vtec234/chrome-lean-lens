@@ -3820,6 +3820,254 @@ console.log("25. Testing the infoview...");
   }));
 }
 
+// 26. Hovers at the bottom of the infoview's panel while it is open, and beside the code otherwise.
+console.log("26. Testing hovers in the infoview's panel...");
+{
+  // A small DOM: elements with classes, children and listeners. `querySelector` gives, for each
+  // selector, one element of the element's own (what `innerHTML` would have made).
+  const listenersOf = (target) => (type) => (target.listeners[type] || []);
+  const makeElement = (tag = 'div') => {
+    const classes = new Set();
+    const stubs = new Map();
+    const el = {
+      tagName: tag.toUpperCase(), id: '', children: [], parentNode: null, listeners: {}, dataset: {},
+      textContent: '', innerHTML: '', title: '', scrollTop: 0, offsetWidth: 0, offsetHeight: 0, height: 200,
+      style: { setProperty(k, v) { this[k] = v; }, removeProperty(k) { delete this[k]; } },
+      classList: {
+        add: (...names) => names.forEach((c) => classes.add(c)),
+        remove: (...names) => names.forEach((c) => classes.delete(c)),
+        contains: (c) => classes.has(c),
+        toggle: (c, on) => { const want = on === undefined ? !classes.has(c) : Boolean(on); if (want) classes.add(c); else classes.delete(c); return want; },
+      },
+      get className() { return [...classes].join(' '); },
+      set className(v) { classes.clear(); String(v).split(/\s+/).filter(Boolean).forEach((c) => classes.add(c)); },
+      get parentElement() { return el.parentNode; },
+      appendChild(child) {
+        if (child.parentNode) child.parentNode.removeChild(child);
+        child.parentNode = el;
+        el.children.push(child);
+        return child;
+      },
+      removeChild(child) { el.children = el.children.filter((c) => c !== child); child.parentNode = null; return child; },
+      contains(other) { for (let n = other; n; n = n.parentNode) if (n === el) return true; return false; },
+      querySelector(sel) {
+        if (!stubs.has(sel)) {
+          const stub = makeElement();
+          if (sel.startsWith('.')) stub.classList.add(sel.slice(1));
+          if (sel.startsWith('#')) stub.id = sel.slice(1);
+          stub.parentNode = el;
+          stubs.set(sel, stub);
+        }
+        return stubs.get(sel);
+      },
+      querySelectorAll: () => [],
+      closest(sel) {
+        const wanted = sel.split(',').map((s) => s.trim());
+        for (let n = el; n; n = n.parentNode) {
+          if (wanted.some((w) => (w.startsWith('.') && n.classList.contains(w.slice(1))) || (w.startsWith('#') && n.id === w.slice(1)))) return n;
+        }
+        return null;
+      },
+      addEventListener(type, fn) { (el.listeners[type] = el.listeners[type] || []).push(fn); },
+      removeEventListener(type, fn) { el.listeners[type] = (el.listeners[type] || []).filter((f) => f !== fn); },
+      getBoundingClientRect: () => ({ top: 0, left: 0, right: 0, bottom: el.height, width: 0, height: el.height }),
+      setPointerCapture() {},
+    };
+    return el;
+  };
+
+  // Timers are kept, not run: the content script's start-up scan never happens here.
+  const timers = new Set();
+  const stored = [];
+  let kept = { lean_lens_infoview_panel: { open: false, width: 500, hover: 300 } };
+  let lookups = [];
+  const body = makeElement('body');
+  const html = makeElement('html');
+  const docListeners = {};
+  const dctx = {
+    console, Date, Math, JSON, Promise, URL, Uint8Array,
+    setTimeout: (fn, ms) => { const t = { fn, ms }; timers.add(t); return t; },
+    clearTimeout: (t) => timers.delete(t),
+    setInterval: () => 0, clearInterval: () => {},
+    location: { pathname: '/o/r/pull/7/changes' },
+    innerWidth: 1400, innerHeight: 900,
+    crypto: require('crypto').webcrypto,
+    navigator: { clipboard: { writeText: () => Promise.resolve() } },
+    CSS: { highlights: new Map() },
+    Highlight: function (...ranges) { this.ranges = ranges; },
+    getComputedStyle: () => ({ overflowY: 'visible', maxWidth: '460px', backgroundColor: 'rgb(13, 17, 23)' }),
+    requestAnimationFrame: (fn) => fn(),
+    Node: { ELEMENT_NODE: 1, TEXT_NODE: 3 }, NodeFilter: { SHOW_TEXT: 4 },
+    MutationObserver: function () { this.observe = () => {}; },
+    document: {
+      body, documentElement: html, getElementById: () => null, querySelectorAll: () => [],
+      createElement: (tag) => makeElement(tag),
+      addEventListener: (type, fn) => { (docListeners[type] = docListeners[type] || []).push(fn); },
+      removeEventListener: (type, fn) => { docListeners[type] = (docListeners[type] || []).filter((f) => f !== fn); },
+    },
+    chrome: {
+      runtime: {
+        lastError: null, onMessage: { addListener: () => {} }, getURL: (p) => `chrome-extension://lens/${p}`,
+        sendMessage: (message, cb) => {
+          if (message.action === 'GET_SETTINGS') cb && cb({ settings: { enabled: true, enableHelper: false } });
+          else if (message.action === 'LOOKUP_TOKEN') lookups.push({ message, answer: cb });
+          else if (cb) cb(null);
+        },
+      },
+      storage: { local: { get: (keys, cb) => cb(kept), set: (value) => stored.push(JSON.parse(JSON.stringify(value))) } },
+    },
+  };
+  dctx.window = dctx; dctx.self = dctx; dctx.globalThis = dctx;
+  const winListeners = {};
+  dctx.addEventListener = (type, fn) => { (winListeners[type] = winListeners[type] || []).push(fn); };
+  vm.createContext(dctx);
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'manifest.json'), 'utf8'));
+  for (const f of manifest.content_scripts[0].js) vm.runInContext(fs.readFileSync(path.join(__dirname, '..', f), 'utf8'), dctx, { filename: f });
+  const view = dctx.VersoTooltipView;
+  const panel = dctx.LeanInfoviewPanel;
+  const CI = dctx.VersoContentInternals;
+  const title = () => view.container.querySelector('#verso-title').textContent;
+  const shaded = () => (dctx.CSS.highlights.has('lean-lens-hover') ? dctx.CSS.highlights.get('lean-lens-hover').ranges : null);
+  const rect = { left: 40, right: 80, top: 100, bottom: 116 };
+  const card = (name, more = {}) => Object.assign({ name, kind: 'def', typeSignature: `def ${name} : Nat`, docstring: 'A number.', source: 'loogle' }, more);
+
+  // Beside the code while there is no panel.
+  view.show(card('foo'), rect, ['foo-range']);
+  assert.strictEqual(view.container.parentNode, body);
+  assert.notStrictEqual(view.container.style.left, '', 'placed beside the code');
+  assert.deepStrictEqual(shaded(), ['foo-range']);
+
+  // The panel comes, as it was left: hidden, 500 wide, with hovers 300 high. Hovers stay beside the code.
+  panel.pageInfo = () => ({ owner: 'o', name: 'r', repo: 'o/r', pr: '7', sha: 'a'.repeat(40), files: ['A.lean'], current: 'A.lean' });
+  panel.refresh(true);
+  assert.strictEqual(panel.width, 500);
+  assert.strictEqual(panel.root.style['--lean-infoview-hover-height'], '300px');
+  assert.strictEqual(view.dock, null);
+  // Opened, it takes the hover shown into its bottom, out of its place beside the code.
+  panel.setOpen(true);
+  const hover = panel.root.querySelector('.lean-infoview-hover');
+  assert.strictEqual(view.dock, hover);
+  assert.strictEqual(view.container.parentNode, hover);
+  assert(view.container.classList.contains('verso-docked'));
+  assert(view.isVisible() && title() === 'foo', 'the hover open beside the code moves into the panel');
+  assert(hover.classList.contains('verso-dock-filled'), 'the hint gives way');
+  assert.strictEqual(view.container.style.left, '');
+  assert(/Esc/.test(view.container.querySelector('#verso-close-btn').title));
+
+  // In the panel: no run of Lean of its own; an estimate says so, Lean's own hover says nothing.
+  const barText = view.container.querySelector('#verso-helper-text');
+  const barBtn = view.container.querySelector('#verso-helper-btn');
+  const bar = view.container.querySelector('#verso-helper-bar');
+  let ran = 0;
+  view.show(card('foo'), rect, ['foo-range'], { goals: null, messages: [], helper: { state: 'missing', run: () => ran++ } });
+  assert.strictEqual(barText.textContent, 'Estimated: not checked by Lean');
+  assert(barBtn.classList.contains('verso-hidden'), 'no Run Lean in the panel');
+  assert(!bar.classList.contains('verso-hidden'));
+  view.show(card('foo', { source: 'lean' }), rect, ['foo-range'], { goals: null, messages: [], helper: { state: 'ready' } });
+  assert(bar.classList.contains('verso-hidden'));
+  // A proof state beside a definition stays in one column: the panel is narrow.
+  view.show(card('foo', { source: 'lean' }), rect, ['foo-range'], { goals: { at: true, tactic: 'simp', goals: ['⊢ True'] }, messages: [], helper: { state: 'ready' } });
+  assert(!view.container.classList.contains('verso-two-col'));
+  assert.strictEqual(ran, 0);
+
+  // The pointer moving away leaves the hover. A lookup under way puts a bar over it; when it
+  // finds nothing, the hover stays as it was, with its own code shaded again.
+  view.show(card('foo'), rect, ['foo-range']);
+  view.scheduleHide(0);
+  assert.strictEqual(view.hideTimer, null, 'a docked hover is not closed by moving away');
+  view.showLoading('bar', rect, ['bar-range']);
+  assert(view.container.classList.contains('verso-loading'));
+  assert.strictEqual(title(), 'foo', 'the hover shown stays while the next is looked up');
+  assert.deepStrictEqual(shaded(), ['bar-range']);
+  view.hide(false);
+  assert(view.isVisible() && !view.container.classList.contains('verso-loading'));
+  assert.deepStrictEqual(shaded(), ['foo-range']);
+  // Keys typed in a text field are the field's (Esc leaves a comment, Option makes a symbol).
+  const press = (key, target) => (winListeners.keydown || []).forEach((fn) => fn({ key, target, preventDefault: () => {} }));
+  const field = makeElement('textarea');
+  field.closest = (sel) => (/textarea/.test(sel) ? field : null);
+  press('Alt', field);
+  press('Escape', field);
+  assert(view.isVisible() && !view.isPinned, 'typing in a comment leaves the hover alone');
+  const elsewhere = makeElement('span');
+  press('Alt', elsewhere);
+  assert(view.isPinned, 'Alt elsewhere keeps the hover');
+  press('Alt', elsewhere);
+  // Esc (or the close button) clears it, and the hint shows again.
+  press('Escape', elsewhere);
+  assert(!view.isVisible() && !hover.classList.contains('verso-dock-filled'));
+  assert.strictEqual(shaded(), null);
+  // With nothing shown yet, a lookup shows its spinner in the panel, which goes when nothing is found.
+  view.showLoading('baz', rect, ['baz-range']);
+  assert(view.isVisible() && view.loadingCard && title() === 'baz');
+  view.hide(false);
+  assert(!view.isVisible() && !hover.classList.contains('verso-dock-filled'));
+
+  // A lookup under way when the pointer goes into the panel is dropped: the hover being read stays.
+  CI.setSettings({ enableHelper: false, enablePRScanner: false, enableBuiltins: false });
+  dctx.VersoBinderContext.fileRefFromDom = () => ({ owner: 'o', repo: 'r', pr: '7', sha: 'a'.repeat(40), side: 'right', path: 'A.lean', line: 3 });
+  dctx.VersoBinderContext.contextFromDom = () => 'theorem t : Foo.bar = 1 := rfl';
+  const lookUp = (token) => {
+    lookups = [];
+    CI.hovering(token);
+    CI.triggerHoverLookup({ token, subToken: token, chainUpToCursor: token, fullChain: token, linePrefix: 'theorem t : ', lineSuffix: ' = 1 := rfl',
+      boundingRect: rect, shade: [`${token}-range`], textNode: {}, column: 12, columnEnd: 12 + token.length, caret: 13 });
+    assert.strictEqual(lookups.length, 1, `${token} is looked up`);
+    return lookups[0];
+  };
+  let pending = lookUp('Foo.bar');
+  pending.answer({ success: true, data: card('Foo.bar') });
+  assert.strictEqual(title(), 'Foo.bar', 'an answer that arrives is shown in the panel');
+  pending = lookUp('Foo.baz');
+  view.showLoading('Foo.baz', rect, ['Foo.baz-range']);
+  const outside = makeElement('span');
+  body.appendChild(outside);
+  for (const fn of docListeners.mouseover) fn({ target: outside });
+  assert(view.container.classList.contains('verso-loading'), 'moving about the page drops nothing');
+  for (const fn of docListeners.mouseover) fn({ target: view.container.querySelector('#verso-title') });
+  assert(!view.container.classList.contains('verso-loading'), 'into the panel: the bar goes');
+  pending.answer({ success: true, data: card('Foo.baz') });
+  assert.strictEqual(title(), 'Foo.bar', 'and the answer that comes after is not shown');
+  assert.deepStrictEqual(shaded(), ['Foo.bar-range']);
+
+  // The line between the infoview and the hovers moves; the height is kept, within bounds.
+  const split = panel.root.querySelector('.lean-infoview-split');
+  hover.height = 300;
+  stored.length = 0;
+  listenersOf(split)('pointerdown').forEach((fn) => fn({ clientY: 600, pointerId: 1, preventDefault: () => {} }));
+  assert(panel.root.classList.contains('lean-infoview-splitting'), 'the frame lets the pointer through while dragging');
+  listenersOf(split)('pointermove').forEach((fn) => fn({ clientY: 500 }));
+  assert.strictEqual(panel.root.style['--lean-infoview-hover-height'], '400px');
+  listenersOf(split)('pointerup').forEach((fn) => fn({}));
+  assert(!panel.root.classList.contains('lean-infoview-splitting'));
+  assert.strictEqual(stored[stored.length - 1].lean_lens_infoview_panel.hover, 400);
+  panel.setHoverHeight(10);
+  assert.strictEqual(panel.hoverHeight, 60, 'never too low to read');
+  panel.setHoverHeight(5000);
+  assert.strictEqual(panel.hoverHeight, 900 - 120, 'and the infoview keeps some room');
+  panel.setHoverHeight(null);
+  assert.strictEqual(panel.root.style['--lean-infoview-hover-height'], undefined);
+
+  // Hidden, the panel gives hovers back to the code; open again, it takes them; gone from the page, it gives them back.
+  view.show(card('foo'), rect, ['foo-range']);
+  panel.setOpen(false);
+  assert.strictEqual(view.dock, null);
+  assert.strictEqual(view.container.parentNode, body);
+  assert(!view.container.classList.contains('verso-docked') && !view.isVisible());
+  assert.strictEqual(shaded(), null);
+  view.show(card('foo'), rect, ['foo-range']);
+  assert.notStrictEqual(view.container.style.left, '', 'placed beside the code again');
+  view.scheduleHide(50);
+  assert(view.hideTimer, 'and closed when the pointer leaves');
+  view.clearHideTimer();
+  assert(!/Esc/.test(view.container.querySelector('#verso-close-btn').title) || /Close/.test(view.container.querySelector('#verso-close-btn').title));
+  panel.setOpen(true);
+  assert.strictEqual(view.dock, hover);
+  panel.refresh(false);
+  assert.strictEqual(view.dock, null, 'no panel on the page: hovers beside the code');
+  console.log("   ✓ Hovers in the infoview's panel verified.\n");
+}
+
 Promise.all(asyncChecks).then(() => {
   console.log("   ✓ Rewrite replay verified.\n");
   console.log("==================================================");
