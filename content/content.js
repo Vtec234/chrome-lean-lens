@@ -1284,10 +1284,35 @@
   }
 
   /**
+   * The pointer went into the infoview's panel, where hovers are shown while it is open (the
+   * panel keeps its own mouse moves from `handleMouseMove`). A token crossed on the way there,
+   * or one still being looked up, does not replace the hover being read.
+   */
+  function leaveForPanel(e) {
+    const view = window.VersoTooltipView;
+    if (!view.dock || !e.target || !e.target.closest || !e.target.closest('.lean-infoview')) return;
+    if (hoverTimer) {
+      clearTimeout(hoverTimer);
+      hoverTimer = null;
+    }
+    if (loadingTimer) {
+      clearTimeout(loadingTimer);
+      loadingTimer = null;
+    }
+    lastHoveredToken = null;
+    lastHoveredRect = null;
+    lastHoveredSpot = null;
+    activeHover = null;
+    // (Takes away a lookup's loading bar; the hover shown stays.)
+    view.hide(false);
+  }
+
+  /**
    * Bind event listeners.
    */
   function initListeners() {
     document.addEventListener('mousemove', handleMouseMove, { passive: true });
+    document.addEventListener('mouseover', leaveForPanel, { passive: true });
 
     // Handle GitHub SPA soft navigations (Turbo / PJAX)
     const handleNavigation = () => {
@@ -1329,7 +1354,7 @@
 
   // Exposed for the test suite.
   window.VersoContentInternals = { receiverFor, lookupContext, isInProse, isInAttribute, isInString, refineLocal, triggerTermLookup, versoState, inLeanNames,
-    triggerHoverLookup, exactCard, exactExtras, regionRanges, scrollBeside, isDeclKeyword, whereCard, setSettings: (values) => Object.assign(settings, values), hovering: (token) => { lastHoveredToken = token; } };
+    triggerHoverLookup, exactCard, exactExtras, regionRanges, scrollBeside, isDeclKeyword, whereCard, leaveForPanel, setSettings: (values) => Object.assign(settings, values), hovering: (token) => { lastHoveredToken = token; } };
 
   // Startup
   loadSettings();
