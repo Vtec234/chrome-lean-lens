@@ -37,7 +37,7 @@
    *
    * @param {object} env
    *   `request(path, body, timeoutMs)`: a request to the helper: its JSON answer, or `{state}`
-   *     ('off', 'offline', 'unauthorized', 'not_allowed', 'old', 'error') when there is none.
+   *     ('off', 'not_local', 'offline', 'unauthorized', 'not_allowed', 'old', 'error') when there is none.
    *   `frame`: `{create(onMessage), destroy(), post(message)}`: the infoview's frame.
    *   `panel(message)`: tell the page on GitHub something (`{type: 'reveal', …}`).
    *   `render(view)`: show the state. `loadConfig()`, `saveConfig(config)`: the infoview's settings.
@@ -455,6 +455,7 @@
       if (refused) {
         const said = {
           off: 'The helper is switched off. Switch on “Use the local helper” in Lean Lens’s options, and paste the helper’s address and token there.',
+          not_local: 'The helper runs on this machine: its address in Lean Lens’s options starts with http://127.0.0.1 or http://localhost.',
           offline: 'The helper is not running. Start it with `node helper/lean-lens-helper.mjs`.',
           unauthorized: 'The helper did not accept the token. Paste the one it printed into Lean Lens’s options.',
           old: 'This helper is older than the extension and has no infoview. Stop it, and start the one in the extension’s folder.',
@@ -511,27 +512,49 @@
     return settings;
   }
 
-  /** One request to the helper: its JSON answer, or `{state}` when it gave none. */
+  /**
+   * One request to the helper: its JSON answer, or `{state}` when it gave none.
+   *
+   * This page is a frame in a tab of github.com, and what it asks of this machine may be stopped
+   * for that: Firefox's local network access check refuses it ("Local Network Access permission
+   * required", for the top-level site), and content blockers have filters against web pages that
+   * probe the local network. The background script's requests, which the hovers use, are not
+   * subject to either. So in Firefox the background script makes all of them; elsewhere the
+   * request is made from here, and by the background script if that gets no answer, and the way
+   * that worked is kept to.
+   */
+  let direct = location.protocol === 'moz-extension:' ? false : null; // true: from here; false: by the background script
   async function request(path, body, timeoutMs = 8000) {
     const s = await helperSettings();
     if (!s.enableHelper || !s.helperUrl || !s.helperToken) return { state: 'off' };
-    try {
-      const response = await fetch(new URL(path, s.helperUrl).toString(), {
-        method: 'POST',
-        headers: { 'X-Lean-Lens-Token': s.helperToken, 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs),
-        keepalive: path === '/live/close'
-      });
-      if (response.status === 401) return { state: 'unauthorized' };
-      const json = await response.json().catch(() => null);
-      if (response.status === 403) return { state: 'not_allowed', repo: json && json.repo };
-      if (response.status === 404) return { state: 'old' };
-      if (!response.ok || !json) return { state: 'error', error: (json && json.error) || `The helper answered ${response.status}` };
-      return json;
-    } catch (err) {
-      return { state: 'offline' };
+    // (As in the background script: the token goes only to an address on this machine.)
+    let local = false;
+    try { const at = new URL(s.helperUrl); local = at.protocol === 'http:' && (at.hostname === '127.0.0.1' || at.hostname === 'localhost'); } catch (err) { /* no address */ }
+    if (!local) return { state: 'not_local' };
+    if (direct !== false) {
+      try {
+        const response = await fetch(new URL(path, s.helperUrl).toString(), {
+          method: 'POST',
+          headers: { 'X-Lean-Lens-Token': s.helperToken, 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(timeoutMs),
+          keepalive: path === '/live/close'
+        });
+        direct = true;
+        if (response.status === 401) return { state: 'unauthorized' };
+        const json = await response.json().catch(() => null);
+        if (response.status === 403) return { state: 'not_allowed', repo: json && json.repo };
+        if (response.status === 404) return { state: 'old' };
+        if (!response.ok || !json) return { state: 'error', error: (json && json.error) || `The helper answered ${response.status}` };
+        return json;
+      } catch (err) {
+        if (direct) return { state: 'offline' };
+      }
     }
+    const answer = await sendMessage({ action: 'HELPER_LIVE', path, body, timeout: timeoutMs });
+    if (!answer || answer.state === 'offline') return { state: 'offline' };
+    direct = false;
+    return answer;
   }
 
   // The infoview's frame. It gets one end of a message channel once it has loaded. In Chrome
