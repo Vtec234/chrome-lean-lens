@@ -1781,6 +1781,29 @@ function helperForPanel(request, sender) {
   return helperRequest(request.path, { body: request.body, timeout, missing: 'old' });
 }
 
+// How the infoview's panel was left (content/infoview_panel.js): open or hidden, how wide, and how
+// tall the hovers under it. The content script, in GitHub's page, does not reach the extension's
+// storage (see `setAccessLevel` below), so it is kept here for it: these three values and
+// nothing else, whatever is sent.
+const INFOVIEW_PANEL_KEY = 'lean_lens_infoview_panel';
+function infoviewPanel(state) {
+  const size = (value) => (typeof value === 'number' && value > 0 && value < 100000 ? Math.round(value) : null);
+  const plain = (kept) => (kept && typeof kept === 'object' ? { open: kept.open === true, width: size(kept.width), hover: size(kept.hover) } : null);
+  return new Promise((resolve) => {
+    try {
+      if (state === undefined || state === null) {
+        chrome.storage.local.get([INFOVIEW_PANEL_KEY], (res) => resolve({ state: chrome.runtime.lastError ? null : plain(res && res[INFOVIEW_PANEL_KEY]) }));
+        return;
+      }
+      const kept = plain(state);
+      if (!kept) { resolve({ state: null }); return; }
+      chrome.storage.local.set({ [INFOVIEW_PANEL_KEY]: kept }, () => resolve({ state: chrome.runtime.lastError ? null : kept }));
+    } catch (err) {
+      resolve({ state: null });
+    }
+  });
+}
+
 // Keys for the infoview's panels (see INFOVIEW_KEY), by the frame's name. Kept for the browser
 // session where the browser can, so that a worker restarted between the two askers gives both
 // the same key.
@@ -1892,6 +1915,8 @@ const MESSAGE_HANDLERS = {
   // The key by which the infoview's panel knows the content script of its page (and not the
   // page's own scripts, which cannot send messages here): one for each frame, given to both.
   INFOVIEW_KEY: (request) => infoviewKey(request.id),
+  // How the infoview's panel was left: read, or kept when `state` is sent.
+  INFOVIEW_PANEL: (request) => infoviewPanel(request.state),
   HELPER_LIVE: (request, sender) => helperForPanel(request, sender),
   // The commit a pull request's page shows, when the page itself does not say (for the infoview).
   PAGE_COMMIT: async (request) => ({ sha: request.fileRef ? await commitOf(request.fileRef) : null }),

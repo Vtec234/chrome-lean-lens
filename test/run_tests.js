@@ -954,6 +954,20 @@ for (const action of ['SET_SETTINGS', 'CLEAR_CACHE', 'TEST_HELPER']) {
     assert(kept === false && answer && answer.success === false && /extension's own pages/.test(answer.error), `${action} is refused from ${sender.url || 'an unknown sender'}`);
   }
 }
+// How the infoview's panel was left is kept by the worker for the content script, which cannot
+// reach the storage itself: three values, whatever else a page sends.
+{
+  const ask = (request) => new Promise((resolve) => workerListeners[0](Object.assign({ action: 'INFOVIEW_PANEL' }, request), GITHUB_TAB, (res) => resolve(JSON.parse(JSON.stringify(res)))));
+  asyncChecks.push((async () => {
+    assert.deepStrictEqual(await ask({}), { state: null }, 'nothing is kept at first');
+    assert.deepStrictEqual(await ask({ state: 'open' }), { state: null }, 'what is no state is not kept');
+    assert.deepStrictEqual(await ask({ state: { open: true, width: 500.4, hover: '300', helperToken: 'x' } }), { state: { open: true, width: 500, hover: null } });
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(fakeStorage.lean_lens_infoview_panel)), { open: true, width: 500, hover: null }, 'only the three values are stored');
+    assert.deepStrictEqual(await ask({ state: { open: false, width: 440, hover: 250 } }), { state: { open: false, width: 440, hover: 250 } });
+    assert.deepStrictEqual(await ask({}), { state: { open: false, width: 440, hover: 250 } }, 'and read again on the next page');
+    delete fakeStorage.lean_lens_infoview_panel;
+  })());
+}
 // The infoview panel's requests to the helper, made by the worker for it (Firefox does not let a
 // frame in a tab of github.com reach this machine): only the panel's page may ask, and only for its own.
 {
@@ -3879,7 +3893,7 @@ console.log("26. Testing hovers in the infoview's panel...");
   // Timers are kept, not run: the content script's start-up scan never happens here.
   const timers = new Set();
   const stored = [];
-  let kept = { lean_lens_infoview_panel: { open: false, width: 500, hover: 300 } };
+  let kept = { open: false, width: 500, hover: 300 }; // how the panel was left, as the worker keeps it
   let lookups = [];
   const body = makeElement('body');
   const html = makeElement('html');
@@ -3911,10 +3925,13 @@ console.log("26. Testing hovers in the infoview's panel...");
         sendMessage: (message, cb) => {
           if (message.action === 'GET_SETTINGS') cb && cb({ settings: { enabled: true, enableHelper: false } });
           else if (message.action === 'LOOKUP_TOKEN') lookups.push({ message, answer: cb });
-          else if (cb) cb(null);
+          else if (message.action === 'INFOVIEW_PANEL') {
+            if (message.state) { kept = JSON.parse(JSON.stringify(message.state)); stored.push(kept); }
+            if (cb) cb({ state: kept });
+          } else if (cb) cb(null);
         },
       },
-      storage: { local: { get: (keys, cb) => cb(kept), set: (value) => stored.push(JSON.parse(JSON.stringify(value))) } },
+      // (No `storage`: a content script is not given the extension's, and asks the worker.)
     },
   };
   dctx.window = dctx; dctx.self = dctx; dctx.globalThis = dctx;
@@ -4040,7 +4057,7 @@ console.log("26. Testing hovers in the infoview's panel...");
   assert.strictEqual(panel.root.style['--lean-infoview-hover-height'], '400px');
   listenersOf(split)('pointerup').forEach((fn) => fn({}));
   assert(!panel.root.classList.contains('lean-infoview-splitting'));
-  assert.strictEqual(stored[stored.length - 1].lean_lens_infoview_panel.hover, 400);
+  assert.strictEqual(stored[stored.length - 1].hover, 400);
   panel.setHoverHeight(10);
   assert.strictEqual(panel.hoverHeight, 60, 'never too low to read');
   panel.setHoverHeight(5000);

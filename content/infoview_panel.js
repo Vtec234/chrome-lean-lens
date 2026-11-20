@@ -9,7 +9,6 @@
  * is marked in the code.
  */
 (function () {
-  const STATE_KEY = 'lean_lens_infoview_panel';
   const MIN_WIDTH = 280;
   const DEFAULT_WIDTH = 440;
   // The hovers at the bottom of the panel: how low they may get, and how much they leave the infoview.
@@ -123,10 +122,12 @@
       this.dockHover();
       if (!this.restored) {
         // As it was left on the last page: open or hidden, how wide, and how much the hovers take.
+        // (Kept by the background script: this script, in GitHub's page, does not reach the
+        // extension's storage.)
         this.restored = true;
         try {
-          chrome.storage.local.get([STATE_KEY], (res) => {
-            const kept = res && res[STATE_KEY];
+          chrome.runtime.sendMessage({ action: 'INFOVIEW_PANEL' }, (res) => {
+            const kept = !chrome.runtime.lastError && res && res.state;
             if (!kept) return;
             if (Number(kept.width) >= MIN_WIDTH) this.setWidth(Number(kept.width));
             if (Number(kept.hover) >= MIN_HOVER) this.setHoverHeight(Number(kept.hover));
@@ -245,7 +246,8 @@
     }
 
     save() {
-      try { chrome.storage.local.set({ [STATE_KEY]: { open: this.open, width: this.width, hover: this.hoverHeight } }); } catch (err) { /* not kept */ }
+      const state = { open: this.open, width: this.width, hover: this.hoverHeight };
+      try { chrome.runtime.sendMessage({ action: 'INFOVIEW_PANEL', state }, () => { void chrome.runtime.lastError; }); } catch (err) { /* not kept */ }
     }
 
     setOpen(open, remember = true) {
